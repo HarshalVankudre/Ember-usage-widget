@@ -1,41 +1,103 @@
-# Ember — Claude + Codex usage widget
+<div align="center">
 
-A little flame that flickers while you code and heats up as you burn through your plan limits. Ember combines the Claude Usage Widget and the Codex Usage Widget into one app:
+<img src="scripts/fire.svg" width="110" alt="Ember logo" />
 
-- **Plan usage limits stay per provider** — Claude and Codex each get their own 5-hour session tracker and weekly tracker (plus Claude's per-model weekly rows when active), with live reset countdowns and color-coded bars (terracotta for Claude, green for Codex).
-- **Everything else is combined** — API-equivalent spend, token stat cards, rolling 5-hour / 7-day windows, the daily spend chart, the by-model table, and the projects list merge both providers into one view.
-- **Usage history survives log deletion** — parsed records are kept in Ember's own cache, so deleting a project's session logs (or Codex pruning old sessions) never erases its numbers. Such projects move to a collapsed **Deleted projects** group at the bottom of the Projects panel.
-- **Filters** — date presets, provider chips (Claude / Codex), and per-model chips to slice any view.
-- The Ember flame reacts to the worst limit window across both providers: amber when calm, hot orange past 80%, pulsing red past 95%. Click it.
+# Ember
 
-## How costs are calculated
+**One little flame that watches your entire AI coding spend.**
 
-Each usage bucket is priced with **its own provider's billing rules** before anything is merged — combined figures are sums of exact per-provider dollars, never a shared formula:
+Claude Code + ChatGPT Codex usage, API-equivalent cost, and plan limits — in a single glassy desktop widget.
 
-- **Claude**: `input × rate + output × rate + cacheRead × 0.1 × input-rate + 5m-writes × 1.25 × input-rate + 1h-writes × 2 × input-rate`, with date-aware intro pricing (e.g. Sonnet 5 before Sep 2026).
-- **Codex**: `non-cached input × rate + output × rate + cached input × cached-rate`. Reasoning tokens are a subset of output — shown for information, **never added twice**. GPT-5.6+ cache writes (1.25× input) aren't logged by Codex, so the 25% surcharge is estimated from non-cached input and shown as "Cache write (est.)".
+[![Release](https://img.shields.io/github/v/release/HarshalVankudre/Ember-usage-widget?color=ff5a1f&label=release)](https://github.com/HarshalVankudre/Ember-usage-widget/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/HarshalVankudre/Ember-usage-widget/total?color=ffc24d&label=downloads)](https://github.com/HarshalVankudre/Ember-usage-widget/releases)
+[![Platform](https://img.shields.io/badge/platform-Windows%2011-0a84ff)](#install)
+[![Electron](https://img.shields.io/badge/built%20with-Electron-19c37d)](https://www.electronjs.org/)
+[![License](https://img.shields.io/badge/license-MIT-98989d)](LICENSE)
 
-## Data sources
+<img src="docs/ember.png" width="560" alt="Ember widget showing combined Claude + Codex spend, plan limit trackers, and token stats" />
+
+</div>
+
+---
+
+## Why Ember?
+
+You code with **Claude Code** *and* **Codex**. Each has its own invisible meters — a 5-hour session limit, a weekly limit, tokens quietly burning in the background. Ember puts all of it on your desktop in one always-on-top, frosted-glass widget that updates **live, every second**, straight from the local session logs. No accounts, no telemetry, nothing leaves your machine.
+
+## ✨ Features
+
+### 🔥 Two providers, one flame
+- **Combined API-equivalent spend** — hero total, today's burn, rolling *Last 5 hours* and *Last 7 days* windows across both tools
+- **Provider & model filter chips** — isolate Claude or Codex, or any single model, with one click
+- **Stacked daily spend chart** with hover breakdowns, weekly grouping for long ranges
+
+### ⏱️ Plan limits, per provider — the meters that actually matter
+- **Claude**: 5-hour session + weekly trackers (plus per-model weekly rows when active), fetched with Claude Code's own token — terracotta bars
+- **Codex**: 5-hour session + weekly trackers read *locally* from rollout logs, zero extra network — green bars
+- Live "resets in…" countdowns, plan badges (Max, Pro, Plus…), color shift at 80% / 95%
+- The flame itself reacts: calm flicker → faster & brighter past 80% → pulsing red past 95% 🔴
+
+### 🧾 Costs you can trust
+Every bucket is priced with **its own provider's official billing rules** before anything is merged — combined figures are sums of exact per-provider dollars, never one blended formula:
 
 | | Claude | Codex |
 |---|---|---|
-| Usage logs | `~/.claude/projects/**/*.jsonl` | `~/.codex/sessions` + `~/.codex/archived_sessions` |
-| Plan limits | Anthropic account API (Claude Code's own OAuth token, read-only) | `rate_limits` snapshots inside the rollout logs (no network) |
-| Pricing | Bundled official Anthropic rates | Bundled official OpenAI rates + OpenRouter fallback for new models |
+| Input / output | official per-model rates, date-aware intro pricing | official per-model rates |
+| Cache reads | 0.1× input | discounted cached-input rate |
+| Cache writes | 1.25× (5-min) / 2× (1-hour) — real log counts | GPT-5.6+ 25% surcharge, estimated & labeled *(est.)* |
+| Reasoning tokens | — | subset of output — shown, **never double-counted** |
+| New models | — | live OpenRouter price fallback, refreshed daily |
 
-## Run / build
+### 🗂️ Your history is permanent
+- Parsed usage lives in Ember's own cache — **deleting session logs never erases your numbers**
+- Projects whose logs are gone move to a tidy collapsed **Deleted projects** group at the bottom
+- Right-click any project to **blur it & exclude it from totals** (privacy mode for screen shares)
+- Expand any project for a per-model token & cost breakdown
 
-```
+### 🖥️ A widget that behaves
+- Frosted acrylic glass, always-on-top toggle, remembers its position
+- Lives in the tray (flame icon) — close just hides it; autostart optional
+- Cache savings, burn per active day, session count, cache-hit rate insights
+- Today / 7D / 30D / Month / All / custom date ranges
+
+## 📦 Install
+
+Grab the latest from **[Releases](https://github.com/HarshalVankudre/Ember-usage-widget/releases/latest)**:
+
+| File | What it is |
+|---|---|
+| `Ember Setup x.x.x.exe` | One-click installer — per-user, tray + autostart, no admin needed |
+| `Ember Portable x.x.x.exe` | Single portable exe — no install at all |
+
+> Requires Windows 11 (22H2+ for the acrylic blur) and local sessions of [Claude Code](https://claude.com/claude-code) and/or [Codex](https://openai.com/codex/).
+
+## 🔍 Where the data comes from
+
+| | Claude | Codex |
+|---|---|---|
+| Usage logs | `~/.claude/projects/**/*.jsonl` | `~/.codex/sessions` + `archived_sessions` |
+| Plan limits | Anthropic account API (Claude Code's own OAuth token, read-only) | `rate_limits` snapshots inside the rollout logs |
+| Refresh | fs-watch + 1s polling (mtime-cached, cheap) | same |
+
+Everything is read-only and stays on your machine. Plan-limit meters are each provider's own measure of work done — the dollar figures are API-equivalent *estimates* of what your subscription usage would have cost at pay-as-you-go rates (a fun number to watch next to a flat-rate plan 😄).
+
+## 🛠️ Build from source
+
+```bash
+git clone https://github.com/HarshalVankudre/Ember-usage-widget.git
+cd Ember-usage-widget
 npm install
 npm start          # dev run
-npm run dist       # installer + portable exe (Windows)
+npm run dist       # build installer + portable exe
 ```
 
-Debug screenshot: set `WIDGET_SHOT=<path>.png` before `npm start` to capture the rendered window.
+Debug tip: `WIDGET_SHOT=shot.png npm start` saves screenshots of the rendered widget.
 
-Closing the window hides to the tray (flame icon); quit from the tray menu.
+## 🙏 Credits
 
-## Credits
+- Flame logo: [Fluent Emoji](https://github.com/microsoft/fluentui-emoji) "Fire" by Microsoft (MIT), rasterized to the app/tray icons at build time by `scripts/render-icon.js`
+- Grew out of [Claude-usage-widget](https://github.com/HarshalVankudre/Claude-usage-widget) and [Codex-usage-widget](https://github.com/HarshalVankudre/Codex-usage-widget), now merged into one
 
-Flame logo: [Fluent Emoji](https://github.com/microsoft/fluentui-emoji) "Fire" by Microsoft, MIT license (`scripts/fire.svg`, rasterized to the app/tray icons at build time).
+## 📄 License
 
+[MIT](LICENSE) © Harshal Vankudre
