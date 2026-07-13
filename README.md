@@ -22,14 +22,15 @@ Claude Code + ChatGPT Codex usage, transparent API-equivalent cost, and plan lim
 
 ## Why Ember?
 
-You code with **Claude Code** *and* **Codex**. Each has its own invisible meters — a 5-hour session limit, a weekly limit, tokens quietly burning in the background. Ember puts all of it on your desktop in one always-on-top, frosted-glass widget that updates **live, every second**, straight from the local session logs. No accounts, no telemetry, nothing leaves your machine.
+You code with **Claude Code** *and* **Codex**. Each has its own invisible meters — a 5-hour session limit, a weekly limit, tokens quietly burning in the background. Ember puts all of it on your desktop in one always-on-top, frosted-glass widget that reacts **live** to changes in the local session logs. No accounts, no telemetry, nothing leaves your machine.
 
 ## ✨ Features
 
 ### 🔥 Two providers, one flame
 - **Combined API-equivalent spend** — hero total, today's burn, rolling *Last 5 hours* and *Last 7 days* windows across both tools
 - **Provider & model filter chips** — isolate Claude or Codex, or any single model, with one click
-- **Stacked daily spend chart** with hover breakdowns, weekly grouping for long ranges
+- **Stacked daily spend chart** with hover breakdowns, weekly grouping for long ranges, and clickable days that open the complete token, project, model, and cost breakdown for that date
+- Clicking a daily spike moves the range control to **Custom**, so the detailed day being viewed is always unambiguous
 
 ### ⏱️ Plan limits, per provider — the meters that actually matter
 - **Claude**: 5-hour session + weekly trackers (plus per-model weekly rows when active), fetched with Claude Code's own token — terracotta bars
@@ -49,12 +50,15 @@ Every request is priced with **its own provider's official billing rules** befor
 | Modifiers | fast mode, US inference geography, and logged web-search fees | GPT-5.4+ / 5.5 / 5.6 long-context multipliers |
 | Unpublished models | shown as **Unpriced**, excluded from the dollar total | shown as **Unpriced**, never guessed |
 
-The headline is an API-equivalent value, not a subscription invoice. When Codex omits GPT-5.6 cache-write counts, Ember shows the conservative estimate alongside the lower bound. Pricing coverage beside the headline reports any calls excluded because no official public rate exists.
+The headline is an API-equivalent value, not a subscription invoice. When Codex omits GPT-5.6 cache-write counts, Ember shows the conservative estimate alongside the lower bound. In Codex-only views, the token ledger adapts to show measured **Reasoning** instead of an empty Cache write card; reasoning remains part of Output and is not added twice. Pricing coverage beside the headline reports any calls excluded because no official public rate exists.
 
 OpenAI model IDs surfaced inside Claude Code by compatibility gateways such as Claudex/Ultracode are reattributed to Codex and repriced with OpenAI rules before the providers are merged. That keeps GPT-5.6 Sol, Terra, and Luna in one model row without dropping their Claude Code project usage.
 
+Internal `nexus-gpt-*` compatibility models are excluded before aggregation, so they do not appear in totals, charts, filters, projects, or model breakdowns.
+
 ### 🗂️ Your history is permanent
 - Parsed usage lives in Ember's own cache — **deleting session logs never erases your numbers**
+- Live records retain minute-level timestamps for time-range filtering. Existing caches migrate forward without losing legacy history; if a deleted legacy log no longer retains an exact timestamp, Ember does not invent minute precision for it
 - Projects whose logs are gone move to a tidy collapsed **Deleted projects** group at the bottom
 - Right-click any project to **blur it & exclude it from totals** (privacy mode for screen shares)
 - Expand any project for a per-model token & cost breakdown
@@ -63,16 +67,18 @@ OpenAI model IDs surfaced inside Claude Code by compatibility gateways such as C
 - Calm matte “burn ledger” theme over Windows acrylic, always-on-top toggle, remembers its position
 - Lives in the tray (flame icon) — close just hides it; autostart optional
 - Cache savings, burn per active day, session count, cache-hit rate insights
-- Today / 7D / 30D / Month / All / custom date ranges
+- Today / 7D / 30D / Month / All / custom date-and-time ranges
+- Custom ranges use strict 24-hour `HH:MM` times (for example `19:45`) and support either **start → now** or an explicit end date and time
+- Debounced filesystem updates, shared aggregation work, selective rendering, and periodic reconciliation keep interaction and live refreshes responsive without dropping history or calculations
 
 ## 📦 Install
 
-Grab the latest from **[Releases](https://github.com/HarshalVankudre/Ember-usage-widget/releases/latest)**:
+Grab **[Ember v1.2.0](https://github.com/HarshalVankudre/Ember-usage-widget/releases/tag/v1.2.0)**, or check **[Releases](https://github.com/HarshalVankudre/Ember-usage-widget/releases/latest)** for the newest package:
 
 | File | What it is |
 |---|---|
-| `Ember Setup x.x.x.exe` | One-click installer — per-user, tray + autostart, no admin needed |
-| `Ember Portable x.x.x.exe` | Single portable exe — no install at all |
+| `Ember Setup 1.2.0.exe` | One-click installer — per-user, tray + autostart, no admin needed |
+| `Ember Portable 1.2.0.exe` | Single portable exe — no install at all |
 
 > Requires Windows 11 (22H2+ for the acrylic blur) and local sessions of [Claude Code](https://claude.com/claude-code) and/or [Codex](https://openai.com/codex/).
 
@@ -82,7 +88,7 @@ Grab the latest from **[Releases](https://github.com/HarshalVankudre/Ember-usage
 |---|---|---|
 | Usage logs | `~/.claude/projects/**/*.jsonl` | `~/.codex/sessions` + `archived_sessions` |
 | Plan limits | Anthropic account API (Claude Code's own OAuth token, read-only) | `rate_limits` snapshots inside the rollout logs |
-| Refresh | fs-watch + 1s polling (mtime-cached, cheap) | same |
+| Refresh | filesystem watcher with debounced updates and periodic reconciliation | same |
 
 Everything is read-only and stays on your machine. Plan-limit meters are each provider's own measure of work done — the dollar figures are API-equivalent *estimates* of what your subscription usage would have cost at pay-as-you-go rates (a fun number to watch next to a flat-rate plan 😄).
 
