@@ -6,7 +6,7 @@
 
 **One little flame that watches your entire AI coding spend.**
 
-Claude Code + ChatGPT Codex usage, API-equivalent cost, and plan limits — in a single glassy desktop widget.
+Claude Code + ChatGPT Codex usage, transparent API-equivalent cost, and plan limits — in a single precision desktop widget.
 
 [![Release](https://img.shields.io/github/v/release/HarshalVankudre/Ember-usage-widget?color=ff5a1f&label=release)](https://github.com/HarshalVankudre/Ember-usage-widget/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/HarshalVankudre/Ember-usage-widget/total?color=ffc24d&label=downloads)](https://github.com/HarshalVankudre/Ember-usage-widget/releases)
@@ -38,15 +38,20 @@ You code with **Claude Code** *and* **Codex**. Each has its own invisible meters
 - The flame itself reacts: calm flicker → faster & brighter past 80% → pulsing red past 95% 🔴
 
 ### 🧾 Costs you can trust
-Every bucket is priced with **its own provider's official billing rules** before anything is merged — combined figures are sums of exact per-provider dollars, never one blended formula:
+Every request is priced with **its own provider's official billing rules** before anything is merged. Ember refreshes both providers' official pricing documents daily, caches them for offline use, and keeps uncertainty visible instead of fabricating precision:
 
 | | Claude | Codex |
 |---|---|---|
-| Input / output | official per-model rates, date-aware intro pricing | official per-model rates |
+| Input / output | official per-model rates, date-aware intro pricing | official per-model rates; historical long-context tiers applied per request |
 | Cache reads | 0.1× input | discounted cached-input rate |
-| Cache writes | 1.25× (5-min) / 2× (1-hour) — real log counts | GPT-5.6+ 25% surcharge, estimated & labeled *(est.)* |
+| Cache writes | official 5-minute / 1-hour rates from real log counts | measured when present; otherwise a labeled lower-to-conservative range |
 | Reasoning tokens | — | subset of output — shown, **never double-counted** |
-| New models | — | live OpenRouter price fallback, refreshed daily |
+| Modifiers | fast mode, US inference geography, and logged web-search fees | GPT-5.4+ / 5.5 / 5.6 long-context multipliers |
+| Unpublished models | shown as **Unpriced**, excluded from the dollar total | shown as **Unpriced**, never guessed |
+
+The headline is an API-equivalent value, not a subscription invoice. When Codex omits GPT-5.6 cache-write counts, Ember shows the conservative estimate alongside the lower bound. Pricing coverage beside the headline reports any calls excluded because no official public rate exists.
+
+OpenAI model IDs surfaced inside Claude Code by compatibility gateways such as Claudex/Ultracode are reattributed to Codex and repriced with OpenAI rules before the providers are merged. That keeps GPT-5.6 Sol, Terra, and Luna in one model row without dropping their Claude Code project usage.
 
 ### 🗂️ Your history is permanent
 - Parsed usage lives in Ember's own cache — **deleting session logs never erases your numbers**
@@ -55,7 +60,7 @@ Every bucket is priced with **its own provider's official billing rules** before
 - Expand any project for a per-model token & cost breakdown
 
 ### 🖥️ A widget that behaves
-- Frosted acrylic glass, always-on-top toggle, remembers its position
+- Calm matte “burn ledger” theme over Windows acrylic, always-on-top toggle, remembers its position
 - Lives in the tray (flame icon) — close just hides it; autostart optional
 - Cache savings, burn per active day, session count, cache-hit rate insights
 - Today / 7D / 30D / Month / All / custom date ranges
@@ -88,6 +93,7 @@ git clone https://github.com/HarshalVankudre/Ember-usage-widget.git
 cd Ember-usage-widget
 npm install
 npm start          # dev run
+npm test           # pricing + attribution checks
 npm run dist       # build installer + portable exe
 ```
 

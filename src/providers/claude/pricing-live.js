@@ -5,50 +5,35 @@ const fsp = require('fs/promises');
 const path = require('path');
 const { setLivePrices } = require('./pricing');
 
-const SOURCE_URL = 'https://developers.openai.com/api/docs/pricing.md';
+const SOURCE_URL = 'https://platform.claude.com/docs/en/about-claude/pricing.md';
 const REFRESH_MS = 24 * 3600 * 1000;
 const RETRY_MS = 60 * 60 * 1000;
-const CACHE_VERSION = 2;
+const CACHE_VERSION = 1;
 
 let cachePath = null;
 let state = { live: false, fetchedAt: 0, models: 0 };
 
-function cleanModelName(name) {
-  return String(name)
-    .toLowerCase()
-    .replace(/\s*\(<272k context length\)\s*/i, '')
-    .trim();
+function dollars(cell) {
+  const hit = String(cell || '').match(/\$([\d.]+)/);
+  return hit ? Number(hit[1]) : null;
 }
 
-// The official MDX contains several arrays (standard, batch, flex). Standard
-// appears first, so first occurrence wins. A row is either
-// [model,input,cached,output] or [model,input,cached,cacheWrite,output].
 function buildMap(markdown) {
   const map = {};
   for (const line of String(markdown || '').split(/\r?\n/)) {
-    const match = line.match(/(\["[^"]+"\s*,[^\]]+\])/);
+    if (!/^\|\s*Claude\s+/i.test(line)) continue;
+    const cells = line.split('|').slice(1, -1).map((v) => v.trim());
+    if (cells.length !== 6) continue;
+    const match = cells[0].match(/Claude\s+(Fable|Mythos|Opus|Sonnet|Haiku)\s+(\d+(?:\.\d+)?)/i);
     if (!match) continue;
-    let row;
-    try {
-      row = JSON.parse(match[1]);
-    } catch {
-      continue;
-    }
-    if (!Array.isArray(row) || (row.length !== 4 && row.length !== 5)) continue;
-    const id = cleanModelName(row[0]);
-    if (!/^(?:gpt|chatgpt|chat-|codex|o\d)/.test(id) || map[id]) continue;
-    const numeric = (v) => (typeof v === 'number' && isFinite(v) ? v : null);
-    const input = numeric(row[1]);
-    const cached = numeric(row[2]);
-    const write = row.length === 5 ? numeric(row[3]) : null;
-    const output = numeric(row[row.length - 1]);
-    if (input == null || output == null) continue;
-    map[id] = {
-      input,
-      cached: cached == null ? input : cached,
-      write: write == null ? undefined : write,
-      output,
-    };
+    const family = match[1].toLowerCase();
+    const version = match[2].replace('.', '-');
+    let key = `${family}-${version}`;
+    if (key === 'sonnet-5') key += /starting september/i.test(cells[0]) ? '@standard' : '@intro';
+    if (map[key]) continue;
+    const [input, cacheW5m, cacheW1h, cacheRead, output] = cells.slice(1).map(dollars);
+    if ([input, cacheW5m, cacheW1h, cacheRead, output].some((v) => v == null)) continue;
+    map[key] = { input, cacheW5m, cacheW1h, cacheRead, output, family };
   }
   return map;
 }
@@ -64,7 +49,7 @@ function apply(prices, fetchedAt) {
 function status() {
   return {
     ...state,
-    provider: 'OpenAI',
+    provider: 'Anthropic',
     source: state.live ? 'Official pricing · live' : 'Official pricing · bundled',
     url: SOURCE_URL,
   };
@@ -77,13 +62,13 @@ async function refresh() {
     const res = await fetch(SOURCE_URL, { signal: ctrl.signal, headers: { accept: 'text/markdown' } });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const prices = buildMap(await res.text());
-    if (!apply(prices, Date.now())) throw new Error('empty standard price table');
+    if (!apply(prices, Date.now())) throw new Error('empty model price table');
     if (cachePath) {
       await fsp.writeFile(cachePath, JSON.stringify({ v: CACHE_VERSION, fetchedAt: state.fetchedAt, prices })).catch(() => {});
     }
     return true;
   } catch (err) {
-    console.error('OpenAI pricing refresh failed:', err.message);
+    console.error('Anthropic pricing refresh failed:', err.message);
     return false;
   } finally {
     clearTimeout(kill);
@@ -91,14 +76,13 @@ async function refresh() {
 }
 
 function init(userDataDir, onUpdated) {
-  cachePath = path.join(userDataDir, 'openai-pricing.json');
+  cachePath = path.join(userDataDir, 'anthropic-pricing.json');
   try {
     const parsed = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
     if (parsed.v === CACHE_VERSION) apply(parsed.prices, parsed.fetchedAt || 0);
   } catch {
-    /* first run or old cache */
+    /* first run */
   }
-
   const cycle = async () => {
     const fresh = state.live && Date.now() - state.fetchedAt < REFRESH_MS;
     const ok = fresh || await refresh();

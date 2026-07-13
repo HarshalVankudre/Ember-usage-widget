@@ -1,310 +1,170 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta http-equiv="Content-Security-Policy"
-        content="default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'self'" />
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;450;500;600;650;700&display=swap" rel="stylesheet" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ember · AI usage ledger</title>
   <link rel="stylesheet" href="styles.css" />
-  <title>Ember</title>
 </head>
 <body>
-  <div id="widget">
-    <div class="noise"></div>
-
-    <!-- ───────── header ───────── -->
-    <header id="titlebar">
-      <div class="brand">
-        <span class="brand-name">Ember <em>· Claude + Codex</em></span>
-        <span class="brand-dot" id="liveDot"></span>
+  <main class="app" aria-label="Ember AI usage ledger">
+    <header class="titlebar">
+      <div class="brand" aria-label="Ember">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M12.4 2.6c.5 3.6-2.8 5.2-2 8.2.5 1.7 2 2.3 2 4.2 0 1.6-1 2.8-2.5 3.3 4.8.8 8.1-1.6 8.1-5.7 0-4.1-3-7.3-5.6-10Z" fill="currentColor"/><path d="M8.8 7.2C6.3 9.6 5 12 5 14.7c0 3.8 2.8 6.7 7 6.7 1.1 0 2.1-.2 3-.6-3.8-.2-6.1-2.4-5.1-5.7.7-2.3-.4-4.8-1.1-7.9Z" fill="currentColor" opacity=".55"/></svg>
+        </span>
+        <span class="brand-copy"><strong>Ember</strong><small>usage ledger</small></span>
       </div>
-      <div class="win-controls">
-        <button id="btnPin" class="wbtn" title="Always on top">
-          <svg viewBox="0 0 16 16" width="11" height="11"><path d="M9.5 1.5l5 5-2.2.6-2.6 2.6.3 3.3-1.6-.1-2.2-2.2L2.5 14l-.5-.5 3.3-3.7-2.2-2.2-.1-1.6 3.3.3L8.9 3.7l.6-2.2z" fill="currentColor"/></svg>
+      <div class="title-status" aria-live="polite"><span class="live-dot" id="liveDot"></span><span id="lastUpdated">Loading…</span></div>
+      <div class="window-actions">
+        <button id="btnPin" class="wbtn" type="button" title="Always on top" aria-label="Toggle always on top" aria-pressed="false">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m9.5 1.5 5 5-2.2.6-2.6 2.6.3 3.3-1.6-.1-2.2-2.2L2.5 14l-.5-.5 3.3-3.7-2.2-2.2-.1-1.6 3.3.3L8.9 3.7l.6-2.2Z" fill="currentColor"/></svg>
         </button>
-        <button id="btnHide" class="wbtn" title="Hide to tray">
-          <svg viewBox="0 0 16 16" width="11" height="11"><rect x="3" y="7.25" width="10" height="1.5" fill="currentColor"/></svg>
+        <button id="btnHide" class="wbtn" type="button" title="Hide to tray" aria-label="Hide to tray">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 7.25h10v1.5H3z" fill="currentColor"/></svg>
         </button>
-        <button id="btnClose" class="wbtn wbtn-close" title="Close">
-          <svg viewBox="0 0 16 16" width="11" height="11"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.5"/></svg>
+        <button id="btnClose" class="wbtn wbtn-close" type="button" title="Close to tray" aria-label="Close to tray">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8m0-8-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
         </button>
       </div>
     </header>
 
-    <!-- ───────── hero cost ───────── -->
-    <section class="hero">
+    <section class="hero" aria-labelledby="heroLabel">
       <div class="hero-main">
-        <div class="hero-label" id="heroLabel">API spend · all time</div>
-        <div class="hero-cost" id="heroCost">$0.00</div>
-        <div class="hero-sub">
-          <span id="heroTokens">0 tokens</span>
-          <span class="sep">·</span>
-          <span id="heroMsgs">0 calls</span>
+        <p class="hero-label" id="heroLabel">API-equivalent spend · all time</p>
+        <div class="hero-cost" id="heroCost" aria-live="polite">$0.00</div>
+        <div class="hero-sub"><span id="heroTokens">0 tokens</span><span aria-hidden="true">/</span><span id="heroMsgs">0 calls</span></div>
+        <div class="pricing-confidence" id="pricingConfidence">
+          <span class="confidence-mark" aria-hidden="true"></span>
+          <span id="pricingSummary">Checking official-rate coverage…</span>
+          <span class="confidence-range" id="pricingRange"></span>
         </div>
       </div>
-      <div class="pet-box" title="Ember — your burn buddy. Flickers while you code, heats up as either plan nears its limits">
-        <svg class="pet" id="pet" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+      <button class="pet" id="pet" type="button" title="Ember reacts as plan limits heat up" aria-label="Animate Ember flame">
+        <svg viewBox="0 0 44 52" aria-hidden="true">
           <g class="flame-g">
-<path d="M12.5554 8.93525C14.0921 6.53779 15.0016 4.32368 15.4762 2.75834C15.6581 2.1584 16.4264 1.91265 16.8824 2.34277C23.7549 8.82401 26.0011 13.7722 26.4493 19.4908C26.7774 25.0221 24.0587 29.944 16.7618 29.944C9.91109 29.944 4.85547 25.1627 5.54294 17.5846C5.95379 13.0556 7.7145 9.60538 9.12218 7.55149C9.56028 6.91229 10.473 6.90302 10.9779 7.49092L12.237 8.95719C12.3238 9.05822 12.4835 9.04736 12.5554 8.93525Z" fill="url(#paint0_radial_18_15821)"/>
-<path d="M12.5554 8.93525C14.0921 6.53779 15.0016 4.32368 15.4762 2.75834C15.6581 2.1584 16.4264 1.91265 16.8824 2.34277C23.7549 8.82401 26.0011 13.7722 26.4493 19.4908C26.7774 25.0221 24.0587 29.944 16.7618 29.944C9.91109 29.944 4.85547 25.1627 5.54294 17.5846C5.95379 13.0556 7.7145 9.60538 9.12218 7.55149C9.56028 6.91229 10.473 6.90302 10.9779 7.49092L12.237 8.95719C12.3238 9.05822 12.4835 9.04736 12.5554 8.93525Z" fill="url(#paint1_radial_18_15821)"/>
-<path d="M12.5554 8.93525C14.0921 6.53779 15.0016 4.32368 15.4762 2.75834C15.6581 2.1584 16.4264 1.91265 16.8824 2.34277C23.7549 8.82401 26.0011 13.7722 26.4493 19.4908C26.7774 25.0221 24.0587 29.944 16.7618 29.944C9.91109 29.944 4.85547 25.1627 5.54294 17.5846C5.95379 13.0556 7.7145 9.60538 9.12218 7.55149C9.56028 6.91229 10.473 6.90302 10.9779 7.49092L12.237 8.95719C12.3238 9.05822 12.4835 9.04736 12.5554 8.93525Z" fill="url(#paint2_linear_18_15821)"/>
-<path d="M12.5554 8.93525C14.0921 6.53779 15.0016 4.32368 15.4762 2.75834C15.6581 2.1584 16.4264 1.91265 16.8824 2.34277C23.7549 8.82401 26.0011 13.7722 26.4493 19.4908C26.7774 25.0221 24.0587 29.944 16.7618 29.944C9.91109 29.944 4.85547 25.1627 5.54294 17.5846C5.95379 13.0556 7.7145 9.60538 9.12218 7.55149C9.56028 6.91229 10.473 6.90302 10.9779 7.49092L12.237 8.95719C12.3238 9.05822 12.4835 9.04736 12.5554 8.93525Z" fill="url(#paint3_radial_18_15821)"/>
-<path d="M12.5554 8.93525C14.0921 6.53779 15.0016 4.32368 15.4762 2.75834C15.6581 2.1584 16.4264 1.91265 16.8824 2.34277C23.7549 8.82401 26.0011 13.7722 26.4493 19.4908C26.7774 25.0221 24.0587 29.944 16.7618 29.944C9.91109 29.944 4.85547 25.1627 5.54294 17.5846C5.95379 13.0556 7.7145 9.60538 9.12218 7.55149C9.56028 6.91229 10.473 6.90302 10.9779 7.49092L12.237 8.95719C12.3238 9.05822 12.4835 9.04736 12.5554 8.93525Z" fill="url(#paint4_radial_18_15821)"/>
-<path d="M12.5554 8.93525C14.0921 6.53779 15.0016 4.32368 15.4762 2.75834C15.6581 2.1584 16.4264 1.91265 16.8824 2.34277C23.7549 8.82401 26.0011 13.7722 26.4493 19.4908C26.7774 25.0221 24.0587 29.944 16.7618 29.944C9.91109 29.944 4.85547 25.1627 5.54294 17.5846C5.95379 13.0556 7.7145 9.60538 9.12218 7.55149C9.56028 6.91229 10.473 6.90302 10.9779 7.49092L12.237 8.95719C12.3238 9.05822 12.4835 9.04736 12.5554 8.93525Z" fill="url(#paint5_radial_18_15821)"/>
-<path d="M12.5554 8.93525C14.0921 6.53779 15.0016 4.32368 15.4762 2.75834C15.6581 2.1584 16.4264 1.91265 16.8824 2.34277C23.7549 8.82401 26.0011 13.7722 26.4493 19.4908C26.7774 25.0221 24.0587 29.944 16.7618 29.944C9.91109 29.944 4.85547 25.1627 5.54294 17.5846C5.95379 13.0556 7.7145 9.60538 9.12218 7.55149C9.56028 6.91229 10.473 6.90302 10.9779 7.49092L12.237 8.95719C12.3238 9.05822 12.4835 9.04736 12.5554 8.93525Z" fill="url(#paint6_radial_18_15821)"/>
-<path d="M12.5554 8.93525C14.0921 6.53779 15.0016 4.32368 15.4762 2.75834C15.6581 2.1584 16.4264 1.91265 16.8824 2.34277C23.7549 8.82401 26.0011 13.7722 26.4493 19.4908C26.7774 25.0221 24.0587 29.944 16.7618 29.944C9.91109 29.944 4.85547 25.1627 5.54294 17.5846C5.95379 13.0556 7.7145 9.60538 9.12218 7.55149C9.56028 6.91229 10.473 6.90302 10.9779 7.49092L12.237 8.95719C12.3238 9.05822 12.4835 9.04736 12.5554 8.93525Z" fill="url(#paint7_radial_18_15821)"/>
-<g filter="url(#filter0_i_18_15821)">
-<path d="M10.1782 19.8769C11.4805 16.7776 14.1528 13.348 15.9574 11.4875C16.4673 10.9618 17.2915 10.9524 17.8301 11.4487C21.2913 14.6377 22.3332 17.5207 23.2174 20.8769C24.1372 24.3686 23.2174 29.9946 16.2958 29.9946C10.3351 29.9946 8.27019 24.4174 10.1782 19.8769Z" fill="url(#paint8_radial_18_15821)"/>
-<path d="M10.1782 19.8769C11.4805 16.7776 14.1528 13.348 15.9574 11.4875C16.4673 10.9618 17.2915 10.9524 17.8301 11.4487C21.2913 14.6377 22.3332 17.5207 23.2174 20.8769C24.1372 24.3686 23.2174 29.9946 16.2958 29.9946C10.3351 29.9946 8.27019 24.4174 10.1782 19.8769Z" fill="url(#paint9_radial_18_15821)"/>
-<path d="M10.1782 19.8769C11.4805 16.7776 14.1528 13.348 15.9574 11.4875C16.4673 10.9618 17.2915 10.9524 17.8301 11.4487C21.2913 14.6377 22.3332 17.5207 23.2174 20.8769C24.1372 24.3686 23.2174 29.9946 16.2958 29.9946C10.3351 29.9946 8.27019 24.4174 10.1782 19.8769Z" fill="url(#paint10_radial_18_15821)"/>
-</g>
-<path d="M10.1782 19.8769C11.4805 16.7776 14.1528 13.348 15.9574 11.4875C16.4673 10.9618 17.2915 10.9524 17.8301 11.4487C21.2913 14.6377 22.3332 17.5207 23.2174 20.8769C24.1372 24.3686 23.2174 29.9946 16.2958 29.9946C10.3351 29.9946 8.27019 24.4174 10.1782 19.8769Z" fill="url(#paint11_linear_18_15821)"/>
-<path d="M10.1782 19.8769C11.4805 16.7776 14.1528 13.348 15.9574 11.4875C16.4673 10.9618 17.2915 10.9524 17.8301 11.4487C21.2913 14.6377 22.3332 17.5207 23.2174 20.8769C24.1372 24.3686 23.2174 29.9946 16.2958 29.9946C10.3351 29.9946 8.27019 24.4174 10.1782 19.8769Z" fill="url(#paint12_radial_18_15821)"/>
-<g filter="url(#filter1_f_18_15821)">
-<path d="M11.8137 11.5385C14.1291 8.14851 15.4831 4.48144 15.8966 3.57653C15.2936 8.21133 13.5364 11.6047 10.2287 15.9746C7.58254 19.4706 7.10476 22.4634 7.12774 23.1917C6.30081 17.63 8.91941 15.776 11.8137 11.5385Z" fill="url(#paint13_linear_18_15821)"/>
-</g>
-<g filter="url(#filter2_f_18_15821)">
-<path d="M9.81366 7.87422C8.5136 9.4879 5.9295 13.9638 5.99348 18.9582C7.27492 13.8358 10.2692 12.2215 9.81366 7.87422Z" fill="url(#paint14_linear_18_15821)"/>
-</g>
-<defs>
-<filter id="filter0_i_18_15821" x="9.48987" y="11.0846" width="14.5255" height="18.9099" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
-<feFlood flood-opacity="0" result="BackgroundImageFix"/>
-<feBlend mode="normal" in="SourceGraphic" in2="BackgroundImageFix" result="shape"/>
-<feColorMatrix in="SourceAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0" result="hardAlpha"/>
-<feOffset dx="0.5"/>
-<feGaussianBlur stdDeviation="0.25"/>
-<feComposite in2="hardAlpha" operator="arithmetic" k2="-1" k3="1"/>
-<feColorMatrix type="matrix" values="0 0 0 0 0.952941 0 0 0 0 0.615686 0 0 0 0 0.364706 0 0 0 1 0"/>
-<feBlend mode="normal" in2="shape" result="effect1_innerShadow_18_15821"/>
-</filter>
-<filter id="filter1_f_18_15821" x="5.7229" y="2.32654" width="11.4237" height="22.1152" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
-<feFlood flood-opacity="0" result="BackgroundImageFix"/>
-<feBlend mode="normal" in="SourceGraphic" in2="BackgroundImageFix" result="shape"/>
-<feGaussianBlur stdDeviation="0.625" result="effect1_foregroundBlur_18_15821"/>
-</filter>
-<filter id="filter2_f_18_15821" x="4.49231" y="6.37427" width="6.86804" height="14.0839" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
-<feFlood flood-opacity="0" result="BackgroundImageFix"/>
-<feBlend mode="normal" in="SourceGraphic" in2="BackgroundImageFix" result="shape"/>
-<feGaussianBlur stdDeviation="0.75" result="effect1_foregroundBlur_18_15821"/>
-</filter>
-<radialGradient id="paint0_radial_18_15821" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(24.0023 19.72) rotate(-179.474) scale(17.0988 25.7861)">
-<stop stop-color="#FF953D"/>
-<stop offset="1" stop-color="#FF5141"/>
-</radialGradient>
-<radialGradient id="paint1_radial_18_15821" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(10.3724 15.6549) rotate(-157.937) scale(10.3441 17.8495)">
-<stop stop-color="#CE5327"/>
-<stop offset="1" stop-color="#CE5327" stop-opacity="0"/>
-</radialGradient>
-<linearGradient id="paint2_linear_18_15821" x1="18.3364" y1="29.944" x2="18.3364" y2="24.8455" gradientUnits="userSpaceOnUse">
-<stop stop-color="#FF7583"/>
-<stop offset="1" stop-color="#FF7583" stop-opacity="0"/>
-</linearGradient>
-<radialGradient id="paint3_radial_18_15821" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(4.95718 14.3914) rotate(24.0149) scale(3.10465 25.6991)">
-<stop stop-color="#FFAA7B"/>
-<stop offset="1" stop-color="#FFAA7B" stop-opacity="0"/>
-</radialGradient>
-<radialGradient id="paint4_radial_18_15821" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(9.31032 6.25095) rotate(77.3196) scale(3.84035 4.79187)">
-<stop stop-color="#FF5E47"/>
-<stop offset="1" stop-color="#FF5E47" stop-opacity="0"/>
-</radialGradient>
-<radialGradient id="paint5_radial_18_15821" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(16.429 1.36584) rotate(87.8819) scale(10.1374 9.38321)">
-<stop stop-color="#FF2F3C"/>
-<stop offset="1" stop-color="#FF2F3C" stop-opacity="0"/>
-</radialGradient>
-<radialGradient id="paint6_radial_18_15821" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(13.9 4.79911) rotate(25.3285) scale(2.29895 4.61352)">
-<stop stop-color="#FF846C"/>
-<stop offset="1" stop-color="#FF846C" stop-opacity="0"/>
-</radialGradient>
-<radialGradient id="paint7_radial_18_15821" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(12.4577 8.20959) rotate(113.224) scale(2.27837 0.522116)">
-<stop stop-color="#FFA682"/>
-<stop offset="1" stop-color="#FFA682" stop-opacity="0"/>
-</radialGradient>
-<radialGradient id="paint8_radial_18_15821" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(21.2046 24.3762) rotate(-168.558) scale(10.0291 12.4891)">
-<stop stop-color="#FFDA2F"/>
-<stop offset="1" stop-color="#FF8E41"/>
-</radialGradient>
-<radialGradient id="paint9_radial_18_15821" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(12.4013 8.59263) rotate(69.0442) scale(14.1425 12.2879)">
-<stop stop-color="#FD5639"/>
-<stop offset="1" stop-color="#FE5533" stop-opacity="0"/>
-</radialGradient>
-<radialGradient id="paint10_radial_18_15821" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(19.239 20.6289) rotate(174.239) scale(9.79866 23.9914)">
-<stop offset="0.627719" stop-color="#D7812D" stop-opacity="0"/>
-<stop offset="1" stop-color="#D7812D"/>
-</radialGradient>
-<linearGradient id="paint11_linear_18_15821" x1="16.5026" y1="10.6122" x2="16.5026" y2="14.2595" gradientUnits="userSpaceOnUse">
-<stop stop-color="#F95131"/>
-<stop offset="1" stop-color="#F95131" stop-opacity="0"/>
-</linearGradient>
-<radialGradient id="paint12_radial_18_15821" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(22.9857 18.8023) rotate(143.063) scale(16.0546 11.6174)">
-<stop offset="0.772305" stop-color="#F18A52" stop-opacity="0"/>
-<stop offset="1" stop-color="#F18A52"/>
-</radialGradient>
-<linearGradient id="paint13_linear_18_15821" x1="14.9957" y1="4.2552" x2="7.65549" y2="22.7319" gradientUnits="userSpaceOnUse">
-<stop stop-color="#FF7558"/>
-<stop offset="1" stop-color="#F38758"/>
-</linearGradient>
-<linearGradient id="paint14_linear_18_15821" x1="9.54097" y1="8.14373" x2="5.58208" y2="19.4793" gradientUnits="userSpaceOnUse">
-<stop stop-color="#FF815B"/>
-<stop offset="1" stop-color="#FF9C6D"/>
-</linearGradient>
-</defs>
-</g>
+            <path d="M24 2c1.5 10.8-8.2 15.2-5.8 24.3 1.3 4.8 6 7.2 5.7 12.8-.1 2.8-1.5 5.6-4 7.4C31.5 48 40 41.5 40 30.3 40 18.2 31.5 8.8 24 2Z" fill="#ff6b3d"/>
+            <path d="M14.2 13.8C7.5 20.2 4 27 4 34.2 4 44.5 11.6 51 22.7 51c3 0 5.6-.6 8-1.7-10.2-.6-16.4-6.5-13.8-15.3 1.9-6.2-.9-13-2.7-20.2Z" fill="#ff9a51"/>
+            <path d="M21.2 27.2c-3.8 4.1-5.4 7.5-5.4 11.1 0 5.2 3.7 8.7 8.9 8.7 5.4 0 9-3.6 9-8.6 0-5.1-3.7-9-7-12.1.4 4.8-2.4 6.6-5.5.9Z" fill="#ffd166"/>
+          </g>
         </svg>
-        <div class="pet-cap"><b id="todayVal">–</b><span>today</span></div>
-      </div>
+        <span><b id="todayVal">–</b><small>today</small></span>
+      </button>
     </section>
 
-    <!-- ───────── plan usage limits — per provider, 5h + weekly ───────── -->
-    <section class="limits" id="limitsSection" hidden>
-      <div class="limits-head">Plan usage limits</div>
+    <section class="limits" id="limitsSection" aria-labelledby="limitsHeading" hidden>
+      <div class="section-kicker" id="limitsHeading">Plan headroom</div>
       <div id="limitRows"></div>
     </section>
 
-    <!-- ───────── rolling usage windows (combined) ───────── -->
-    <section class="windows">
-      <div class="wcard" title="Rolling window across both providers — matches the cadence of the 5-hour session limits">
-        <div class="w-k">Last 5 hours</div>
-        <div class="w-v" id="w5hCost">–</div>
-        <div class="w-s" id="w5hTok"></div>
-      </div>
-      <div class="wcard" title="Rolling 7-day window across both providers — matches the cadence of the weekly limits">
-        <div class="w-k">Last 7 days</div>
-        <div class="w-v" id="wkCost">–</div>
-        <div class="w-s" id="wkTok"></div>
-      </div>
+    <section class="windows" aria-label="Rolling usage windows">
+      <article class="window-metric"><span>Last 5 hours</span><strong id="w5hCost">–</strong><small id="w5hTok">no activity</small></article>
+      <article class="window-metric"><span>Last 7 days</span><strong id="wkCost">–</strong><small id="wkTok">no activity</small></article>
     </section>
 
-    <!-- ───────── filters ───────── -->
-    <section class="filters">
-      <div class="chip-row" id="dateChips">
-        <span class="seg-thumb" id="segThumb"></span>
-        <button class="chip" data-range="today">Today</button>
-        <button class="chip" data-range="7d">7D</button>
-        <button class="chip" data-range="30d">30D</button>
-        <button class="chip" data-range="mtd">Month</button>
-        <button class="chip active" data-range="all">All</button>
-        <button class="chip" data-range="custom" id="chipCustom">
-          <svg viewBox="0 0 16 16" width="10" height="10" style="margin-right:4px"><rect x="2" y="3" width="12" height="11" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M2 6.5h12M5.5 1.5v3M10.5 1.5v3" stroke="currentColor" stroke-width="1.3"/></svg>Custom
+    <section class="filters" aria-label="Usage filters">
+      <div class="chip-row date-chips" id="dateChips" role="group" aria-label="Date range">
+        <span class="seg-thumb" id="segThumb" aria-hidden="true"></span>
+        <button class="chip" type="button" data-range="today">Today</button>
+        <button class="chip" type="button" data-range="7d">7D</button>
+        <button class="chip" type="button" data-range="30d">30D</button>
+        <button class="chip" type="button" data-range="mtd">Month</button>
+        <button class="chip active" type="button" data-range="all">All</button>
+        <button class="chip custom-chip" type="button" data-range="custom" id="chipCustom" aria-label="Custom date range">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="3" width="12" height="11" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M2 6.5h12M5.5 1.5v3M10.5 1.5v3" stroke="currentColor" stroke-width="1.3"/></svg><span>Custom</span>
         </button>
       </div>
       <div class="custom-range" id="customRange" hidden>
-        <input type="date" id="dateFrom" />
-        <span class="arrow">→</span>
-        <input type="date" id="dateTo" />
-        <button class="chip mini" id="applyCustom">Apply</button>
+        <div class="custom-range-fields">
+          <div class="range-pair" aria-label="Range start">
+            <label><span>From date</span><input type="date" id="dateFrom" required aria-describedby="customRangeError" /></label>
+            <label><span>Start time · 24h</span><input type="text" id="timeFrom" value="00:00" inputmode="numeric" maxlength="5" placeholder="HH:MM" pattern="(?:[01][0-9]|2[0-3]):[0-5][0-9]" autocomplete="off" spellcheck="false" title="Enter a 24-hour time from 00:00 to 23:59 in HH:MM format" aria-label="Start time in 24-hour HH:MM format" aria-describedby="customRangeError" required /></label>
+          </div>
+          <fieldset class="range-end-mode">
+            <legend>End</legend>
+            <div class="end-mode-options">
+              <label><input type="radio" name="customEndMode" id="endModeNow" value="now" checked /><span>To now</span></label>
+              <label><input type="radio" name="customEndMode" id="endModeCustom" value="custom" /><span>Custom end</span></label>
+            </div>
+          </fieldset>
+          <div class="range-pair" id="customEndFields" aria-label="Custom range end" hidden>
+            <label><span>End date</span><input type="date" id="dateTo" aria-describedby="customRangeError" /></label>
+            <label><span>End time · 24h</span><input type="text" id="timeTo" value="23:59" inputmode="numeric" maxlength="5" placeholder="HH:MM" pattern="(?:[01][0-9]|2[0-3]):[0-5][0-9]" autocomplete="off" spellcheck="false" title="Enter a 24-hour time from 00:00 to 23:59 in HH:MM format" aria-label="End time in 24-hour HH:MM format" aria-describedby="customRangeError" /></label>
+          </div>
+          <button class="chip apply" type="button" id="applyCustom">Apply</button>
+        </div>
+        <p class="range-error" id="customRangeError" role="alert" aria-live="assertive" hidden></p>
       </div>
-      <div class="chip-row models" id="providerChips"></div>
-      <div class="chip-row models" id="modelChips"></div>
+      <div class="filter-scroller"><div class="chip-row models" id="providerChips" aria-label="Provider filters"></div></div>
+      <div class="filter-scroller"><div class="chip-row models" id="modelChips" aria-label="Model filters"></div></div>
     </section>
 
-    <div class="scroll-area">
-      <!-- ───────── stat cards ───────── -->
-      <section class="stat-grid">
-        <div class="stat" title="Non-cached input tokens across both providers">
-          <div class="stat-k">Input</div>
-          <div class="stat-v" id="stIn">–</div>
-          <div class="stat-c" id="stInCost"></div>
-        </div>
-        <div class="stat" title="Output tokens across both providers (Codex reasoning tokens are billed inside output)">
-          <div class="stat-k">Output</div>
-          <div class="stat-v" id="stOut">–</div>
-          <div class="stat-c" id="stOutCost"></div>
-        </div>
-        <div class="stat" title="Prompt-cache hits — Claude cache reads + Codex cached input, billed at discounted rates">
-          <div class="stat-k">Cache read</div>
-          <div class="stat-v" id="stCr">–</div>
-          <div class="stat-c" id="stCrCost"></div>
-        </div>
-        <div class="stat" title="Claude cache writes (real log counts). Codex logs carry no write counts, so its GPT-5.6+ write surcharge is estimated and included in the cost line.">
-          <div class="stat-k">Cache write</div>
-          <div class="stat-v" id="stCw">–</div>
-          <div class="stat-c" id="stCwCost"></div>
+    <div class="scroll-area" tabindex="0" aria-label="Usage details">
+      <section class="token-ledger" aria-labelledby="tokensHeading">
+        <div class="panel-head"><h2 id="tokensHeading">Token ledger</h2><span class="panel-note">cost by billable class</span></div>
+        <div class="stat-grid">
+          <article class="stat" title="Ordinary non-cached input tokens"><span class="stat-k">Input</span><strong class="stat-v" id="stIn">–</strong><span class="stat-c" id="stInCost"></span></article>
+          <article class="stat" title="Output tokens; Codex reasoning is included"><span class="stat-k">Output</span><strong class="stat-v" id="stOut">–</strong><span class="stat-c" id="stOutCost"></span></article>
+          <article class="stat" title="Prompt-cache reads billed at discounted rates"><span class="stat-k">Cache read</span><strong class="stat-v" id="stCr">–</strong><span class="stat-c" id="stCrCost"></span></article>
+          <article class="stat" id="stCwCard" title="Measured cache writes; an estimated premium may also appear in cost"><span class="stat-k" id="stCwLabel">Cache write</span><strong class="stat-v" id="stCw" aria-labelledby="stCwLabel">–</strong><span class="stat-c" id="stCwCost"></span></article>
         </div>
       </section>
 
-      <section class="insight-row">
-        <div class="insight">
-          <span class="ins-k">Saved by caching</span>
-          <span class="ins-v amber" id="insSaved">–</span>
-        </div>
-        <div class="insight">
-          <span class="ins-k">Burn / active day</span>
-          <span class="ins-v" id="insBurn">–</span>
-        </div>
-        <div class="insight">
-          <span class="ins-k">Sessions</span>
-          <span class="ins-v" id="insSessions">–</span>
-        </div>
-        <div class="insight" title="Share of input tokens served from the prompt cache across both providers">
-          <span class="ins-k">Cache hit</span>
-          <span class="ins-v" id="insCacheRate">–</span>
+      <section class="insight-row" aria-label="Usage insights">
+        <article><span>Cache savings</span><strong class="amber" id="insSaved">–</strong></article>
+        <article><span>Burn / active day</span><strong id="insBurn">–</strong></article>
+        <article><span>Sessions</span><strong id="insSessions">–</strong></article>
+        <article><span>Input cache share</span><strong id="insCacheRate">–</strong></article>
+      </section>
+
+      <section class="panel" aria-labelledby="chartHeading">
+        <div class="panel-head"><h2 id="chartHeading">Burn history</h2><span class="panel-note" id="chartNote"></span></div>
+        <div class="chart-wrap"><canvas id="chart" role="application" tabindex="0" aria-label="Interactive API-equivalent cost history. Use left and right arrow keys to choose a period, then press Enter for full details.">Cost history chart</canvas><div id="chartTip" class="chart-tip" hidden></div></div>
+      </section>
+
+      <section class="panel" aria-labelledby="modelsHeading">
+        <div class="panel-head"><h2 id="modelsHeading">Models</h2><span class="panel-note">official-rate cost</span></div>
+        <div class="table-scroll">
+          <table class="model-table" id="modelTable">
+            <caption class="sr-only">Tokens and API-equivalent cost by model</caption>
+            <thead><tr><th scope="col">Model</th><th scope="col">In</th><th scope="col">Out</th><th scope="col">Read</th><th scope="col">Write</th><th scope="col" class="r">Cost</th></tr></thead>
+            <tbody></tbody>
+          </table>
         </div>
       </section>
 
-      <!-- ───────── chart ───────── -->
-      <section class="panel">
-        <div class="panel-head">
-          <h2>Daily spend</h2>
-          <span class="panel-note" id="chartNote"></span>
-        </div>
-        <div class="chart-wrap">
-          <canvas id="chart"></canvas>
-          <div id="chartTip" class="chart-tip" hidden></div>
-        </div>
-      </section>
-
-      <!-- ───────── model table ───────── -->
-      <section class="panel">
-        <div class="panel-head"><h2>By model</h2></div>
-        <table class="model-table" id="modelTable">
-          <thead>
-            <tr><th>Model</th><th>In</th><th>Out</th><th>C·Read</th><th>C·Write</th><th class="r">Cost</th></tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </section>
-
-      <!-- ───────── projects ───────── -->
-      <section class="panel">
-        <div class="panel-head"><h2>Projects</h2><span class="panel-note" id="projNote">sorted by cost</span></div>
+      <section class="panel" aria-labelledby="projectsHeading">
+        <div class="panel-head"><h2 id="projectsHeading">Projects</h2><span class="panel-note" id="projNote">sorted by cost</span></div>
         <div id="projectList" class="project-list"></div>
       </section>
     </div>
 
-    <!-- ───────── footer ───────── -->
     <footer>
-      <span id="lastUpdated">…</span>
+      <span>Local logs · official API rates</span>
       <div class="foot-actions">
-        <button class="fbtn" id="btnRefresh" title="Refresh">↻</button>
-        <button class="fbtn" id="btnSettings" title="Settings">⚙</button>
+        <button class="fbtn" id="btnRefresh" type="button" title="Refresh data" aria-label="Refresh data">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13 5.3A5.7 5.7 0 1 0 13.4 10M13 2v3.7H9.3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <button class="fbtn" id="btnSettings" type="button" title="Settings and pricing notes" aria-label="Open settings">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 5.4A2.6 2.6 0 1 0 8 10.6 2.6 2.6 0 0 0 8 5.4Zm5.1 3.7.9.7-1.3 2.2-1.1-.4a5.7 5.7 0 0 1-1.4.8l-.2 1.2H7.4l-.2-1.2a5.7 5.7 0 0 1-1.4-.8l-1.1.4-1.3-2.2.9-.7a5.7 5.7 0 0 1 0-1.7l-.9-.7 1.3-2.2 1.1.4a5.7 5.7 0 0 1 1.4-.8l.2-1.2H10l.2 1.2a5.7 5.7 0 0 1 1.4.8l1.1-.4L14 6.7l-.9.7a5.7 5.7 0 0 1 0 1.7Z" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linejoin="round"/></svg>
+        </button>
       </div>
     </footer>
 
-    <!-- ───────── settings overlay ───────── -->
-    <div id="settingsOverlay" hidden>
-      <div class="settings-card">
-        <div class="settings-head">
-          <h2>Settings</h2>
-          <button class="wbtn" id="btnSettingsClose">
-            <svg viewBox="0 0 16 16" width="11" height="11"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.5"/></svg>
-          </button>
+    <div id="settingsOverlay" class="settings-overlay" hidden>
+      <section class="settings-card" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+        <div class="settings-head"><div><span class="section-kicker">Ember preferences</span><h2 id="settingsTitle">Settings & accuracy</h2></div><button class="wbtn" id="btnSettingsClose" type="button" aria-label="Close settings"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8m0-8-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button></div>
+        <label class="setting-row"><span><strong>Launch at startup</strong><small>Keep usage monitoring ready in the tray</small></span><input type="checkbox" id="setAutostart" class="switch" /></label>
+        <label class="setting-row"><span><strong>Always on top</strong><small>Pin Ember above other windows</small></span><input type="checkbox" id="setPin" class="switch" /></label>
+        <div class="accuracy-note">
+          <h3>How the number is calculated</h3>
+          <p>API-equivalent value is reconstructed from local Claude Code and Codex token logs. Official standard API rates are refreshed daily and cached for offline use.</p>
+          <p>Codex currently does not log GPT‑5.6 cache-write tokens. Ember shows the conservative estimate and a lower bound without that write premium. Unpublished model prices remain visibly unpriced.</p>
         </div>
-        <label class="setting-row">
-          <span>Launch at Windows startup</span>
-          <input type="checkbox" id="setAutostart" class="switch" />
-        </label>
-        <label class="setting-row">
-          <span>Always on top</span>
-          <input type="checkbox" id="setPin" class="switch" />
-        </label>
-        <p class="settings-note">Costs are API-equivalent estimates from official per-token pricing. Claude: cache read 0.1×, cache write 1.25×/2× input (data: <code>~/.claude/projects</code>). Codex: cached input at the discounted cache rate, reasoning billed as output; GPT-5.6+ cache writes (1.25× input) aren't counted in Codex logs, so the extra 25% is estimated from non-cached input (data: <code>~/.codex/sessions</code>). Plan-limit meters are each provider's own measure and don't track these dollar figures.</p>
-        <p class="settings-note" id="pricingStatus"></p>
-      </div>
+        <p class="pricing-status" id="pricingStatus"></p>
+      </section>
     </div>
-  </div>
-
+  </main>
   <script src="app.js"></script>
 </body>
 </html>

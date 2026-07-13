@@ -5,19 +5,60 @@ const fsp = require('fs/promises');
 const path = require('path');
 const os = require('os');
 const { costOf } = require('./pricing');
+const { costOf: codexCostOf } = require('../codex/pricing');
+const { isOpenAIModel } = require('../model-attribution');
 
 const PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
 
-const CACHE_VERSION = 2; // v2: entries carry the hour of day
+const CACHE_VERSION = 4; // v4: local minute precision appended to cached entries
+const LEGACY_ENTRY_LENGTH = 13;
 
 let cachePath = null; // set via init()
 let fileCache = {}; // filePath -> { mtimeMs, size, entries }
+let cacheNeedsReparse = false;
+let cacheWrite = Promise.resolve();
+
+function upgradeV3Files(files) {
+  const upgraded = {};
+  for (const [file, rec] of Object.entries(files || {})) {
+    const entries = Array.isArray(rec.entries)
+      ? rec.entries.map((entry) => (
+        Array.isArray(entry) && entry.length === LEGACY_ENTRY_LENGTH ? [...entry, null] : entry
+      ))
+      : rec.entries;
+    upgraded[file] = { ...rec, entries };
+  }
+  return upgraded;
+}
+
+function saveCache() {
+  if (!cachePath) return;
+  const target = cachePath;
+  const temp = `${target}.tmp`;
+  const snapshot = JSON.stringify({ v: CACHE_VERSION, files: fileCache });
+  cacheWrite = cacheWrite.then(async () => {
+    try {
+      await fsp.writeFile(temp, snapshot);
+      await fsp.rename(temp, target);
+    } catch {
+      try { await fsp.unlink(temp); } catch { /* ignore cleanup failures */ }
+    }
+  });
+}
 
 function init(userDataDir) {
   cachePath = path.join(userDataDir, 'claude-usage-cache.json');
+  cacheNeedsReparse = false;
   try {
     const parsed = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
-    fileCache = parsed.v === CACHE_VERSION ? parsed.files : {};
+    if (parsed.v === CACHE_VERSION) {
+      fileCache = parsed.files || {};
+    } else if (parsed.v === 3) {
+      fileCache = upgradeV3Files(parsed.files);
+      cacheNeedsReparse = true;
+    } else {
+      fileCache = {};
+    }
   } catch {
     fileCache = {};
   }
@@ -62,10 +103,11 @@ function localParts(ts) {
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, '0');
   const day = String(d.getDate()).padStart(2, '0');
-  return { date: `${y}-${m}-${day}`, hour: d.getHours() };
+  return { date: `${y}-${m}-${day}`, hour: d.getHours(), minute: d.getMinutes() };
 }
 
-// entry: [dedupKey, date, hour, model, input, output, cacheRead, cacheW5m, cacheW1h]
+// entry: [dedupKey, date, hour, model, input, output, cacheRead, cacheW5m,
+//         cacheW1h, speed, inferenceGeo, webSearches, serviceTier, minute]
 function parseContent(text) {
   const entries = [];
   for (const line of text.split('\n')) {
@@ -81,12 +123,21 @@ function parseContent(text) {
     if (!u || !msg.model || msg.model === '<synthetic>') continue;
     const parts = localParts(obj.timestamp);
     if (!parts) continue;
-    const key = msg.id ? `${msg.id}:${obj.requestId || ''}` : obj.uuid || Math.random().toString(36);
     const cc = u.cache_creation || {};
     const cw5 = cc.ephemeral_5m_input_tokens;
     const cw1 = cc.ephemeral_1h_input_tokens;
     // Older logs only have the combined figure; treat it as 5m-TTL writes.
     const hasSplit = cw5 != null || cw1 != null;
+    const write5 = hasSplit ? cw5 || 0 : u.cache_creation_input_tokens || 0;
+    const write1 = hasSplit ? cw1 || 0 : 0;
+    const tools = u.server_tool_use || {};
+    const webSearches = Math.max(0, Number(tools.web_search_requests || tools.web_searches || 0));
+    const stableFallback = [
+      obj.timestamp || '', msg.model,
+      u.input_tokens || 0, u.output_tokens || 0, u.cache_read_input_tokens || 0,
+      write5, write1, u.speed || '', u.inference_geo || '', webSearches,
+    ].join(':');
+    const key = msg.id ? `${msg.id}:${obj.requestId || ''}` : obj.uuid || stableFallback;
     entries.push([
       key,
       parts.date,
@@ -95,8 +146,13 @@ function parseContent(text) {
       u.input_tokens || 0,
       u.output_tokens || 0,
       u.cache_read_input_tokens || 0,
-      hasSplit ? cw5 || 0 : u.cache_creation_input_tokens || 0,
-      hasSplit ? cw1 || 0 : 0,
+      write5,
+      write1,
+      u.speed || 'standard',
+      u.inference_geo || 'not_available',
+      webSearches,
+      u.service_tier || 'standard',
+      parts.minute,
     ]);
   }
   return entries;
@@ -105,7 +161,8 @@ function parseContent(text) {
 async function aggregate() {
   const files = await listJsonlFiles(PROJECTS_DIR);
   const liveCache = {};
-  let cacheDirty = false;
+  const forceReparse = cacheNeedsReparse;
+  let cacheDirty = forceReparse;
 
   for (const file of files) {
     let st;
@@ -115,7 +172,7 @@ async function aggregate() {
       continue;
     }
     const prev = fileCache[file];
-    if (prev && prev.mtimeMs === st.mtimeMs && prev.size === st.size) {
+    if (!forceReparse && prev && prev.mtimeMs === st.mtimeMs && prev.size === st.size) {
       if (prev.gone) {
         // a previously deleted file came back (restore from backup)
         const { gone, ...rest } = prev;
@@ -126,13 +183,20 @@ async function aggregate() {
       }
       continue;
     }
-    let entries = [];
+    let entries = null;
     try {
       entries = parseContent(await fsp.readFile(file, 'utf8'));
     } catch {
-      /* unreadable file — skip */
+      /* preserve cached history at legacy precision if a file is unreadable */
     }
-    liveCache[file] = { mtimeMs: st.mtimeMs, size: st.size, entries };
+    if (entries) {
+      liveCache[file] = { mtimeMs: st.mtimeMs, size: st.size, entries };
+    } else if (prev) {
+      const { gone, ...rest } = prev;
+      liveCache[file] = { ...rest, mtimeMs: st.mtimeMs, size: st.size };
+    } else {
+      liveCache[file] = { mtimeMs: st.mtimeMs, size: st.size, entries: [] };
+    }
     cacheDirty = true;
   }
   // Files that vanished from disk (deleted project folders, pruned logs) keep
@@ -148,12 +212,11 @@ async function aggregate() {
     }
   }
   fileCache = liveCache;
-  if (cacheDirty && cachePath) {
-    fsp.writeFile(cachePath, JSON.stringify({ v: CACHE_VERSION, files: fileCache })).catch(() => {});
-  }
+  cacheNeedsReparse = false;
+  if (cacheDirty) saveCache();
 
   // Global dedup (resumed sessions copy older messages into new files),
-  // then bucket by date|model|project|session.
+  // then bucket by date|hour|minute|model|project|session.
   const seen = new Set();
   const buckets = new Map();
   const projectLive = new Map(); // project -> still has at least one on-disk file
@@ -163,13 +226,21 @@ async function aggregate() {
     projectLive.set(project, projectLive.get(project) || !gone);
     if (!entries || !entries.length) continue;
     const session = sessionOf(file);
-    for (const [key, date, hour, model, inp, out, cr, cw5, cw1] of entries) {
+    for (const [key, date, hour, model, inp, out, cr, cw5, cw1, speed = 'standard', inferenceGeo = 'not_available', webSearches = 0, serviceTier = 'standard', minute = null] of entries) {
       if (seen.has(key)) continue;
       seen.add(key);
-      const bk = `${date}|${hour}|${model}|${project}|${session}`;
+      const bk = `${date}|${hour}|${minute}|${model}|${project}|${session}`;
       let b = buckets.get(bk);
       if (!b) {
-        b = { date, hour, model, project, session, input: 0, output: 0, cacheRead: 0, cacheW5m: 0, cacheW1h: 0, msgs: 0 };
+        b = {
+          date, hour, minute, model, project, session,
+          input: 0, output: 0, cacheRead: 0, cacheW5m: 0, cacheW1h: 0, webSearches: 0, msgs: 0,
+          cost: 0, costMin: 0, costMax: 0,
+          cIn: 0, cOut: 0, cCr: 0, cCw: 0, cTool: 0, cacheSavings: 0,
+          pricedCalls: 0, unpricedCalls: 0, estimated: false,
+          fastCalls: 0, usRegionCalls: 0, longContextCalls: 0,
+          pricingSource: '', serviceTiers: [],
+        };
         buckets.set(bk, b);
       }
       b.input += inp;
@@ -177,24 +248,47 @@ async function aggregate() {
       b.cacheRead += cr;
       b.cacheW5m += cw5;
       b.cacheW1h += cw1;
+      b.webSearches += webSearches;
       b.msgs += 1;
+
+      const gateway = isOpenAIModel(model);
+      const c = gateway
+        ? codexCostOf(model, {
+          input: inp,
+          output: out,
+          cached: cr,
+          cacheWrite: cw5 + cw1,
+          cacheWriteKnown: true,
+          totalInput: inp + cr + cw5 + cw1,
+        })
+        : costOf(model, { date, input: inp, output: out, cacheRead: cr, cacheW5m: cw5, cacheW1h: cw1, speed, inferenceGeo, webSearches, serviceTier });
+      b.cost += c.total || 0;
+      b.costMin += c.costMin || 0;
+      b.costMax += c.costMax || 0;
+      b.cIn += c.input || 0;
+      b.cOut += c.output || 0;
+      b.cCr += (gateway ? c.cached : c.cacheRead) || 0;
+      b.cCw += c.cacheWrite || 0;
+      b.cTool += c.toolFee || 0;
+      b.cacheSavings += c.cacheSavings || 0;
+      b.estimated = b.estimated || !!c.estimated;
+      b.fastCalls += c.fast ? 1 : 0;
+      b.usRegionCalls += c.usRegion ? 1 : 0;
+      b.longContextCalls += c.longContext ? 1 : 0;
+      b.pricingSource = c.source || b.pricingSource;
+      if (!b.serviceTiers.includes(serviceTier)) b.serviceTiers.push(serviceTier);
+      if (c.known) b.pricedCalls += 1;
+      else b.unpricedCalls += 1;
     }
   }
 
   const list = [];
   for (const b of buckets.values()) {
-    const c = costOf(b.model, b);
-    b.cost = c.total;
-    b.cIn = c.input || 0;
-    b.cOut = c.output || 0;
-    b.cCr = c.cacheRead || 0;
-    b.cCw = c.cacheWrite || 0;
-    b.cacheSavings = c.cacheSavings || 0;
-    b.priced = c.known;
+    b.priced = b.pricedCalls > 0 && b.unpricedCalls === 0;
     b.projectDeleted = !projectLive.get(b.project);
     list.push(b);
   }
   return { buckets: list, generatedAt: Date.now(), fileCount: files.length };
 }
 
-module.exports = { init, aggregate, PROJECTS_DIR };
+module.exports = { init, aggregate, parseContent, PROJECTS_DIR };

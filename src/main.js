@@ -3,19 +3,27 @@
 const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, nativeTheme, screen } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const claudeUsage = require('./providers/claude/usage');
 const claudeLimits = require('./providers/claude/limits');
 const codexUsage = require('./providers/codex/usage');
 const codexLimits = require('./providers/codex/limits');
 const codexPricingLive = require('./providers/codex/pricing-live');
+const claudePricingLive = require('./providers/claude/pricing-live');
+const { normalizeClaude, normalizeCodex } = require('./providers/normalize');
 
 let win = null;
 let tray = null;
 let settings = null;
 let settingsPath = null;
 let watchDebounce = null;
+let watchMaxWait = null;
 let saveBoundsDebounce = null;
 let isQuitting = false;
+
+const WATCH_DEBOUNCE_MS = 150;
+const WATCH_MAX_WAIT_MS = 900;
+const RECONCILE_INTERVAL_MS = 30 * 1000;
 
 const DEFAULT_SETTINGS = {
   bounds: { width: 460, height: 820 },
@@ -37,7 +45,7 @@ function migrateLegacyData(userData) {
       'settings.json',
       'claude-usage-cache.json', 'codex-usage-cache.json',
       'claude-limits-cache.json', 'codex-limits-cache.json',
-      'pricing-live.json',
+      'pricing-live.json', 'openai-pricing.json', 'anthropic-pricing.json',
     ];
     for (const f of carry) {
       const src = path.join(legacy, f);
@@ -134,22 +142,34 @@ function createWindow() {
 
   // Debug: WIDGET_SHOT=<path> saves a capture of the rendered page after load.
   if (process.env.WIDGET_SHOT) {
-    win.webContents.once('did-finish-load', () => {
-      setTimeout(async () => {
-        try {
-          const img = await win.webContents.capturePage();
-          fs.writeFileSync(process.env.WIDGET_SHOT, img.toPNG());
-          await win.webContents.executeJavaScript(
-            `document.querySelector('.scroll-area').scrollTop = 99999`
-          );
-          await new Promise((r) => setTimeout(r, 400));
-          const img2 = await win.webContents.capturePage();
-          fs.writeFileSync(process.env.WIDGET_SHOT.replace('.png', '-2.png'), img2.toPNG());
-          console.log('shots saved');
-        } catch (e) {
-          console.error('shot failed:', e);
+    win.webContents.once('did-finish-load', async () => {
+      try {
+        // Some headless/background launchers inherit a hidden Windows show
+        // state. Explicitly reveal only this opt-in verification window so
+        // Chromium paints a surface before capturePage runs.
+        win.showInactive();
+        // Large local histories can take longer than a fixed timeout. The
+        // renderer marks itself ready only after the first complete render.
+        for (let i = 0; i < 90; i += 1) {
+          const ready = await win.webContents.executeJavaScript(`document.body.dataset.ready === 'true'`);
+          if (ready) break;
+          await new Promise((r) => setTimeout(r, 500));
         }
-      }, 3500);
+        await new Promise((r) => setTimeout(r, 250));
+        win.webContents.invalidate();
+        await new Promise((r) => setTimeout(r, 100));
+        const img = await win.webContents.capturePage();
+        fs.writeFileSync(process.env.WIDGET_SHOT, img.toPNG());
+        await win.webContents.executeJavaScript(`document.querySelector('.scroll-area').scrollTop = 99999`);
+        await new Promise((r) => setTimeout(r, 400));
+        win.webContents.invalidate();
+        await new Promise((r) => setTimeout(r, 100));
+        const img2 = await win.webContents.capturePage();
+        fs.writeFileSync(process.env.WIDGET_SHOT.replace('.png', '-2.png'), img2.toPNG());
+        console.log('shots saved');
+      } catch (e) {
+        console.error('shot failed:', e);
+      }
     });
   }
   // Closing the window (X / Alt+F4) keeps the app alive in the tray,
@@ -233,49 +253,36 @@ function publicSettings() {
 
 /* ---------------- usage aggregation (both providers) ---------------- */
 
-// Both providers' buckets are normalized to one shape so the renderer can
-// merge them freely:
-//   { provider, date, hour, model, project, session, msgs,
-//     input, output, cacheRead, cacheWrite, reasoning,   <- token counts
-//     cost, cIn, cOut, cCr, cCw, cRs, cacheSavings, priced }
-// Claude: cacheRead/cacheWrite are real log counts (5m+1h writes merged).
-// Codex: `cached` maps to cacheRead; writes have no token counts in Codex
-// logs, so cacheWrite is 0 while cCw carries the estimated write surcharge.
-function normalizeClaude(b) {
-  return {
-    provider: 'claude',
-    date: b.date, hour: b.hour, model: b.model, project: b.project, session: b.session,
-    msgs: b.msgs,
-    input: b.input, output: b.output,
-    cacheRead: b.cacheRead, cacheWrite: b.cacheW5m + b.cacheW1h, reasoning: 0,
-    cost: b.cost, cIn: b.cIn, cOut: b.cOut, cCr: b.cCr, cCw: b.cCw, cRs: 0,
-    cacheSavings: b.cacheSavings, priced: b.priced,
-    projectDeleted: !!b.projectDeleted,
-  };
-}
+let aggregateInFlight = null;
+let aggregateRevision = 0;
 
-function normalizeCodex(b) {
-  return {
-    provider: 'codex',
-    date: b.date, hour: b.hour, model: b.model, project: b.project, session: b.session,
-    msgs: b.msgs,
-    input: b.input, output: b.output,
-    cacheRead: b.cached, cacheWrite: 0, reasoning: b.reasoning,
-    cost: b.cost, cIn: b.cIn, cOut: b.cOut, cCr: b.cCached, cCw: b.cWrite, cRs: b.cReasoning,
-    cacheSavings: b.cacheSavings, priced: b.priced,
-    projectDeleted: !!b.projectDeleted,
-  };
-}
-
-async function aggregateAll() {
-  const [claude, codex] = await Promise.all([claudeUsage.aggregate(), codexUsage.aggregate()]);
-  return {
-    buckets: [...claude.buckets.map(normalizeClaude), ...codex.buckets.map(normalizeCodex)],
-    generatedAt: Date.now(),
-    fileCount: claude.fileCount + codex.fileCount,
-    codexLimitsSnapshot: codex.limits, // newest rate-limit state from the Codex logs
-    pricing: codexPricingLive.status(),
-  };
+function aggregateAll() {
+  // IPC bootstrap, watcher events, pricing callbacks, and manual refreshes can
+  // arrive together. They all consume the same immutable aggregation result
+  // instead of making the providers walk their caches concurrently.
+  if (aggregateInFlight) return aggregateInFlight;
+  const revision = ++aggregateRevision;
+  aggregateInFlight = (async () => {
+    const [claude, codex] = await Promise.all([claudeUsage.aggregate(), codexUsage.aggregate()]);
+    const visibleModel = (b) => !/^nexus[-_. ]*gpt(?:[-_. ]|$)/i.test(String(b.model || ''));
+    return {
+      buckets: [
+        ...claude.buckets.filter(visibleModel).map(normalizeClaude),
+        ...codex.buckets.filter(visibleModel).map(normalizeCodex),
+      ],
+      generatedAt: Date.now(),
+      revision,
+      fileCount: claude.fileCount + codex.fileCount,
+      codexLimitsSnapshot: codex.limits, // newest rate-limit state from the Codex logs
+      pricing: {
+        openai: codexPricingLive.status(),
+        anthropic: claudePricingLive.status(),
+      },
+    };
+  })().finally(() => {
+    aggregateInFlight = null;
+  });
+  return aggregateInFlight;
 }
 
 /* ---------------- plan limits ----------------
@@ -342,21 +349,85 @@ function pushCodexLimits(snapshot) {
 /* ---------------- update loop ---------------- */
 
 let lastSig = '';
-let aggregating = false;
+let updateInFlight = null;
+let updateQueued = false;
+let updateQueuedForce = false;
+let updateQueuedAfterRevision = 0;
 
-async function pushUpdate(force = false) {
-  if (aggregating) return; // never stack aggregations
-  aggregating = true;
+function hashSignatureValue(hash, value) {
+  if (value === null) {
+    hash.update('null;');
+    return;
+  }
+
+  const type = typeof value;
+  if (type === 'string') {
+    hash.update(`string:${Buffer.byteLength(value, 'utf8')}:`);
+    hash.update(value);
+    return;
+  }
+  if (type === 'number') {
+    const encoded = Number.isNaN(value) ? 'NaN'
+      : value === Infinity ? 'Infinity'
+        : value === -Infinity ? '-Infinity'
+          : Object.is(value, -0) ? '-0'
+            : String(value);
+    hash.update(`number:${encoded};`);
+    return;
+  }
+  if (type === 'boolean' || type === 'undefined' || type === 'bigint') {
+    hash.update(`${type}:${String(value)};`);
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    hash.update(`array:${value.length}:[`);
+    for (const item of value) hashSignatureValue(hash, item);
+    hash.update(']');
+    return;
+  }
+  if (value instanceof Date) {
+    hash.update(`date:${value.toISOString()};`);
+    return;
+  }
+
+  const keys = Object.keys(value).sort();
+  hash.update(`object:${keys.length}:{`);
+  for (const key of keys) {
+    hashSignatureValue(hash, key);
+    hashSignatureValue(hash, value[key]);
+  }
+  hash.update('}');
+}
+
+function updateSignature(data) {
+  const hash = crypto.createHash('sha256');
+  const stablePayload = { ...data };
+  // These transport fields intentionally change on every aggregation. The
+  // revision orders responses; generatedAt preserves snapshot timing. Neither
+  // represents a usage-state change that should trigger a full renderer pass.
+  delete stablePayload.generatedAt;
+  delete stablePayload.revision;
+  hashSignatureValue(hash, stablePayload);
+  return hash.digest('hex');
+}
+
+async function aggregateAfter(revision) {
+  let data = await aggregateAll();
+  // An IPC bootstrap may already have been aggregating when a watcher event
+  // arrived. Never let that pre-event pass satisfy the event-driven refresh.
+  while (data.revision <= revision) data = await aggregateAll();
+  return data;
+}
+
+async function publishUpdate(force, afterRevision) {
   try {
-    const data = await aggregateAll();
+    const data = await aggregateAfter(afterRevision);
     if (!win || win.isDestroyed()) return;
-    // cheap change signature: only re-render the UI when numbers actually moved
-    let msgs = 0, toks = 0;
-    for (const b of data.buckets) {
-      msgs += b.msgs;
-      toks += b.input + b.output + b.cacheRead + b.cacheWrite;
-    }
-    const sig = `${data.fileCount}:${data.buckets.length}:${msgs}:${toks}`;
+    // Canonical hashing covers every bucket field and all payload metadata, so
+    // redistributions, reasoning tokens, deletions, and price-only changes are
+    // observable even when top-level token totals happen to stay unchanged.
+    const sig = updateSignature(data);
     if (force || sig !== lastSig) {
       lastSig = sig;
       win.webContents.send('usage:update', data);
@@ -366,8 +437,76 @@ async function pushUpdate(force = false) {
     pushCodexLimits(data.codexLimitsSnapshot);
   } catch (err) {
     console.error('aggregate failed:', err);
-  } finally {
-    aggregating = false;
+  }
+}
+
+function pushUpdate(force = false) {
+  // A pass started at or before this revision cannot contain the event that
+  // requested this update. aggregateAfter() advances beyond this boundary.
+  const afterRevision = aggregateRevision;
+  if (updateInFlight) {
+    // One follow-up pass is enough for any burst, but remember whether any
+    // caller requires a forced renderer/pricing update.
+    updateQueued = true;
+    updateQueuedForce = updateQueuedForce || force;
+    updateQueuedAfterRevision = Math.max(updateQueuedAfterRevision, afterRevision);
+    return updateInFlight;
+  }
+
+  updateInFlight = (async () => {
+    let nextForce = force;
+    let nextAfterRevision = afterRevision;
+    do {
+      updateQueued = false;
+      updateQueuedForce = false;
+      updateQueuedAfterRevision = 0;
+      await publishUpdate(nextForce, nextAfterRevision);
+      if (!updateQueued) break;
+      nextForce = updateQueuedForce;
+      nextAfterRevision = updateQueuedAfterRevision;
+    } while (true);
+  })().finally(() => {
+    updateInFlight = null;
+  });
+  return updateInFlight;
+}
+
+const usageWatchers = new Map();
+
+function flushWatchedUsage() {
+  clearTimeout(watchDebounce);
+  clearTimeout(watchMaxWait);
+  watchDebounce = null;
+  watchMaxWait = null;
+  pushUpdate();
+}
+
+function scheduleWatchedUsage() {
+  clearTimeout(watchDebounce);
+  watchDebounce = setTimeout(flushWatchedUsage, WATCH_DEBOUNCE_MS);
+  // Keep the existing quiet-period debounce, but bound each write burst so a
+  // continuously appended log still publishes fresh data at a steady cadence.
+  if (!watchMaxWait) watchMaxWait = setTimeout(flushWatchedUsage, WATCH_MAX_WAIT_MS);
+}
+
+function attachUsageWatcher(dir) {
+  if (usageWatchers.has(dir)) return;
+  try {
+    const watcher = fs.watch(dir, { recursive: true }, () => {
+      scheduleWatchedUsage();
+    });
+    usageWatchers.set(dir, watcher);
+    watcher.on('error', (err) => {
+      if (usageWatchers.get(dir) !== watcher) return;
+      usageWatchers.delete(dir);
+      watcher.close();
+      console.error(`fs.watch failed for ${dir}, retrying during reconciliation:`, err.message);
+    });
+    watcher.on('close', () => {
+      if (usageWatchers.get(dir) === watcher) usageWatchers.delete(dir);
+    });
+  } catch (err) {
+    console.error(`fs.watch failed for ${dir}, retrying during reconciliation:`, err.message);
   }
 }
 
@@ -377,18 +516,16 @@ function startWatcher() {
   if (!cacheFresh) setTimeout(() => pushClaudeLimits(), 2000);
   setInterval(() => pushClaudeLimits(), 5 * 60 * 1000); // gentle cadence; the endpoint 429s easily
 
-  for (const dir of [claudeUsage.PROJECTS_DIR, ...codexUsage.SESSION_DIRS]) {
-    try {
-      fs.watch(dir, { recursive: true }, () => {
-        clearTimeout(watchDebounce);
-        watchDebounce = setTimeout(() => pushUpdate(), 500);
-      });
-    } catch (err) {
-      console.error(`fs.watch failed for ${dir}, falling back to polling only:`, err.message);
-    }
-  }
-  // Live mode: re-check every second (per-file mtime cache keeps this cheap).
-  setInterval(() => pushUpdate(), 1000);
+  const usageDirs = [...new Set([claudeUsage.PROJECTS_DIR, ...codexUsage.SESSION_DIRS])];
+  for (const dir of usageDirs) attachUsageWatcher(dir);
+  // fs.watch provides the live path. This slower pass reconciles missed or
+  // unavailable watcher events without walking every log cache once a second.
+  // It also picks up directories created after startup and replaces watchers
+  // that failed or closed, while the map prevents duplicate attachments.
+  setInterval(() => {
+    for (const dir of usageDirs) attachUsageWatcher(dir);
+    pushUpdate();
+  }, RECONCILE_INTERVAL_MS);
 }
 
 const gotLock = app.requestSingleInstanceLock();
@@ -412,6 +549,7 @@ if (!gotLock) {
     codexLimits.init(userData);
     // costs re-push (force: token totals are unchanged) once fresh prices land
     codexPricingLive.init(userData, () => pushUpdate(true));
+    claudePricingLive.init(userData, () => pushUpdate(true));
 
     lastGoodClaudeLimits = claudeLimits.loadCached();
     if (lastGoodClaudeLimits) lastClaudeLimits = { ...lastGoodClaudeLimits, stale: true };

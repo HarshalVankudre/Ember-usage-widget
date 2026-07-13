@@ -38,7 +38,7 @@ app.whenReady().then(async () => {
     const svg = fs
       .readFileSync(path.join(__dirname, 'fire.svg'), 'utf8')
       .replace('width="32" height="32"', 'width="256" height="256"');
-    const html = `<!doctype html><html><head><style>html,body{margin:0;background:transparent;overflow:hidden}svg{display:block}</style></head><body>${svg}</body></html>`;
+    const html = `<!doctype html><html lang="en"><head><style>html,body{margin:0;background:transparent;overflow:hidden}svg{display:block}</style></head><body>${svg}</body></html>`;
 
     const win = new BrowserWindow({
       width: 256,
