@@ -19,7 +19,7 @@ and honest API-equivalent cost — updated live from the logs already on your ma
 
 <br />
 
-<img src="docs/ember.png" width="460" alt="The current Ember usage ledger showing API-equivalent value, Claude and Codex plan headroom, rolling windows, filters, and token totals" />
+<img src="docs/ember.png" width="460" alt="The current Ember usage ledger showing API-equivalent value, Claude and Codex plan headroom, the separate Fable 5 weekly quota, rolling windows, filters, and token totals" />
 
 <sub>The current Ember usage ledger — local data, live limits, official API rates.</sub>
 
@@ -35,12 +35,12 @@ Ember turns those invisible meters into one calm, always-available desktop view.
 
 | 🔥 Live headroom | ◉ Honest cost | ⏱ Complete history |
 |---|---|---|
-| Claude and Codex session and weekly limits, with reset countdowns. | Request-level pricing using each provider's official billing rules. | Durable local history, even after the original session logs are deleted. |
+| Claude and Codex session and weekly limits—including Claude's separate Fable 5 quota—with reset countdowns. | Request-level pricing using each provider's official billing rules. | Durable local history, even after the original session logs are deleted. |
 
 ### Everything important, at a glance
 
 - **One headline number** for combined Claude Code and Codex API-equivalent value
-- **5-hour and 7-day windows** for the pace of your current work
+- **5-hour and 7-day windows**, including Claude's separate Fable 5 weekly quota
 - **Provider and model filters** for instant isolation of any slice
 - **Token ledger** for input, output, cache reads, cache writes, and measured reasoning
 - **Interactive burn history** with daily drill-downs and custom date-and-time ranges
@@ -78,8 +78,8 @@ Ember supports **Windows 11**. Windows 11 22H2 or newer is recommended for the a
 
 1. Open the **[latest release](https://github.com/HarshalVankudre/Ember-usage-widget/releases/latest)**.
 2. Choose the build that fits you:
-   - `Ember Setup 1.2.0.exe` — one-click per-user install, shortcuts, tray, and autostart
-   - `Ember Portable 1.2.0.exe` — one self-contained executable, no installation
+   - `Ember Setup 1.2.1.exe` — one-click per-user install, shortcuts, tray, and autostart
+   - `Ember Portable 1.2.1.exe` — one self-contained executable, no installation
 3. Launch Ember. Existing local Claude Code and Codex sessions appear automatically.
 
 No API keys. No account setup. No database to configure.

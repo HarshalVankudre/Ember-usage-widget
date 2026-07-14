@@ -1408,16 +1408,36 @@ function fmtResetDay(iso) {
 function claudeRows(l) {
   const d = l.data || {};
   const rows = [];
+  const modelRows = new Set();
   if (d.five_hour) {
     rows.push({ name: 'Current session', sub: () => fmtCountdown(d.five_hour.resets_at), u: d.five_hour.utilization });
   }
   if (d.seven_day) {
     rows.push({ name: 'Weekly · all models', sub: () => fmtResetDay(d.seven_day.resets_at), u: d.seven_day.utilization });
   }
-  for (const [key, label] of [['seven_day_opus', 'Weekly · Opus'], ['seven_day_sonnet', 'Weekly · Sonnet']]) {
+  for (const [key, label] of [
+    ['seven_day_opus', 'Weekly · Opus'],
+    ['seven_day_sonnet', 'Weekly · Sonnet'],
+    ['seven_day_fable', 'Weekly · Fable 5'],
+    ['seven_day_fable_5', 'Weekly · Fable 5'],
+  ]) {
     const v = d[key];
-    if (v && v.utilization != null && v.utilization > 0) {
+    const showAtZero = key.startsWith('seven_day_fable');
+    if (v && v.utilization != null && (showAtZero || v.utilization > 0) && !modelRows.has(label)) {
       rows.push({ name: label, sub: () => fmtResetDay(v.resets_at), u: v.utilization });
+      modelRows.add(label);
+    }
+  }
+
+  // Newer account API payloads put model-specific quotas in a generic limits
+  // array instead of a named seven_day_* field. Fable currently arrives with
+  // display_name "Fable", while the product-facing model name is Fable 5.
+  for (const v of Array.isArray(d.limits) ? d.limits : []) {
+    const displayName = v && v.scope && v.scope.model && v.scope.model.display_name;
+    if (v && v.kind === 'weekly_scoped' && /^fable(?:\s*5)?$/i.test(displayName || '')
+      && v.percent != null && !modelRows.has('Weekly · Fable 5')) {
+      rows.push({ name: 'Weekly · Fable 5', sub: () => fmtResetDay(v.resets_at), u: v.percent });
+      modelRows.add('Weekly · Fable 5');
     }
   }
   return rows;
