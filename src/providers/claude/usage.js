@@ -7,8 +7,10 @@ const os = require('os');
 const { costOf } = require('./pricing');
 const { costOf: codexCostOf } = require('../codex/pricing');
 const { isOpenAIModel } = require('../model-attribution');
+const { PROJECTS_DIR: CLAUDEX_PROJECTS_DIR } = require('../claudex-paths');
 
-const PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
+const CLAUDE_PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
+const PROJECTS_DIRS = [CLAUDE_PROJECTS_DIR, CLAUDEX_PROJECTS_DIR];
 
 const CACHE_VERSION = 4; // v4: local minute precision appended to cached entries
 const LEGACY_ENTRY_LENGTH = 13;
@@ -80,8 +82,13 @@ async function listJsonlFiles(dir) {
   return out;
 }
 
+function projectsRootOf(file) {
+  return PROJECTS_DIRS.find((dir) => file === dir || file.startsWith(`${dir}${path.sep}`))
+    || CLAUDE_PROJECTS_DIR;
+}
+
 function projectOf(file) {
-  const rel = path.relative(PROJECTS_DIR, file);
+  const rel = path.relative(projectsRootOf(file), file);
   const slug = rel.split(path.sep)[0] || 'unknown';
   // "C--Users-you-Desktop-my-app" -> "Desktop/my/app" style readable name
   let name = slug.replace(/^C--Users-[^-]+-?/, '').replace(/-/g, '/');
@@ -90,7 +97,7 @@ function projectOf(file) {
 }
 
 function sessionOf(file) {
-  const rel = path.relative(PROJECTS_DIR, file);
+  const rel = path.relative(projectsRootOf(file), file);
   const parts = rel.split(path.sep);
   // <project>/<session>.jsonl  OR  <project>/<session>/subagents/.../*.jsonl
   if (parts.length === 2) return path.basename(parts[1], '.jsonl');
@@ -108,7 +115,7 @@ function localParts(ts) {
 
 // entry: [dedupKey, date, hour, model, input, output, cacheRead, cacheW5m,
 //         cacheW1h, speed, inferenceGeo, webSearches, serviceTier, minute]
-function parseContent(text) {
+function parseContent(text, source = 'claude') {
   const entries = [];
   for (const line of text.split('\n')) {
     if (!line || line.indexOf('"usage"') === -1) continue;
@@ -133,7 +140,7 @@ function parseContent(text) {
     const tools = u.server_tool_use || {};
     const webSearches = Math.max(0, Number(tools.web_search_requests || tools.web_searches || 0));
     const stableFallback = [
-      obj.timestamp || '', msg.model,
+      source, obj.timestamp || '', msg.model,
       u.input_tokens || 0, u.output_tokens || 0, u.cache_read_input_tokens || 0,
       write5, write1, u.speed || '', u.inference_geo || '', webSearches,
     ].join(':');
@@ -159,7 +166,7 @@ function parseContent(text) {
 }
 
 async function aggregate() {
-  const files = await listJsonlFiles(PROJECTS_DIR);
+  const files = (await Promise.all(PROJECTS_DIRS.map(listJsonlFiles))).flat();
   const liveCache = {};
   const forceReparse = cacheNeedsReparse;
   let cacheDirty = forceReparse;
@@ -185,7 +192,8 @@ async function aggregate() {
     }
     let entries = null;
     try {
-      entries = parseContent(await fsp.readFile(file, 'utf8'));
+      const source = projectsRootOf(file) === CLAUDEX_PROJECTS_DIR ? 'claudex' : 'claude';
+      entries = parseContent(await fsp.readFile(file, 'utf8'), source);
     } catch {
       /* preserve cached history at legacy precision if a file is unreadable */
     }
@@ -291,4 +299,11 @@ async function aggregate() {
   return { buckets: list, generatedAt: Date.now(), fileCount: files.length };
 }
 
-module.exports = { init, aggregate, parseContent, PROJECTS_DIR };
+module.exports = {
+  init,
+  aggregate,
+  parseContent,
+  PROJECTS_DIR: CLAUDE_PROJECTS_DIR,
+  PROJECTS_DIRS,
+  CLAUDEX_PROJECTS_DIR,
+};

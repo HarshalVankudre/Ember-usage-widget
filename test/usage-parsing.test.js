@@ -4,6 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const codexUsage = require('../src/providers/codex/usage');
 const claudeUsage = require('../src/providers/claude/usage');
+const claudexPaths = require('../src/providers/claudex-paths');
 
 test('parses Codex cached input as a subset without double-counting', () => {
   const timestamp = new Date(2026, 6, 1, 10, 37, 0, 0).toISOString();
@@ -72,5 +73,20 @@ test('Claude fallback dedup keys are deterministic across reparses', () => {
     timestamp: '2026-07-01T10:00:00Z',
     message: { model: 'claude-sonnet-5', usage: { input_tokens: 10, output_tokens: 5 } },
   });
-  assert.equal(claudeUsage.parseContent(line)[0][0], claudeUsage.parseContent(line)[0][0]);
+  const claudeKey = claudeUsage.parseContent(line, 'claude')[0][0];
+  assert.equal(claudeKey, claudeUsage.parseContent(line, 'claude')[0][0]);
+  assert.notEqual(claudeKey, claudeUsage.parseContent(line, 'claudex')[0][0]);
+});
+
+test('scans ClaudeX transcripts through the shared Claude-shaped parser', () => {
+  assert.equal(claudeUsage.PROJECTS_DIRS.includes(claudeUsage.CLAUDEX_PROJECTS_DIR), true);
+  assert.notEqual(claudeUsage.CLAUDEX_PROJECTS_DIR, claudeUsage.PROJECTS_DIR);
+});
+
+test('honors ClaudeX custom config directories', () => {
+  const custom = claudexPaths.resolveConfigDir(
+    { CLAUDEX_CONFIG_DIR: '~/portable-claudex' },
+    'C:\\Users\\dev'
+  );
+  assert.match(custom.replace(/\\/g, '/'), /C:\/Users\/dev\/portable-claudex$/);
 });

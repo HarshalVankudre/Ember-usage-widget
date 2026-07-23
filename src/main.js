@@ -7,10 +7,12 @@ const crypto = require('crypto');
 const claudeUsage = require('./providers/claude/usage');
 const claudeLimits = require('./providers/claude/limits');
 const codexUsage = require('./providers/codex/usage');
+const opencodeUsage = require('./providers/opencode/usage');
 const codexLimits = require('./providers/codex/limits');
 const codexPricingLive = require('./providers/codex/pricing-live');
 const claudePricingLive = require('./providers/claude/pricing-live');
 const { normalizeClaude, normalizeCodex } = require('./providers/normalize');
+const { isFirstPartyModel } = require('./providers/model-attribution');
 
 let win = null;
 let tray = null;
@@ -263,16 +265,21 @@ function aggregateAll() {
   if (aggregateInFlight) return aggregateInFlight;
   const revision = ++aggregateRevision;
   aggregateInFlight = (async () => {
-    const [claude, codex] = await Promise.all([claudeUsage.aggregate(), codexUsage.aggregate()]);
-    const visibleModel = (b) => !/^nexus[-_. ]*gpt(?:[-_. ]|$)/i.test(String(b.model || ''));
+    const [claude, codex, opencode] = await Promise.all([
+      claudeUsage.aggregate(), codexUsage.aggregate(), opencodeUsage.aggregate(),
+    ]);
+    // Claude-shaped compatibility transcripts can contain arbitrary gateway
+    // models. Ember is a Claude + Codex ledger, so keep only first-party IDs.
+    const visibleModel = (b) => isFirstPartyModel(b.model);
     return {
       buckets: [
         ...claude.buckets.filter(visibleModel).map(normalizeClaude),
         ...codex.buckets.filter(visibleModel).map(normalizeCodex),
+        ...opencode.buckets.filter(visibleModel).map(normalizeCodex),
       ],
       generatedAt: Date.now(),
       revision,
-      fileCount: claude.fileCount + codex.fileCount,
+      fileCount: claude.fileCount + codex.fileCount + opencode.fileCount,
       codexLimitsSnapshot: codex.limits, // newest rate-limit state from the Codex logs
       pricing: {
         openai: codexPricingLive.status(),
@@ -287,8 +294,8 @@ function aggregateAll() {
 
 /* ---------------- plan limits ----------------
    Claude: polled from Anthropic's account API (rate-limits aggressively, so
-   cached + backed off). Codex: rides along with usage — the newest
-   rate_limits snapshot in the rollout logs IS the plan-limit state. */
+   cached + backed off). Codex: use the newest account snapshot from either
+   native rollout logs or ClaudeX's shared Codex limit cache. */
 
 let lastClaudeLimits = null;
 let lastGoodClaudeLimits = null;
@@ -331,14 +338,16 @@ async function pushClaudeLimits(force = false) {
 }
 
 function pushCodexLimits(snapshot) {
-  let l = codexLimits.fromSnapshot(snapshot);
+  const native = codexLimits.fromSnapshot(snapshot);
+  const claudex = codexLimits.loadClaudex();
+  let l = codexLimits.newest(native, claudex);
   if (l.ok) {
     codexLimits.saveCached(l);
-  } else if (lastCodexLimits && lastCodexLimits.ok) {
-    l = lastCodexLimits; // keep serving the last good snapshot
+  } else if (lastCodexLimits && lastCodexLimits.ok && lastCodexLimits.source !== 'claudex') {
+    l = lastCodexLimits; // native rollout history can outlive a temporarily unavailable scan
   }
   if (l.ok && Date.now() - l.fetchedAt > 30 * 60 * 1000) l = { ...l, stale: true };
-  const sig = JSON.stringify([l.ok, l.fetchedAt, l.stale, l.reason]);
+  const sig = JSON.stringify([l.ok, l.fetchedAt, l.stale, l.reason, l.plan, l.windows, l.source]);
   lastCodexLimits = l;
   if (sig !== lastCodexSig) {
     lastCodexSig = sig;
@@ -490,7 +499,7 @@ function scheduleWatchedUsage() {
 }
 
 function attachUsageWatcher(dir) {
-  if (usageWatchers.has(dir)) return;
+  if (usageWatchers.has(dir) || !fs.existsSync(dir)) return;
   try {
     const watcher = fs.watch(dir, { recursive: true }, () => {
       scheduleWatchedUsage();
@@ -516,7 +525,12 @@ function startWatcher() {
   if (!cacheFresh) setTimeout(() => pushClaudeLimits(), 2000);
   setInterval(() => pushClaudeLimits(), 5 * 60 * 1000); // gentle cadence; the endpoint 429s easily
 
-  const usageDirs = [...new Set([claudeUsage.PROJECTS_DIR, ...codexUsage.SESSION_DIRS])];
+  const usageDirs = [...new Set([
+    ...claudeUsage.PROJECTS_DIRS,
+    ...codexUsage.SESSION_DIRS,
+    opencodeUsage.DATA_DIR,
+    codexLimits.CLAUDEX_USAGE_DIR,
+  ])];
   for (const dir of usageDirs) attachUsageWatcher(dir);
   // fs.watch provides the live path. This slower pass reconciles missed or
   // unavailable watcher events without walking every log cache once a second.
@@ -546,6 +560,7 @@ if (!gotLock) {
     claudeUsage.init(userData);
     claudeLimits.init(userData);
     codexUsage.init(userData);
+    opencodeUsage.init(userData);
     codexLimits.init(userData);
     // costs re-push (force: token totals are unchanged) once fresh prices land
     codexPricingLive.init(userData, () => pushUpdate(true));
@@ -553,8 +568,14 @@ if (!gotLock) {
 
     lastGoodClaudeLimits = claudeLimits.loadCached();
     if (lastGoodClaudeLimits) lastClaudeLimits = { ...lastGoodClaudeLimits, stale: true };
-    lastCodexLimits = codexLimits.loadCached();
-    if (lastCodexLimits) lastCodexLimits = { ...lastCodexLimits, stale: true };
+    const cachedCodexLimits = codexLimits.loadCached();
+    const liveClaudexLimits = codexLimits.loadClaudex();
+    lastCodexLimits = liveClaudexLimits.ok
+      ? codexLimits.newest(cachedCodexLimits, liveClaudexLimits)
+      : cachedCodexLimits && cachedCodexLimits.source !== 'claudex' ? cachedCodexLimits : null;
+    if (lastCodexLimits && Date.now() - lastCodexLimits.fetchedAt > 30 * 60 * 1000) {
+      lastCodexLimits = { ...lastCodexLimits, stale: true };
+    }
 
     if (settings.firstRun) {
       settings.firstRun = false;
@@ -583,7 +604,11 @@ if (!gotLock) {
 
 /* ---------------- IPC ---------------- */
 
-ipcMain.handle('usage:get', () => aggregateAll());
+ipcMain.handle('usage:get', async () => {
+  const data = await aggregateAll();
+  pushCodexLimits(data.codexLimitsSnapshot);
+  return data;
+});
 ipcMain.handle('limits:get', () => ({ claude: lastClaudeLimits, codex: lastCodexLimits }));
 ipcMain.handle('settings:get', () => publicSettings());
 ipcMain.on('win:hide', () => hideToTray());
