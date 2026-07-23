@@ -6,7 +6,7 @@
 
 ### Your AI coding burn, without the blind spots.
 
-One private desktop ledger for **Claude Code + Codex** usage, plan headroom,<br />
+One private desktop ledger for **Claude Code + Codex + OpenCode** usage, plan headroom,<br />
 and honest API-equivalent cost — updated live from the logs already on your machine.
 
 [![Latest release](https://img.shields.io/github/v/release/HarshalVankudre/Ember-usage-widget?style=flat-square&label=latest&color=ff7547)](https://github.com/HarshalVankudre/Ember-usage-widget/releases/latest)
@@ -61,14 +61,14 @@ Ember prices every request under its own provider before combining totals. Offic
 | Cache reads | Discounted prompt-cache rate | Discounted cached-input rate |
 | Cache writes | Logged 5-minute and 1-hour writes | Measured when present; otherwise a clearly labeled estimate range |
 | Other modifiers | Fast mode, US inference geography, and logged web-search fees | GPT-5.4+ long-context multipliers |
-| Unknown pricing | Excluded and marked **Unpriced** | Excluded and marked **Unpriced** |
+| Unknown pricing | Dollar value omitted and marked **Unpriced** | Dollar value omitted and marked **Unpriced** |
 
 <details>
 <summary><strong>More about attribution and accuracy</strong></summary>
 
-OpenAI model IDs used through Claude Code compatibility gateways are reattributed to Codex and repriced with OpenAI rules before aggregation. Codex reasoning is reported as a subset of output and is never counted twice. Internal `nexus-gpt-*` compatibility traffic is excluded from totals, charts, filters, projects, and model breakdowns.
+OpenAI model IDs used through Claude Code compatibility gateways or OpenCode's OpenAI provider are reattributed to Codex and repriced with OpenAI rules before aggregation. Codex reasoning is reported as a subset of output and is never counted twice. Non-Claude/OpenAI gateway models (such as Qwen) and internal `nexus-gpt-*` traffic are excluded from totals, charts, filters, projects, and model breakdowns.
 
-When a Codex log omits cache-write counts, Ember presents the conservative estimate alongside the lower bound. The coverage line under the headline tells you exactly how much traffic was priced and how many calls were excluded.
+When a Codex log omits cache-write counts, Ember presents the conservative estimate alongside the lower bound. The coverage line under the headline tells you exactly how much traffic was priced and how many calls remain unpriced. Unpriced calls and tokens stay in the usage totals; only their dollar value is omitted.
 
 </details>
 
@@ -78,8 +78,8 @@ Ember supports **Windows 11**. Windows 11 22H2 or newer is recommended for the a
 
 1. Open the **[latest release](https://github.com/HarshalVankudre/Ember-usage-widget/releases/latest)**.
 2. Choose the build that fits you:
-   - `Ember Setup 1.2.1.exe` — one-click per-user install, shortcuts, tray, and autostart
-   - `Ember Portable 1.2.1.exe` — one self-contained executable, no installation
+   - `Ember Setup 1.3.0.exe` — one-click per-user install, shortcuts, tray, and autostart
+   - `Ember Portable 1.3.0.exe` — one self-contained executable, no installation
 3. Launch Ember. Existing local Claude Code and Codex sessions appear automatically.
 
 No API keys. No account setup. No database to configure.
@@ -94,7 +94,7 @@ Codex rollouts ───┘
 
 | Source | Claude | Codex |
 |---|---|---|
-| Usage | `~/.claude/projects/**/*.jsonl` | `~/.codex/sessions` and `archived_sessions` |
+| Usage | `~/.claude/projects/**/*.jsonl` | `~/.codex/sessions`, `archived_sessions`, and OpenAI requests in `~/.local/share/opencode/opencode.db` |
 | Plan limits | Read-only Anthropic account API using Claude Code's existing OAuth token | Local `rate_limits` snapshots from rollout logs |
 | Updates | Debounced filesystem watcher plus periodic reconciliation | Debounced filesystem watcher plus periodic reconciliation |
 

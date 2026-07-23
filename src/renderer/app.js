@@ -292,6 +292,10 @@ function passesLiveFilters(b) {
   return true;
 }
 
+function passesProviderFilter(b) {
+  return state.selectedProviders.size === 0 || state.selectedProviders.has(b.provider);
+}
+
 function bucketMatchesRange(b, source, range, frozenBounds = null) {
   const [from, to] = range;
   if (b.date < from || b.date > to) return false;
@@ -332,6 +336,19 @@ function filteredBuckets() {
   return state.selectedDay ? rows.filter((b) => b.date === state.selectedDay) : rows;
 }
 
+// The Models table remains a stable filter control: it follows the active
+// date/provider range, but deliberately ignores the model selection itself.
+// That lets the non-selected rows stay visible (and blurred) while the rest of
+// the dashboard is filtered to the chosen model.
+function modelTableFilteredBuckets() {
+  const range = rangeForPreset();
+  return state.buckets.filter((b) => {
+    if (!bucketMatchesRange(b, state, range)) return false;
+    if (!passesProviderFilter(b)) return false;
+    return !state.selectedDay || b.date === state.selectedDay;
+  });
+}
+
 function dayTotals(rows) {
   const byDay = new Map();
   for (const b of rows) {
@@ -359,6 +376,29 @@ let resetChartHover = () => {};
 
 function setKey(value) {
   return [...value].sort().join(',');
+}
+
+function addModelBucket(byModel, b) {
+  const mk = mkey(b);
+  let m = byModel.get(mk);
+  if (!m) {
+    m = { provider: b.provider, model: b.model,
+      input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0, costMin: 0, costMax: 0,
+      estimated: false, pricedCalls: 0, unpricedCalls: 0, priced: b.priced };
+    byModel.set(mk, m);
+  }
+  m.input += b.input;
+  m.output += b.output;
+  m.cacheRead += b.cacheRead;
+  m.cacheWrite += b.cacheWrite;
+  m.cost += b.cost;
+  m.reasoning += b.reasoning || 0;
+  m.costMin += b.costMin || 0;
+  m.costMax += b.costMax || b.cost || 0;
+  m.estimated = m.estimated || !!b.estimated;
+  m.pricedCalls += b.pricedCalls ?? (b.priced ? b.msgs : 0);
+  m.unpricedCalls += b.unpricedCalls ?? (b.priced ? 0 : b.msgs);
+  if (!b.priced) m.priced = false;
 }
 
 function scheduleLiveRender() {
@@ -401,6 +441,10 @@ function render({ animate = false } = {}) {
 
   const rows = filteredBuckets();
   const byDay = dayTotals(chartFilteredBuckets());
+  const modelTableData = new Map();
+  for (const b of modelTableFilteredBuckets()) {
+    if (!state.hiddenProjects.has(b.project)) addModelBucket(modelTableData, b);
+  }
 
   const tot = {
     cost: 0, costMin: 0, costMax: 0,
@@ -504,20 +548,7 @@ function render({ animate = false } = {}) {
     sessions.add(`${b.provider}|${b.session}`);
     days.add(b.date);
 
-    let m = byModel.get(mk);
-    if (!m) {
-      m = { provider: b.provider, model: b.model,
-        input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0, costMin: 0, costMax: 0,
-        estimated: false, pricedCalls: 0, unpricedCalls: 0, priced: b.priced };
-      byModel.set(mk, m);
-    }
-    m.input += b.input; m.output += b.output; m.cacheRead += b.cacheRead; m.cacheWrite += b.cacheWrite; m.cost += b.cost;
-    m.reasoning += b.reasoning || 0;
-    m.costMin += b.costMin || 0; m.costMax += b.costMax || b.cost || 0;
-    m.estimated = m.estimated || !!b.estimated;
-    m.pricedCalls += b.pricedCalls ?? (b.priced ? b.msgs : 0);
-    m.unpricedCalls += b.unpricedCalls ?? (b.priced ? 0 : b.msgs);
-    if (!b.priced) m.priced = false;
+    addModelBucket(byModel, b);
 
   }
 
@@ -562,7 +593,7 @@ function render({ animate = false } = {}) {
   const allTok = tot.input + tot.output + tot.cacheRead + tot.cacheWrite;
   $('heroTokens').textContent = fmtTok(allTok) + ' tokens';
   $('heroMsgs').textContent = tot.msgs.toLocaleString() + ' calls';
-  renderPricingConfidence(tot);
+  renderPricingConfidence(tot, byModel);
 
   // stat cards
   const codexOnly = visibleProviders.has('codex') && !visibleProviders.has('claude');
@@ -616,7 +647,7 @@ function render({ animate = false } = {}) {
     setKey(state.selectedModels), hiddenKey,
   ].join('|');
   if (sectionRenderKeys.modelTable !== detailKey) {
-    renderModelTable(byModel);
+    renderModelTable(modelTableData);
     sectionRenderKeys.modelTable = detailKey;
   }
 
@@ -639,34 +670,15 @@ function render({ animate = false } = {}) {
   }
 }
 
-function renderPricingConfidence(tot) {
+function renderPricingConfidence(tot, byModel) {
   const box = $('pricingConfidence');
   const summary = $('pricingSummary');
   const range = $('pricingRange');
   box.classList.remove('estimated', 'partial');
-  if (!tot.msgs) {
-    summary.textContent = 'No usage in this view';
-    range.textContent = '';
-    return;
-  }
-
-  const tokenTotal = tot.pricedTokens + tot.unpricedTokens;
-  const coverage = tokenTotal ? (tot.pricedTokens / tokenTotal) * 100 : 100;
-  const coverageText = tot.unpricedCalls > 0
-    ? `${Math.min(99.99, coverage).toFixed(coverage >= 99 ? 2 : 1)}%`
-    : '100%';
-  if (tot.unpricedCalls > 0) {
-    box.classList.add('partial');
-    summary.textContent = `${coverageText} of tokens priced · ${tot.unpricedCalls.toLocaleString()} calls excluded`;
-    box.title = 'Some models have no published official API price, so those calls are excluded from the dollar total.';
-  } else if (tot.estimated) {
-    box.classList.add('estimated');
-    summary.textContent = '100% officially priced · cache-write premium estimated';
-    box.title = 'Codex logs omit GPT-5.6 cache-write counts. The headline uses the conservative upper estimate.';
-  } else {
-    summary.textContent = '100% officially priced from measured token classes';
-    box.title = 'Every visible call has an official model price and measured token categories.';
-  }
+  const copy = window.EmberPricingConfidence.describePricingConfidence(tot, [...byModel.values()]);
+  if (copy.tone !== 'complete') box.classList.add(copy.tone);
+  summary.textContent = copy.summary;
+  box.title = copy.title;
 
   const spread = Math.max(0, tot.costMax - tot.costMin);
   range.textContent = spread >= 0.005 ? `lower ${fmtCost(tot.costMin)}` : '';
@@ -764,7 +776,18 @@ function renderModelTable(byModel) {
     return;
   }
   for (const m of entries) {
+    const key = `${m.provider}|${m.model}`;
+    const hasModelFilter = state.selectedModels.size > 0;
+    const selected = state.selectedModels.has(key);
     const tr = document.createElement('tr');
+    tr.className = 'model-filter-row';
+    tr.dataset.modelKey = key;
+    tr.tabIndex = 0;
+    tr.setAttribute('aria-selected', String(selected));
+    tr.setAttribute('aria-label', `${prettyModel(m.provider, m.model)}. ${selected ? 'Selected model filter; activate to clear.' : 'Activate to show only this model.'}`);
+    if (selected) tr.classList.add('is-selected');
+    else if (hasModelFilter) tr.classList.add('is-filtered-out');
+    tr.title = selected ? 'Click again to clear the model filter' : `Show only ${prettyModel(m.provider, m.model)} usage`;
     const modelCell = document.createElement('td');
     const name = document.createElement('span');
     name.className = 'mname';
@@ -810,6 +833,23 @@ function renderModelTable(byModel) {
       cost.textContent = fmtCost(m.cost);
     }
     tr.appendChild(cost);
+    const toggleModelFilter = () => {
+      const clear = state.selectedModels.size === 1 && state.selectedModels.has(key);
+      state.selectedModels = clear ? new Set() : new Set([key]);
+      state.expandedProject = null;
+      render();
+      requestAnimationFrame(() => {
+        const replacement = [...$('modelTable').querySelectorAll('tbody tr[data-model-key]')]
+          .find((row) => row.dataset.modelKey === key);
+        replacement?.focus({ preventScroll: true });
+      });
+    };
+    tr.addEventListener('click', toggleModelFilter);
+    tr.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      event.preventDefault();
+      toggleModelFilter();
+    });
     tbody.appendChild(tr);
   }
 }
@@ -845,6 +885,7 @@ function projTableRow(label, tok, cost, opts = {}) {
   const costEl = document.createElement('span');
   costEl.className = 'cost';
   costEl.textContent = cost;
+  if (cost === 'Unpriced') costEl.classList.add('unpriced');
   row.append(lbl, tokEl, costEl);
   return row;
 }
@@ -923,7 +964,7 @@ function buildProjectItem(wrap, name, p, max, isDeleted) {
   nameEl.title = name;
   const costEl = summary.querySelector('.proj-cost');
   costEl.textContent = projectCost;
-  if (p.unpricedCalls > 0) costEl.title = `${p.unpricedCalls.toLocaleString()} calls excluded because no official price is published`;
+  if (p.unpricedCalls > 0) costEl.title = `Dollar value omitted for ${p.unpricedCalls.toLocaleString()} calls because no official price is published`;
   else if (p.estimated) costEl.title = `Conservative estimate; lower bound ${fmtCost(p.costMin)}`;
   summary.title = isHidden
     ? 'Hidden from totals — right-click to unhide'
@@ -1461,7 +1502,7 @@ function claudeErrorMsg(l) {
 
 function codexErrorMsg(l) {
   return l.reason === 'no-data'
-    ? 'Run a Codex session once — limits are read from its local logs.'
+    ? 'Run Codex or ClaudeX once — limits are read from local account snapshots.'
     : 'Plan limits unavailable.';
 }
 
@@ -1542,7 +1583,7 @@ function renderLimits() {
       const mins = Math.round((Date.now() - l.fetchedAt) / 60000);
       if (mins >= 30) {
         const ago = mins < 120 ? `${mins} min` : `${Math.round(mins / 60)} hr`;
-        return `From your last Codex call, ${ago} ago — updates on the next one.`;
+        return `Codex account snapshot from ${ago} ago — updates after the next call.`;
       }
     }
     return null;

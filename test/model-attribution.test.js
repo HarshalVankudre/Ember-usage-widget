@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { isOpenAIModel } = require('../src/providers/model-attribution');
+const { isClaudeModel, isFirstPartyModel, isOpenAIModel } = require('../src/providers/model-attribution');
 const { normalizeClaude, normalizeCodex } = require('../src/providers/normalize');
 
 test('recognizes OpenAI model ids surfaced through compatibility gateways', () => {
@@ -33,6 +33,26 @@ test('does not reattribute Anthropic or custom provider ids', () => {
   }
 });
 
+test('keeps only first-party Claude and Codex model ids in the ledger', () => {
+  for (const model of [
+    'claude-opus-4-8',
+    'claude-sonnet-5',
+    'claude-3-5-sonnet-20241022',
+    'claude-instant-1.2',
+  ]) {
+    assert.equal(isClaudeModel(model), true, model);
+    assert.equal(isFirstPartyModel(model), true, model);
+  }
+
+  for (const model of ['gpt-5.6-sol', 'chatgpt-4o-latest', 'codex-mini', 'o3']) {
+    assert.equal(isFirstPartyModel(model), true, model);
+  }
+
+  for (const model of ['qwen3.8-max-preview', 'deepseek-v4', 'fugu-ultra', 'nexus-gpt-5-6-sol']) {
+    assert.equal(isFirstPartyModel(model), false, model);
+  }
+});
+
 test('reattributes Claude Code gateway usage to Codex pricing', () => {
   const normalized = normalizeClaude({
     date: '2026-07-13', hour: 16, model: 'gpt-5.6-sol',
@@ -59,7 +79,7 @@ test('reattributes Claude Code gateway usage to Codex pricing', () => {
 
 test('gateway and native Codex buckets share one provider-model key', () => {
   const gateway = normalizeClaude({
-    date: '2026-07-13', hour: 16, model: 'gpt-5.6-terra',
+    date: '2026-07-13', hour: 16, model: 'gpt-5.6-sol',
     project: 'Desktop/Saas/claudex', session: 'claude-session', msgs: 1,
     input: 100, output: 20, cacheRead: 50, cacheW5m: 0, cacheW1h: 0,
     cost: 0.001, costMin: 0.001, costMax: 0.001,
@@ -68,7 +88,7 @@ test('gateway and native Codex buckets share one provider-model key', () => {
     projectDeleted: false,
   });
   const native = normalizeCodex({
-    date: '2026-07-13', hour: 16, model: 'gpt-5.6-terra',
+    date: '2026-07-13', hour: 16, model: 'gpt-5.6-sol',
     project: '~ (home)', session: 'codex-session', msgs: 1,
     input: 100, output: 20, cached: 50, cacheWrite: 0, reasoning: 5,
     cost: 0, cIn: 0, cOut: 0, cCached: 0, cWrite: 0, cReasoning: 0,
