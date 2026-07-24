@@ -78,7 +78,7 @@ Ember supports **Windows 11**. Windows 11 22H2 or newer is recommended for the a
 
 1. Open the **[latest release](https://github.com/HarshalVankudre/Ember-usage-widget/releases/latest)**.
 2. Choose the build that fits you:
-   - `Ember Setup 1.3.0.exe` — one-click per-user install, shortcuts, tray, and autostart
+   - `Ember Setup 1.3.1.exe` — one-click per-user install, shortcuts, tray, and autostart
    - `Ember Portable 1.3.0.exe` — one self-contained executable, no installation
 3. Launch Ember. Existing local Claude Code and Codex sessions appear automatically.
 

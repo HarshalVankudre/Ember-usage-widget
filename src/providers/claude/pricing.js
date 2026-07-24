@@ -4,7 +4,7 @@
 // table and is superseded by the daily official-doc refresh when available.
 const PRICING_RULES = [
   { test: /(?:fable-5|mythos-5)/, input: 10, cacheW5m: 12.5, cacheW1h: 20, cacheRead: 1, output: 50, family: 'fable' },
-  { test: /opus-4-[5-9]/, input: 5, cacheW5m: 6.25, cacheW1h: 10, cacheRead: 0.5, output: 25, family: 'opus' },
+  { test: /(?:opus-5|opus-4-[5-9])/, input: 5, cacheW5m: 6.25, cacheW1h: 10, cacheRead: 0.5, output: 25, family: 'opus' },
   { test: /opus/, input: 15, cacheW5m: 18.75, cacheW1h: 30, cacheRead: 1.5, output: 75, family: 'opus' },
   {
     test: /sonnet-5/,
@@ -62,12 +62,12 @@ function priceFor(model, usageDate) {
 
 function supportsUsGeo(model) {
   const m = canonicalModel(model);
-  return /^(?:fable-5|mythos-5|opus-4-[6-9]|sonnet-5|sonnet-4-[6-9])$/.test(m);
+  return /^(?:fable-5|mythos-5|opus-5|opus-4-[6-9]|sonnet-5|sonnet-4-[6-9])$/.test(m);
 }
 
 function fastRates(model) {
   const m = canonicalModel(model);
-  if (m === 'opus-4-8') return { input: 10, output: 50 };
+  if (m === 'opus-5' || m === 'opus-4-8') return { input: 10, output: 50 };
   if (m === 'opus-4-7') return { input: 30, output: 150 };
   return null;
 }

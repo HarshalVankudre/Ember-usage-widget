@@ -80,6 +80,27 @@ test('prices Claude introductory, fast, regional, and server-tool usage', () => 
   assert.equal(fastUs.usRegion, true);
 });
 
+test('prices Opus 5 exactly like Opus 4.8', () => {
+  const opus48 = claude.priceFor('claude-opus-4-8');
+  const opus5 = claude.priceFor('claude-opus-5');
+  for (const rate of ['input', 'cacheW5m', 'cacheW1h', 'cacheRead', 'output']) {
+    assert.equal(opus5[rate], opus48[rate]);
+  }
+
+  const usage = {
+    input: 1_000_000,
+    output: 1_000_000,
+    cacheRead: 100_000,
+    speed: 'fast',
+    inferenceGeo: 'us',
+    webSearches: 2,
+  };
+  const opus5Cost = claude.costOf('claude-opus-5', usage);
+  close(opus5Cost.total, claude.costOf('claude-opus-4-8', usage).total);
+  assert.equal(opus5Cost.fast, true);
+  assert.equal(opus5Cost.usRegion, true);
+});
+
 test('parses Anthropic official model-price table rows', () => {
   const map = anthropicLive.buildMap(`
 | Model | Base Input Tokens | 5m Cache Writes | 1h Cache Writes | Cache Hits & Refreshes | Output Tokens |
