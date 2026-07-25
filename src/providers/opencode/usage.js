@@ -40,9 +40,34 @@ let cachePath = null;
 let rowCache = {};
 let cacheWrite = Promise.resolve();
 let aggregatePromise = null;
+// Reading this source costs a subprocess, so a pass only pays for it when the
+// database files have actually moved. WAL mode writes beside the main file,
+// which is why all three names are watched.
+let memo = null;
+let lastDbSig = '';
+
+function invalidate() {
+  memo = null;
+  lastDbSig = '';
+}
+
+function dbSignature() {
+  const parts = [];
+  for (const file of [DB_PATH, `${DB_PATH}-wal`, `${DB_PATH}-shm`]) {
+    try {
+      const st = fs.statSync(file);
+      parts.push(`${st.mtimeMs}:${st.size}`);
+    } catch {
+      parts.push('-');
+    }
+  }
+  return parts.join('|');
+}
 
 function init(userDataDir) {
   cachePath = path.join(userDataDir, 'opencode-usage-cache.json');
+  memo = null;
+  lastDbSig = '';
   try {
     const parsed = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
     rowCache = parsed && parsed.v === CACHE_VERSION && parsed.rows ? parsed.rows : {};
@@ -186,6 +211,8 @@ async function queryRows() {
 }
 
 async function aggregateOnce() {
+  const signature = dbSignature();
+  if (memo && signature === lastDbSig) return memo;
   try {
     const rows = await queryRows();
     let dirty = false;
@@ -204,7 +231,12 @@ async function aggregateOnce() {
     console.error('OpenCode usage scan failed:', err.message);
   }
   const buckets = parseRows(Object.values(rowCache));
-  return { buckets, generatedAt: Date.now(), fileCount: fs.existsSync(DB_PATH) ? 1 : 0 };
+  // Read the signature again after querying: opening the database updates the
+  // WAL sidecars, so recording the pre-query state would invalidate the memo
+  // on every pass and keep paying for the subprocess.
+  lastDbSig = dbSignature();
+  memo = { buckets, generatedAt: Date.now(), fileCount: fs.existsSync(DB_PATH) ? 1 : 0 };
+  return memo;
 }
 
 function aggregate() {
@@ -217,6 +249,7 @@ function aggregate() {
 module.exports = {
   init,
   aggregate,
+  invalidate,
   parseRows,
   projectOfDirectory,
   findOpenCodeBin,

@@ -8,6 +8,34 @@
 </head>
 <body>
   <main class="app" aria-label="Ember AI usage ledger">
+    <div class="mini-bar" id="miniBar">
+      <span class="mini-flame" aria-hidden="true">
+        <svg viewBox="0 0 44 52">
+          <g class="flame-g">
+            <path d="M24 2c1.5 10.8-8.2 15.2-5.8 24.3 1.3 4.8 6 7.2 5.7 12.8-.1 2.8-1.5 5.6-4 7.4C31.5 48 40 41.5 40 30.3 40 18.2 31.5 8.8 24 2Z" fill="#ff6b3d"/>
+            <path d="M14.2 13.8C7.5 20.2 4 27 4 34.2 4 44.5 11.6 51 22.7 51c3 0 5.6-.6 8-1.7-10.2-.6-16.4-6.5-13.8-15.3 1.9-6.2-.9-13-2.7-20.2Z" fill="#ff9a51"/>
+            <path d="M21.2 27.2c-3.8 4.1-5.4 7.5-5.4 11.1 0 5.2 3.7 8.7 8.9 8.7 5.4 0 9-3.6 9-8.6 0-5.1-3.7-9-7-12.1.4 4.8-2.4 6.6-5.5.9Z" fill="#ffd166"/>
+          </g>
+        </svg>
+      </span>
+      <div class="mini-body">
+        <div class="mini-top">
+          <strong class="mini-cost" id="miniCost">$0.00</strong>
+          <span class="mini-when" id="miniWhen">session</span>
+        </div>
+        <div class="mini-meter"><span class="mini-meter-bar"><i id="miniFill" style="--w:0%"></i></span><span class="mini-pct" id="miniPct">–</span></div>
+        <div class="mini-sub" id="miniSub">no activity yet</div>
+      </div>
+      <div class="mini-actions">
+        <button id="btnMiniExpand" class="wbtn" type="button" title="Expand to the full ledger" aria-label="Expand to the full ledger">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 6.5v-4h4M13.5 9.5v4h-4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <button id="btnMiniHide" class="wbtn wbtn-close" type="button" title="Hide to tray" aria-label="Hide to tray">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8m0-8-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        </button>
+      </div>
+    </div>
+
     <header class="titlebar">
       <div class="brand" aria-label="Ember">
         <span class="brand-mark" aria-hidden="true">
@@ -17,6 +45,9 @@
       </div>
       <div class="title-status" aria-live="polite"><span class="live-dot" id="liveDot"></span><span id="lastUpdated">Loading…</span></div>
       <div class="window-actions">
+        <button id="btnMini" class="wbtn" type="button" title="Compact mode" aria-label="Collapse to compact mode">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6.5 2.5v4h-4M9.5 13.5v-4h4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
         <button id="btnPin" class="wbtn" type="button" title="Always on top" aria-label="Toggle always on top" aria-pressed="false">
           <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m9.5 1.5 5 5-2.2.6-2.6 2.6.3 3.3-1.6-.1-2.2-2.2L2.5 14l-.5-.5 3.3-3.7-2.2-2.2-.1-1.6 3.3.3L8.9 3.7l.6-2.2Z" fill="currentColor"/></svg>
         </button>
@@ -33,7 +64,7 @@
       <div class="hero-main">
         <p class="hero-label" id="heroLabel">API-equivalent spend · all time</p>
         <div class="hero-cost" id="heroCost" aria-live="polite">$0.00</div>
-        <div class="hero-sub"><span id="heroTokens">0 tokens</span><span aria-hidden="true">/</span><span id="heroMsgs">0 calls</span></div>
+        <div class="hero-sub"><span id="heroTokens">0 tokens</span><span aria-hidden="true">/</span><span id="heroMsgs">0 calls</span><span class="hero-delta" id="heroDelta" hidden></span></div>
         <div class="pricing-confidence" id="pricingConfidence">
           <span class="confidence-mark" aria-hidden="true"></span>
           <span id="pricingSummary">Checking official-rate coverage…</span>
@@ -60,6 +91,7 @@
     <section class="windows" aria-label="Rolling usage windows">
       <article class="window-metric"><span>Last 5 hours</span><strong id="w5hCost">–</strong><small id="w5hTok">no activity</small></article>
       <article class="window-metric"><span>Last 7 days</span><strong id="wkCost">–</strong><small id="wkTok">no activity</small></article>
+      <article class="window-metric"><span>This month</span><strong id="mtdCost">–</strong><small id="mtdProj">no activity</small></article>
     </section>
 
     <section class="filters" aria-label="Usage filters">
@@ -100,6 +132,41 @@
     </section>
 
     <div class="scroll-area" tabindex="0" aria-label="Usage details">
+      <section class="panel quota-panel" aria-labelledby="quotaHeading">
+        <div class="panel-head">
+          <h2 id="quotaHeading">Session burn</h2>
+          <span class="panel-note" id="quotaNote">what one window buys</span>
+        </div>
+
+        <div class="quota-scopes" id="quotaScopes" role="tablist" aria-label="Quota window"></div>
+
+        <article class="quota-live" id="quotaLive" hidden>
+          <div class="quota-live-top">
+            <span class="quota-live-label" id="quotaLiveLabel">Current window</span>
+            <span class="quota-live-clock" id="quotaLiveClock"></span>
+          </div>
+          <div class="quota-live-figures">
+            <strong class="quota-live-cost" id="quotaLiveCost">$0.00</strong>
+            <span class="quota-live-tokens" id="quotaLiveTokens">no activity yet</span>
+          </div>
+          <div class="quota-meter" id="quotaMeter" hidden>
+            <div class="quota-meter-bar"><i id="quotaMeterFill" style="--w:0%"></i></div>
+            <span class="quota-meter-pct" id="quotaMeterPct">–</span>
+          </div>
+          <p class="quota-projection" id="quotaProjection"></p>
+        </article>
+
+        <div class="quota-metrics" id="quotaMetrics" role="group" aria-label="History metric"></div>
+
+        <div class="quota-chart-wrap">
+          <canvas id="quotaChart" role="application" tabindex="0" aria-label="Usage per window over time. Use left and right arrow keys to move between windows.">Usage per window</canvas>
+          <div id="quotaTip" class="chart-tip" hidden></div>
+        </div>
+
+        <p class="quota-verdict" id="quotaVerdict"></p>
+        <div class="quota-rows" id="quotaRows"></div>
+      </section>
+
       <section class="token-ledger" aria-labelledby="tokensHeading">
         <div class="panel-head"><h2 id="tokensHeading">Token ledger</h2><span class="panel-note">cost by billable class</span></div>
         <div class="stat-grid">
@@ -115,6 +182,12 @@
         <article><span>Burn / active day</span><strong id="insBurn">–</strong></article>
         <article><span>Sessions</span><strong id="insSessions">–</strong></article>
         <article><span>Input cache share</span><strong id="insCacheRate">–</strong></article>
+      </section>
+
+      <section class="panel hours-panel" aria-labelledby="hoursHeading">
+        <div class="panel-head"><h2 id="hoursHeading">Time of day</h2><span class="panel-note" id="hoursNote"></span></div>
+        <div class="hour-strip" id="hourStrip" role="img" aria-label="API-equivalent value by hour of day"></div>
+        <div class="hour-axis" aria-hidden="true"><span>00</span><span>06</span><span>12</span><span>18</span><span>23</span></div>
       </section>
 
       <section class="panel" aria-labelledby="chartHeading">
@@ -142,6 +215,17 @@
     <footer>
       <span>Local logs · official API rates</span>
       <div class="foot-actions">
+        <div class="export-wrap">
+          <button class="fbtn" id="btnExport" type="button" title="Export or copy" aria-label="Export or copy" aria-haspopup="menu" aria-expanded="false">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.5v7.5m0 0L5.2 7.2M8 10l2.8-2.8M2.8 11v1.7c0 .4.4.8.8.8h8.8c.4 0 .8-.4.8-.8V11" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+          <div class="export-menu" id="exportMenu" role="menu" aria-label="Export options" hidden>
+            <button type="button" role="menuitem" data-export="summary"><strong>Copy summary</strong><small>Markdown for a message or issue</small></button>
+            <button type="button" role="menuitem" data-export="windows-csv"><strong>Session windows · CSV</strong><small>One row per window, with quota rates</small></button>
+            <button type="button" role="menuitem" data-export="view-csv"><strong>Current view · CSV</strong><small>Day × model rows for the active filters</small></button>
+            <button type="button" role="menuitem" data-export="view-json"><strong>Current view · JSON</strong><small>Totals, models, projects and windows</small></button>
+          </div>
+        </div>
         <button class="fbtn" id="btnRefresh" type="button" title="Refresh data" aria-label="Refresh data">
           <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13 5.3A5.7 5.7 0 1 0 13.4 10M13 2v3.7H9.3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
         </button>
@@ -151,11 +235,14 @@
       </div>
     </footer>
 
+    <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
     <div id="settingsOverlay" class="settings-overlay" hidden>
       <section class="settings-card" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
         <div class="settings-head"><div><span class="section-kicker">Ember preferences</span><h2 id="settingsTitle">Settings & accuracy</h2></div><button class="wbtn" id="btnSettingsClose" type="button" aria-label="Close settings"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8m0-8-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button></div>
         <label class="setting-row"><span><strong>Launch at startup</strong><small>Keep usage monitoring ready in the tray</small></span><input type="checkbox" id="setAutostart" class="switch" /></label>
         <label class="setting-row"><span><strong>Always on top</strong><small>Pin Ember above other windows</small></span><input type="checkbox" id="setPin" class="switch" /></label>
+        <label class="setting-row"><span><strong>Compact mode</strong><small>Collapse to a strip showing the live window burn</small></span><input type="checkbox" id="setMini" class="switch" /></label>
         <div class="accuracy-note">
           <h3>How the number is calculated</h3>
           <p>API-equivalent value is reconstructed from local Claude Code and Codex token logs. Official standard API rates are refreshed daily and cached for offline use.</p>
@@ -166,6 +253,7 @@
     </div>
   </main>
   <script src="pricing-confidence.js"></script>
+  <script src="quota-view.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

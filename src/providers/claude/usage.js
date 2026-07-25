@@ -19,6 +19,16 @@ let cachePath = null; // set via init()
 let fileCache = {}; // filePath -> { mtimeMs, size, entries }
 let cacheNeedsReparse = false;
 let cacheWrite = Promise.resolve();
+// Dedup, bucketing and pricing dominate a pass; the file sweep is a tenth of
+// it. When the sweep proves nothing on disk moved, the previous result is
+// still exactly right, so reconciliation can run often without the cost.
+let memo = null;
+
+// Prices can change without any log changing. The pricing tables call this so
+// the next pass rebuilds instead of serving costs from the old rate table.
+function invalidate() {
+  memo = null;
+}
 
 function upgradeV3Files(files) {
   const upgraded = {};
@@ -51,6 +61,7 @@ function saveCache() {
 function init(userDataDir) {
   cachePath = path.join(userDataDir, 'claude-usage-cache.json');
   cacheNeedsReparse = false;
+  memo = null;
   try {
     const parsed = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
     if (parsed.v === CACHE_VERSION) {
@@ -171,13 +182,13 @@ async function aggregate() {
   const forceReparse = cacheNeedsReparse;
   let cacheDirty = forceReparse;
 
-  for (const file of files) {
-    let st;
-    try {
-      st = await fsp.stat(file);
-    } catch {
-      continue;
-    }
+  // One parallel stat sweep instead of a thousand serial round trips.
+  const stats = await Promise.all(files.map((file) => fsp.stat(file).catch(() => null)));
+
+  for (let i = 0; i < files.length; i += 1) {
+    const file = files[i];
+    const st = stats[i];
+    if (!st) continue;
     const prev = fileCache[file];
     if (!forceReparse && prev && prev.mtimeMs === st.mtimeMs && prev.size === st.size) {
       if (prev.gone) {
@@ -222,6 +233,9 @@ async function aggregate() {
   fileCache = liveCache;
   cacheNeedsReparse = false;
   if (cacheDirty) saveCache();
+  // Nothing was reparsed, added or removed, so the records are byte-identical
+  // to the pass that produced the memo.
+  if (!cacheDirty && memo) return memo;
 
   // Global dedup (resumed sessions copy older messages into new files),
   // then bucket by date|hour|minute|model|project|session.
@@ -296,12 +310,14 @@ async function aggregate() {
     b.projectDeleted = !projectLive.get(b.project);
     list.push(b);
   }
-  return { buckets: list, generatedAt: Date.now(), fileCount: files.length };
+  memo = { buckets: list, generatedAt: Date.now(), fileCount: files.length };
+  return memo;
 }
 
 module.exports = {
   init,
   aggregate,
+  invalidate,
   parseContent,
   PROJECTS_DIR: CLAUDE_PROJECTS_DIR,
   PROJECTS_DIRS,
