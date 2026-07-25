@@ -8,7 +8,9 @@ const { setLivePrices } = require('./pricing');
 const SOURCE_URL = 'https://developers.openai.com/api/docs/pricing.md';
 const REFRESH_MS = 24 * 3600 * 1000;
 const RETRY_MS = 60 * 60 * 1000;
-const CACHE_VERSION = 2;
+// v3 records whether a row is priced in context tiers, so the surcharge comes
+// from the official table instead of a bundled assumption.
+const CACHE_VERSION = 3;
 
 let cachePath = null;
 let state = { live: false, fetchedAt: 0, models: 0 };
@@ -35,6 +37,10 @@ function buildMap(markdown) {
       continue;
     }
     if (!Array.isArray(row) || (row.length !== 4 && row.length !== 5)) continue;
+    // OpenAI labels the context-tiered rows "(<272K context length)". That
+    // marker is the only statement that a model carries a long-context
+    // surcharge, so it is recorded rather than inferred from the family.
+    const longContext = /<\s*272k context length/i.test(String(row[0]));
     const id = cleanModelName(row[0]);
     if (!/^(?:gpt|chatgpt|chat-|codex|o\d)/.test(id) || map[id]) continue;
     const numeric = (v) => (typeof v === 'number' && isFinite(v) ? v : null);
@@ -48,6 +54,7 @@ function buildMap(markdown) {
       cached: cached == null ? input : cached,
       write: write == null ? undefined : write,
       output,
+      longContext,
     };
   }
   return map;

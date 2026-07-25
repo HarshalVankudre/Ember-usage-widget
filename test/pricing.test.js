@@ -25,18 +25,45 @@ test('does not invent a public API price for Codex Spark', () => {
   assert.equal(c.total, 0);
 });
 
-test('applies historical OpenAI long-context rates per request', () => {
-  const atCap = codex.costOf('gpt-5.6-sol', {
+test('applies the long-context surcharge only to models OpenAI prices in tiers', () => {
+  // gpt-5.4 is published as "(<272K context length)", so a larger request is
+  // billed at 2x input and 1.5x output.
+  const atCap = codex.costOf('gpt-5.4', {
     input: 272_000, output: 10_000, cacheWrite: 0, cacheWriteKnown: true, totalInput: 272_000,
   });
-  close(atCap.total, 1.66);
+  close(atCap.total, 0.83);
   assert.equal(atCap.longContext, false);
 
-  const above = codex.costOf('gpt-5.6-sol', {
+  const above = codex.costOf('gpt-5.4', {
     input: 272_001, output: 10_000, cacheWrite: 0, cacheWriteKnown: true, totalInput: 272_001,
   });
-  close(above.total, 3.17001);
+  close(above.total, 1.585005);
   assert.equal(above.longContext, true);
+});
+
+test('a flat-priced model stays flat however large the request', () => {
+  // The gpt-5.6 family carries no context tier in OpenAI's table, so charging
+  // one would invent a surcharge that was never billed.
+  const huge = codex.costOf('gpt-5.6-sol', {
+    input: 272_001, output: 10_000, cacheWrite: 0, cacheWriteKnown: true, totalInput: 272_001,
+  });
+  close(huge.total, 1.660005);
+  assert.equal(huge.longContext, false);
+});
+
+test('Codex-only model variants have no published price and stay unpriced', () => {
+  // OpenAI publishes gpt-5.6-sol. It publishes nothing for the -pro and -fast
+  // ids Codex reports, and a "pro" tier costs several times the base model, so
+  // borrowing the base rate would be a fabricated number rather than a missing
+  // one.
+  for (const model of ['gpt-5.6-sol-pro', 'gpt-5.6-sol-fast', 'gpt-5.6-terra-fast', 'gpt-5.4-mini-fast']) {
+    const c = codex.costOf(model, { input: 1_000_000, output: 100_000 });
+    assert.equal(c.known, false, `${model} should have no official price`);
+    assert.equal(c.total, 0);
+  }
+  // A dated snapshot is still the same model, and is still priced.
+  assert.equal(codex.priceFor('gpt-5.6-sol-2026-01-15').input, 5);
+  assert.equal(codex.priceFor('gpt-4o-mini-2024-07-18').input, 0.15);
 });
 
 test('makes missing OpenAI cache writes an explicit bounded estimate', () => {
@@ -60,9 +87,12 @@ test('parses the first official OpenAI standard-price rows', () => {
     ["chatgpt-4o-latest", 5, "-", 15],
     ["gpt-5.6-sol", 2.5, 0.25, 15],
   `);
-  assert.deepEqual(map['gpt-5.6-sol'], { input: 5, cached: 0.5, write: 6.25, output: 30 });
-  assert.deepEqual(map['gpt-5.5'], { input: 5, cached: 0.5, write: undefined, output: 30 });
+  assert.deepEqual(map['gpt-5.6-sol'], { input: 5, cached: 0.5, write: 6.25, output: 30, longContext: false });
+  assert.deepEqual(map['gpt-5.5'], { input: 5, cached: 0.5, write: undefined, output: 30, longContext: true });
   assert.equal(map['chatgpt-4o-latest'].cached, 5);
+  // The context-tier marker is read from the table rather than assumed.
+  assert.equal(map['gpt-5.5'].longContext, true);
+  assert.equal(map['gpt-5.6-sol'].longContext, false);
 });
 
 test('prices Claude introductory, fast, regional, and server-tool usage', () => {

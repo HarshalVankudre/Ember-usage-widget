@@ -24,6 +24,12 @@ const state = {
   hiddenProjects: loadHiddenProjects(), // excluded from all totals, shown blurred
   settings: { alwaysOnTop: false, launchAtStartup: true },
   limits: null, // { claude, codex }
+  worstLimit: 0,
+  lastView: null,
+  quota: null,  // durable plan-meter history from the main process
+  quotaRevision: 0,
+  quotaScope: null,
+  quotaMetric: 'cost',
   pricing: null,
   dataRevision: 0,
   usageRevision: null,
@@ -52,6 +58,7 @@ function saveHiddenProjects() {
 
 const $ = (id) => document.getElementById(id);
 const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+let APP_VERSION = '';
 
 /* ───────────────────────── helpers ───────────────────────── */
 
@@ -127,6 +134,11 @@ function updateValue(el, to, renderFn, animate) {
 
 const paintMoney = (el, v) => { el.innerHTML = moneyHTML(v); };
 const paintCost = (el, v) => { el.textContent = fmtCost(v); };
+const paintTok = (el, v) => { el.innerHTML = tokHTML(Math.max(0, v)); };
+const paintTokens = (el, v) => { el.textContent = `${fmtTok(Math.max(0, v))} tokens`; };
+const paintCalls = (el, v) => { el.textContent = `${Math.round(Math.max(0, v)).toLocaleString()} calls`; };
+const paintCount = (el, v) => { el.textContent = Math.round(Math.max(0, v)).toLocaleString(); };
+const paintPct = (el, v) => { el.textContent = `${Math.round(Math.max(0, v))}%`; };
 
 function dstr(d) {
   const y = d.getFullYear();
@@ -370,6 +382,7 @@ const sectionRenderKeys = {
   modelTable: null,
   projects: null,
   chart: null,
+  quota: null,
 };
 let liveRenderFrame = 0;
 let resetChartHover = () => {};
@@ -584,6 +597,7 @@ function render({ animate = false } = {}) {
   $('w5hTok').textContent = w5.msgs ? `${fmtTok(w5.tok)} tokens · ${w5.msgs.toLocaleString()} calls` : 'no activity';
   updateValue($('wkCost'), wk.cost, paintMoney, animate);
   $('wkTok').textContent = wk.msgs ? `${fmtTok(wk.tok)} tokens · ${wk.msgs.toLocaleString()} calls` : 'no activity';
+  renderMonthProjection(animate);
 
   // hero: only officially priced usage contributes to the number. Unknown
   // model prices are called out separately instead of silently counting $0.
@@ -591,16 +605,18 @@ function render({ animate = false } = {}) {
   $('heroLabel').textContent = (tot.unpricedCalls ? 'Priced API value · ' : 'API-equivalent value · ') + detailLabel;
   updateValue($('heroCost'), tot.cost, paintMoney, animate);
   const allTok = tot.input + tot.output + tot.cacheRead + tot.cacheWrite;
-  $('heroTokens').textContent = fmtTok(allTok) + ' tokens';
-  $('heroMsgs').textContent = tot.msgs.toLocaleString() + ' calls';
+  updateValue($('heroTokens'), allTok, paintTokens, animate);
+  updateValue($('heroMsgs'), tot.msgs, paintCalls, animate);
+  renderPeriodDelta(tot.cost);
   renderPricingConfidence(tot, byModel);
+  renderHours(rows);
 
   // stat cards
   const codexOnly = visibleProviders.has('codex') && !visibleProviders.has('claude');
   const showReasoningCard = tot.cacheWrite === 0 && (codexOnly || tot.reasoning > 0);
-  $('stIn').innerHTML = tokHTML(tot.input);
-  $('stOut').innerHTML = tokHTML(tot.output);
-  $('stCr').innerHTML = tokHTML(tot.cacheRead);
+  updateValue($('stIn'), tot.input, paintTok, animate);
+  updateValue($('stOut'), tot.output, paintTok, animate);
+  updateValue($('stCr'), tot.cacheRead, paintTok, animate);
   $('stInCost').textContent = fmtCost(tot.cIn);
   $('stOutCost').textContent = fmtCost(tot.cOut)
     + (tot.cTool > 0 ? ` + ${fmtCost(tot.cTool)} tools` : '')
@@ -608,24 +624,25 @@ function render({ animate = false } = {}) {
   $('stCrCost').textContent = fmtCost(tot.cCr);
   if (showReasoningCard) {
     $('stCwLabel').textContent = 'Reasoning';
-    $('stCw').innerHTML = tokHTML(tot.reasoning);
+    updateValue($('stCw'), tot.reasoning, paintTok, animate);
     $('stCwCost').textContent = 'included in output'
       + (tot.cCw > 0 ? ` · ≈${fmtCost(tot.cCw)} write est.` : '');
     $('stCwCard').title = 'Codex reasoning tokens are included in output billing'
       + (tot.cCw > 0 ? '; estimated cache-write premium retained below' : '');
   } else {
     $('stCwLabel').textContent = 'Cache write';
-    $('stCw').innerHTML = tokHTML(tot.cacheWrite);
+    updateValue($('stCw'), tot.cacheWrite, paintTok, animate);
     $('stCwCost').textContent = `${tot.estimated && tot.cCw > 0 ? '≈' : ''}${fmtCost(tot.cCw)}`;
     $('stCwCard').title = 'Measured cache writes; an estimated premium may also appear in cost';
   }
 
   // insights
-  $('insSaved').textContent = fmtCost(tot.saved);
-  $('insBurn').textContent = days.size ? fmtCost(tot.cost / days.size) : '$0.00';
-  $('insSessions').textContent = sessions.size.toLocaleString();
+  updateValue($('insSaved'), tot.saved, paintCost, animate);
+  updateValue($('insBurn'), days.size ? tot.cost / days.size : 0, paintCost, animate);
+  updateValue($('insSessions'), sessions.size, paintCount, animate);
   const inTotal = tot.input + tot.cacheRead + tot.cacheWrite;
-  $('insCacheRate').textContent = inTotal ? Math.round((tot.cacheRead / inTotal) * 100) + '%' : '–';
+  if (inTotal) updateValue($('insCacheRate'), (tot.cacheRead / inTotal) * 100, paintPct, animate);
+  else updateValue($('insCacheRate'), 0, (el) => { el.textContent = '–'; }, false);
 
   const providersKey = `${state.dataRevision}|${setKey(state.selectedProviders)}`;
   if (sectionRenderKeys.providers !== providersKey) {
@@ -668,6 +685,152 @@ function render({ animate = false } = {}) {
     renderChart(byDay);
     sectionRenderKeys.chart = chartKey;
   }
+
+  // Session burn answers a different question than the filters do, so it
+  // tracks the raw data and the meter history rather than the active view.
+  const quotaKey = [state.dataRevision, state.quotaRevision, state.quotaScope, state.quotaMetric].join('|');
+  if (sectionRenderKeys.quota !== quotaKey) {
+    renderQuota(animate);
+    sectionRenderKeys.quota = quotaKey;
+  }
+
+  // Whatever the user is looking at is what export writes out.
+  state.lastView = {
+    tot, byModel, byProject, w5, wk, todayCost,
+    dayCount: days.size, sessionCount: sessions.size,
+  };
+  renderMini();
+}
+
+/* ───────────────────────── period comparison ─────────────────────────
+   A number alone says nothing about direction. Each bounded range is
+   measured against the stretch of equal length immediately before it. */
+
+function shiftRangeBack([from, to]) {
+  const start = new Date(`${from}T00:00:00`);
+  const end = new Date(`${to}T00:00:00`);
+  if (isNaN(start) || isNaN(end)) return null;
+  const days = Math.round((end - start) / 86400000) + 1;
+  if (!(days > 0)) return null;
+  const prevStart = new Date(start);
+  prevStart.setDate(prevStart.getDate() - days);
+  const prevEnd = new Date(start);
+  prevEnd.setDate(prevEnd.getDate() - 1);
+  return { range: [dstr(prevStart), dstr(prevEnd)], days };
+}
+
+function renderPeriodDelta(currentCost) {
+  const el = $('heroDelta');
+  // "All time" has nothing before it, and a single chosen day is a slice of a
+  // range rather than a period of its own.
+  if (state.preset === 'all' || state.selectedDay) {
+    el.hidden = true;
+    return;
+  }
+  const previous = shiftRangeBack(rangeForPreset());
+  if (!previous) {
+    el.hidden = true;
+    return;
+  }
+  const [from, to] = previous.range;
+  let prevCost = 0;
+  let prevCalls = 0;
+  for (const b of state.buckets) {
+    if (b.date < from || b.date > to) continue;
+    if (state.hiddenProjects.has(b.project)) continue;
+    if (!passesLiveFilters(b)) continue;
+    prevCost += b.cost;
+    prevCalls += b.msgs;
+  }
+  if (!prevCalls) {
+    el.hidden = true;
+    return;
+  }
+  const change = (currentCost - prevCost) / prevCost;
+  const pct = Math.round(Math.abs(change) * 100);
+  const label = previous.days === 1 ? 'yesterday' : `prev ${previous.days}d`;
+  el.hidden = false;
+  el.classList.toggle('up', change > 0.005);
+  el.classList.toggle('down', change < -0.005);
+  el.textContent = pct === 0
+    ? `level vs ${label}`
+    : `${change > 0 ? '+' : '−'}${pct}% vs ${label}`;
+  el.title = `${fmtCost(prevCost)} over the ${previous.days === 1 ? 'previous day' : `previous ${previous.days} days`} (${from} to ${to}), under the same filters`;
+}
+
+/* ───────────────────────── month projection ─────────────────────────
+   Month-to-date is live regardless of the chosen range, so the pace it
+   implies is the one figure a monthly budget can actually be judged on. */
+
+function renderMonthProjection(animate) {
+  const now = new Date();
+  const monthStart = dstr(new Date(now.getFullYear(), now.getMonth(), 1));
+  const t = today();
+  let cost = 0;
+  let calls = 0;
+  for (const b of state.buckets) {
+    if (b.date < monthStart || b.date > t) continue;
+    if (state.hiddenProjects.has(b.project)) continue;
+    if (!passesLiveFilters(b)) continue;
+    cost += b.cost;
+    calls += b.msgs;
+  }
+  updateValue($('mtdCost'), cost, paintMoney, animate);
+  const el = $('mtdProj');
+  if (!calls) {
+    el.textContent = 'no activity';
+    el.title = '';
+    return;
+  }
+  const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+  // Count today as the fraction already elapsed, so a projection made at
+  // breakfast does not read the morning as a whole day of work.
+  const elapsed = now.getDate() - 1 + (now.getHours() * 60 + now.getMinutes()) / 1440;
+  const projected = elapsed > 0.2 ? (cost / elapsed) * daysInMonth : null;
+  el.textContent = projected ? `≈${fmtCost(projected)} by month end` : `${calls.toLocaleString()} calls`;
+  el.title = projected
+    ? `At the pace set over the first ${elapsed.toFixed(1)} days of the month`
+    : '';
+}
+
+/* ───────────────────────── time of day ───────────────────────── */
+
+function renderHours(rows) {
+  const strip = $('hourStrip');
+  const byHour = new Array(24).fill(0);
+  const callsByHour = new Array(24).fill(0);
+  let total = 0;
+  for (const b of rows) {
+    if (state.hiddenProjects.has(b.project)) continue;
+    const hour = Number.isInteger(b.hour) ? b.hour : 0;
+    byHour[hour] += b.cost;
+    callsByHour[hour] += b.msgs;
+    total += b.cost;
+  }
+  const max = Math.max(...byHour);
+  strip.replaceChildren();
+  for (let h = 0; h < 24; h += 1) {
+    const cell = document.createElement('span');
+    cell.className = 'hour-cell';
+    // Square-root shading: a single runaway hour would otherwise flatten
+    // every other hour into the background.
+    const intensity = max > 0 ? Math.sqrt(byHour[h] / max) : 0;
+    cell.style.setProperty('--i', intensity.toFixed(3));
+    if (byHour[h] > 0) cell.classList.add('has');
+    cell.title = `${String(h).padStart(2, '0')}:00 — ${fmtCost(byHour[h])} · ${callsByHour[h].toLocaleString()} calls`;
+    strip.appendChild(cell);
+  }
+  const note = $('hoursNote');
+  if (!total) {
+    note.textContent = 'no usage in this range';
+    strip.setAttribute('aria-label', 'No usage in this range');
+    return;
+  }
+  const peak = byHour.indexOf(max);
+  const share = Math.round((max / total) * 100);
+  note.textContent = `peak ${String(peak).padStart(2, '0')}:00 · ${fmtCost(max)} · ${share}% of the range`;
+  strip.setAttribute('aria-label',
+    `API-equivalent value by hour of day. Busiest hour ${peak}:00 at ${fmtCost(max)}, ${share} percent of the range.`);
 }
 
 function renderPricingConfidence(tot, byModel) {
@@ -1426,6 +1589,589 @@ function setupChartHover() {
   });
 }
 
+/* ───────────────────────── session burn ─────────────────────────
+   The panel that answers what a plan meter never does: what one window of
+   work actually costs, and whether that is holding steady. Windows come
+   from the logs (every 5-hour block ever worked) and, where Ember has
+   watched the meter, carry the percentage of quota they consumed. */
+
+const QUOTA_METRICS = [
+  { id: 'cost', label: 'Value', needsRate: false },
+  { id: 'tokens', label: 'Tokens', needsRate: false },
+  { id: 'perPct', label: 'Per 1%', needsRate: true },
+];
+
+const HOUR_MS = 3600 * 1000;
+
+// Rebuilt only when the data or the meter history moves — the compact strip
+// asks for it once a second.
+const scopeCache = { key: '', scopes: [] };
+
+function quotaScopeList() {
+  const key = `${state.dataRevision}|${state.quotaRevision}`;
+  if (scopeCache.key === key) return scopeCache.scopes;
+  const scopes = buildQuotaScopes();
+  scopeCache.key = key;
+  scopeCache.scopes = scopes;
+  return scopes;
+}
+
+function buildQuotaScopes() {
+  const providers = new Set(state.buckets.map((b) => b.provider));
+  const meters = (state.quota && state.quota.meters) || [];
+  const meterFor = (provider, kind) =>
+    meters.find((m) => m.provider === provider && m.kind === kind) || null;
+  const both = providers.has('claude') && providers.has('codex');
+  const out = [];
+  const push = (provider, mode, meter, windowMs, short, title) => {
+    out.push({
+      id: `${provider}|${mode}`,
+      provider,
+      mode,
+      meter,
+      windowMs,
+      label: both ? `${PROVIDERS[provider].label} · ${short}` : short,
+      title,
+    });
+  };
+
+  if (providers.has('claude')) {
+    // Claude's session window is a documented fixed length, so the block
+    // history is reconstructable whether or not a meter has been seen yet.
+    push('claude', 'session', meterFor('claude', 'session'), 5 * HOUR_MS, '5h session',
+      'Claude Code five-hour session windows, rebuilt from the logs');
+    push('claude', 'period', meterFor('claude', 'weekly'), 7 * 24 * HOUR_MS, 'Week',
+      'Claude weekly quota periods');
+  }
+  if (providers.has('codex')) {
+    // Codex session length varies by plan, so it is only offered once the
+    // account snapshot has reported one. Guessing five hours would be wrong.
+    const session = meterFor('codex', 'session');
+    if (session && session.windowMinutes) {
+      push('codex', 'session', session, session.windowMinutes * 60000,
+        `${Math.round(session.windowMinutes / 60)}h session`, 'Codex session windows');
+    }
+    const weekly = meterFor('codex', 'weekly');
+    push('codex', 'period', weekly,
+      (weekly && weekly.windowMinutes ? weekly.windowMinutes : 7 * 24 * 60) * 60000,
+      'Week', 'Codex weekly quota periods');
+  }
+  return out;
+}
+
+function activeQuotaScope(scopes) {
+  return scopes.find((s) => s.id === state.quotaScope) || scopes[0] || null;
+}
+
+const quotaCache = { key: '', rows: [], scope: null };
+
+function quotaRowsFor(scope) {
+  const key = [state.dataRevision, state.quotaRevision, scope.id, scope.windowMs].join('|');
+  quotaCache.scope = scope;
+  if (quotaCache.key === key) return quotaCache.rows;
+  const Q = window.EmberQuota;
+  const now = Date.now();
+  // The panel deliberately ignores the date, provider and model filters: a
+  // plan meter counts everything, so a filtered view would not be comparable.
+  const rows = Q.timeline(state.buckets, scope.provider);
+  const windows = scope.meter ? Q.quotaWindows(null, scope.meter, { rows, now, limit: 80 }) : [];
+  const blocks = scope.mode === 'session'
+    ? Q.sessionBlocks(null, { rows, windowMs: scope.windowMs, now, limit: 48, anchors: windows })
+    : Q.fixedPeriods(null, {
+      rows,
+      periodMs: scope.windowMs,
+      anchorMs: windows.length ? windows[0].endsAt : 0,
+      now,
+      limit: 26,
+    });
+  Q.attachObserved(blocks, windows, { rows, now });
+  quotaCache.key = key;
+  quotaCache.rows = blocks;
+  return blocks;
+}
+
+function metricValue(row, metric) {
+  if (metric === 'tokens') return row.totals.tokens;
+  if (metric === 'perPct') return row.rate ? row.rate.costPerPct : 0;
+  return row.totals.cost;
+}
+
+function fmtClock(ms) {
+  return new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+}
+
+function fmtShortDay(ms) {
+  return new Date(ms).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+}
+
+function quotaRowLabel(row, scope) {
+  return scope.mode === 'session'
+    ? `${fmtShortDay(row.startedAt)} · ${fmtClock(row.startedAt)}–${fmtClock(row.endsAt)}`
+    : `${fmtShortDay(row.startedAt)} – ${fmtShortDay(row.endsAt - 1)}`;
+}
+
+function fmtRemaining(ms) {
+  if (!(ms > 0)) return 'closing';
+  const mins = Math.ceil(ms / 60000);
+  if (mins < 60) return `${mins} min left`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs} hr ${mins % 60} min left`;
+  const days = Math.floor(hrs / 24);
+  return `${days}d ${hrs % 24}h left`;
+}
+
+function renderQuotaScopes(scopes, active) {
+  const wrap = $('quotaScopes');
+  wrap.innerHTML = '';
+  if (scopes.length < 2) return;
+  for (const scope of scopes) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'chip quota-scope';
+    btn.setAttribute('role', 'tab');
+    const on = scope.id === active.id;
+    btn.classList.toggle('active', on);
+    btn.setAttribute('aria-selected', String(on));
+    btn.textContent = scope.label;
+    if (scope.title) btn.title = scope.title;
+    btn.onclick = () => {
+      state.quotaScope = scope.id;
+      resetQuotaHover();
+      render();
+    };
+    wrap.appendChild(btn);
+  }
+}
+
+function renderQuotaMetrics(rows, metric) {
+  const wrap = $('quotaMetrics');
+  wrap.innerHTML = '';
+  const hasRates = rows.some((r) => r.rate);
+  for (const m of QUOTA_METRICS) {
+    if (m.needsRate && !hasRates) continue;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'chip quota-metric';
+    const on = m.id === metric;
+    btn.classList.toggle('active', on);
+    btn.setAttribute('aria-pressed', String(on));
+    btn.textContent = m.label;
+    if (m.id === 'perPct') btn.title = 'API-equivalent value bought by one percent of the plan quota';
+    btn.onclick = () => {
+      state.quotaMetric = m.id;
+      resetQuotaHover();
+      render();
+    };
+    wrap.appendChild(btn);
+  }
+}
+
+function renderQuotaLive(rows, scope, animate) {
+  const card = $('quotaLive');
+  const live = rows.find((r) => r.active);
+  if (!live) {
+    card.hidden = true;
+    return;
+  }
+  card.hidden = false;
+  $('quotaLiveLabel').textContent = scope.mode === 'session' ? 'Current session' : 'Current week';
+  $('quotaLiveClock').textContent = `${fmtClock(live.startedAt)} · ${fmtRemaining(live.endsAt - Date.now())}`;
+  updateValue($('quotaLiveCost'), live.totals.cost, paintMoney, animate);
+  $('quotaLiveTokens').textContent = live.totals.msgs
+    ? `${fmtTok(live.totals.tokens)} tokens · ${live.totals.msgs.toLocaleString()} calls`
+    : 'no activity yet';
+
+  const meter = $('quotaMeter');
+  const projection = $('quotaProjection');
+  if (live.percent > 0) {
+    meter.hidden = false;
+    const pct = Math.max(0, Math.min(100, live.percent));
+    const fill = $('quotaMeterFill');
+    fill.style.setProperty('--w', `${pct.toFixed(1)}%`);
+    fill.className = pct >= 95 ? 'crit' : pct >= 80 ? 'warn' : scope.provider;
+    $('quotaMeterPct').textContent = `${Math.round(pct)}%`;
+    meter.title = `${Math.round(pct)}% of the plan ${scope.mode === 'session' ? 'session' : 'weekly'} quota consumed`;
+    projection.textContent = live.rate
+      ? `${fmtCost(live.rate.costPerPct)} and ${fmtTok(live.rate.tokensPerPct)} tokens per 1% · a full window at this rate is worth ${fmtCost(live.rate.projectedCost)}`
+      : '';
+    projection.hidden = !live.rate;
+  } else {
+    meter.hidden = true;
+    projection.hidden = false;
+    projection.textContent = state.quota
+      ? 'Waiting for the first plan-meter reading of this window.'
+      : 'Plan meters unavailable — window totals still come from the local logs.';
+  }
+}
+
+function renderQuotaVerdict(rows, scope) {
+  const Q = window.EmberQuota;
+  const el = $('quotaVerdict');
+  const unit = scope.mode === 'session' ? 'sessions' : 'weeks';
+  const closed = rows.filter((r) => !r.active && r.totals.msgs > 0);
+  const rated = closed.filter((r) => r.rate);
+
+  el.classList.remove('up', 'down');
+  if (rated.length >= 6) {
+    const t = Q.trend(rated.map((r) => r.rate.costPerPct));
+    if (t.ok) {
+      const pct = Math.round(Math.abs(t.change) * 100);
+      if (t.direction === 'steady') {
+        el.textContent = `Holding steady — your last ${t.perSide} ${unit} bought ${fmtCost(t.recentMean)} of API value per 1% of quota, within ${pct}% of the ${t.perSide} before.`;
+        return;
+      }
+      el.classList.add(t.direction);
+      const word = t.direction === 'down' ? 'less' : 'more';
+      el.textContent = `Your last ${t.perSide} ${unit} bought ${fmtCost(t.recentMean)} per 1% of quota — ${pct}% ${word} than the ${t.perSide} before. A change in model mix explains some shifts; a persistent one does not.`;
+      return;
+    }
+  }
+  if (closed.length >= 3) {
+    const values = closed.map((r) => r.totals.cost);
+    const spread = Q.variability(values);
+    const tail = rated.length
+      ? ` ${rated.length} of them carry a measured quota reading.`
+      : ` Quota rates appear once Ember has watched ${unit === 'sessions' ? 'a session' : 'a week'} close.`;
+    el.textContent = `Your last ${closed.length} ${unit} averaged ${fmtCost(Q.mean(values))} of API value each${spread != null ? ` (±${Math.round(spread * 100)}%)` : ''}.${tail}`;
+    return;
+  }
+  el.textContent = closed.length
+    ? `Ember is building this history — ${closed.length} closed ${closed.length === 1 ? unit.slice(0, -1) : unit} so far.`
+    : `No closed ${unit} yet. Each ${scope.mode === 'session' ? 'five-hour window' : 'week'} you work adds a point.`;
+}
+
+const QUOTA_ROW_COUNT = 5;
+
+function renderQuotaRows(rows, scope, metric) {
+  const wrap = $('quotaRows');
+  wrap.innerHTML = '';
+  const recent = [...rows].reverse().slice(0, QUOTA_ROW_COUNT);
+  if (!recent.length) {
+    wrap.innerHTML = '<div class="empty">no windows recorded yet</div>';
+    return;
+  }
+  for (const row of recent) {
+    const item = document.createElement('div');
+    item.className = 'quota-row';
+    if (row.active) item.classList.add('is-live');
+
+    const label = document.createElement('span');
+    label.className = 'qr-when';
+    label.textContent = quotaRowLabel(row, scope);
+    if (row.active) label.textContent += ' · live';
+
+    const tok = document.createElement('span');
+    tok.className = 'qr-tok';
+    tok.textContent = fmtTok(row.totals.tokens);
+
+    const cost = document.createElement('span');
+    cost.className = 'qr-cost';
+    cost.textContent = fmtCost(row.totals.cost);
+
+    const pct = document.createElement('span');
+    pct.className = 'qr-pct';
+    if (row.percent > 0) {
+      pct.textContent = `${Math.round(row.percent)}%`;
+      pct.title = `${Math.round(row.percent)}% of the plan quota, as reported by the provider`;
+    } else {
+      pct.textContent = '—';
+      pct.classList.add('muted');
+      pct.title = 'No plan-meter reading was recorded for this window';
+    }
+
+    const rate = document.createElement('span');
+    rate.className = 'qr-rate';
+    if (row.rate) {
+      rate.textContent = metric === 'tokens'
+        ? `${fmtTok(row.rate.tokensPerPct)}/%`
+        : `${fmtCost(row.rate.costPerPct)}/%`;
+      rate.title = `${fmtCost(row.rate.costPerPct)} and ${fmtTok(row.rate.tokensPerPct)} tokens per 1% of quota`;
+    } else {
+      rate.textContent = '';
+    }
+
+    item.append(label, tok, cost, pct, rate);
+    wrap.appendChild(item);
+  }
+}
+
+let quotaGeom = null;
+let quotaHover = -1;
+function resetQuotaHover() { quotaHover = -1; }
+
+function renderQuotaChart(rows, scope, metric, hoverIdx = -1) {
+  const canvas = $('quotaChart');
+  const wrap = canvas.parentElement;
+  const dpr = window.devicePixelRatio || 1;
+  const W = wrap.clientWidth;
+  const H = wrap.clientHeight;
+  if (!W || !H) return;
+  canvas.width = W * dpr;
+  canvas.height = H * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, W, H);
+
+  // The rate view only has a value where a meter reading exists, so plotting
+  // the unmeasured windows as zero would invent a collapse that never happened.
+  const bars = metric === 'perPct' ? rows.filter((r) => r.rate) : rows;
+  quotaGeom = null;
+  if (!bars.length) {
+    ctx.fillStyle = 'rgba(198,187,176,0.45)';
+    ctx.font = '10px "Segoe UI", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('no windows to chart yet', W / 2, H / 2);
+    return;
+  }
+
+  const padL = 4, padR = 4, padT = 10, padB = 15;
+  const plotW = W - padL - padR;
+  const plotH = H - padT - padB;
+  const values = bars.map((r) => metricValue(r, metric));
+  const maxV = Math.max(...values, 1e-9);
+  const n = bars.length;
+  const gap = n > 30 ? 1 : 3;
+  const barW = Math.max(2, (plotW - gap * (n - 1)) / n);
+  const scaleY = (v) => (v / maxV) * plotH;
+
+  ctx.strokeStyle = 'rgba(245,239,232,0.05)';
+  for (const f of [0.25, 0.5, 0.75]) {
+    const gy = H - padB - plotH * f + 0.5;
+    ctx.beginPath();
+    ctx.moveTo(padL, gy);
+    ctx.lineTo(W - padR, gy);
+    ctx.stroke();
+  }
+  ctx.strokeStyle = 'rgba(245,239,232,0.12)';
+  ctx.beginPath();
+  ctx.moveTo(padL, H - padB + 0.5);
+  ctx.lineTo(W - padR, H - padB + 0.5);
+  ctx.stroke();
+
+  bars.forEach((row, i) => {
+    const x = padL + i * (barW + gap);
+    const dim = hoverIdx >= 0 && i !== hoverIdx;
+    ctx.globalAlpha = dim ? 0.32 : 1;
+    if (metric === 'perPct') {
+      // A ratio cannot be stacked; one bar per window, tinted by the model
+      // that dominated it so a mix change stays visible.
+      const h = scaleY(values[i]);
+      const top = H - padB - h;
+      const lead = [...row.totals.models.values()].sort((a, b) => b.cost - a.cost)[0];
+      const color = lead ? modelColor(lead.provider, lead.model) : PROVIDERS[scope.provider].color;
+      const grad = ctx.createLinearGradient(0, top, 0, H - padB);
+      grad.addColorStop(0, shade(color, 26));
+      grad.addColorStop(1, shade(color, -6));
+      ctx.fillStyle = grad;
+      if (h >= 0.5) {
+        roundRectPath(ctx, x, top, barW, h, Math.min(2.5, barW / 2));
+        ctx.fill();
+      }
+    } else {
+      // Stacked by model: a window that looks cheap because it ran a smaller
+      // model should say so on the chart, not only in a tooltip.
+      let y = H - padB;
+      const entries = [...row.totals.models.entries()]
+        .map(([key, m]) => [key, metric === 'tokens' ? m.tokens : m.cost, m])
+        .sort((a, b) => b[1] - a[1]);
+      for (const [, value, m] of entries) {
+        const h = scaleY(value);
+        if (h < 0.5) continue;
+        const top = y - h;
+        const color = modelColor(m.provider, m.model);
+        const grad = ctx.createLinearGradient(0, top, 0, y);
+        grad.addColorStop(0, shade(color, 26));
+        grad.addColorStop(1, shade(color, -6));
+        ctx.fillStyle = grad;
+        roundRectPath(ctx, x, top, barW, h, Math.min(2.5, barW / 2));
+        ctx.fill();
+        y = top;
+      }
+      if (values[i] === 0) {
+        ctx.fillStyle = 'rgba(245,239,232,0.08)';
+        ctx.fillRect(x, H - padB - 1.5, barW, 1.5);
+      }
+    }
+    if (row.active) {
+      ctx.globalAlpha = dim ? 0.3 : 0.75;
+      ctx.strokeStyle = 'rgba(255,155,101,0.9)';
+      ctx.setLineDash([2, 2]);
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x - 0.5, padT - 2, barW + 1, H - padB - padT + 2);
+      ctx.setLineDash([]);
+    }
+    ctx.globalAlpha = 1;
+  });
+
+  // Average line: the reference the eye needs to judge "is this consistent".
+  const mean = window.EmberQuota.mean(values.filter((v) => v > 0));
+  if (mean > 0) {
+    const my = H - padB - scaleY(mean) + 0.5;
+    ctx.strokeStyle = 'rgba(244,179,95,0.42)';
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(padL, my);
+    ctx.lineTo(W - padR, my);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  const fmtMetric = (v) => (metric === 'tokens' ? fmtTok(v) : fmtCost(v));
+  // The scale sits over the tallest bar by definition, so it carries its own
+  // backing rather than competing with whatever is behind it.
+  ctx.font = '600 9px "Segoe UI", sans-serif';
+  const scaleText = fmtMetric(maxV);
+  const scaleW = ctx.measureText(scaleText).width;
+  ctx.fillStyle = 'rgba(13,11,10,0.72)';
+  roundRectPath(ctx, W - padR - scaleW - 5, padT - 5, scaleW + 6, 13, 3);
+  ctx.fill();
+  ctx.fillStyle = 'rgba(198,187,176,0.7)';
+  ctx.textAlign = 'right';
+  ctx.fillText(scaleText, W - padR - 2, padT + 4);
+  ctx.textAlign = 'left';
+  ctx.font = '9px "Segoe UI", sans-serif';
+  ctx.fillText(`${n} ${scope.mode === 'session' ? 'sessions' : 'weeks'} · avg ${fmtMetric(mean)}${metric === 'perPct' ? ' per 1%' : ''}`, padL, H - 4);
+
+  quotaGeom = { bars, padL, barW, gap, W, scope, metric };
+  canvas.setAttribute('aria-label',
+    `${scope.label} history, ${n} windows, average ${fmtMetric(mean)}${metric === 'perPct' ? ' per one percent of quota' : ''}.`);
+}
+
+function setupQuotaHover() {
+  const canvas = $('quotaChart');
+  const tip = $('quotaTip');
+
+  const binAtX = (clientX) => {
+    if (!quotaGeom) return -1;
+    const rect = canvas.getBoundingClientRect();
+    const { padL, barW, gap, bars } = quotaGeom;
+    const i = Math.floor((clientX - rect.left - padL) / (barW + gap));
+    return i >= 0 && i < bars.length ? i : -1;
+  };
+
+  const showTip = (i) => {
+    if (!quotaGeom || i < 0) { tip.hidden = true; return; }
+    const { bars, padL, barW, gap, W, scope, metric } = quotaGeom;
+    const row = bars[i];
+    tip.replaceChildren();
+    const head = document.createElement('div');
+    head.className = 'tip-date';
+    head.textContent = quotaRowLabel(row, scope) + (row.active ? ' · live' : '');
+    tip.appendChild(head);
+    const addRow = (label, value, color) => {
+      const el = document.createElement('div');
+      el.className = 'tip-row';
+      const name = document.createElement('span');
+      if (color) {
+        const dot = document.createElement('span');
+        dot.className = 'dot';
+        dot.style.background = color;
+        name.appendChild(dot);
+      }
+      name.appendChild(document.createTextNode(label));
+      const v = document.createElement('b');
+      v.textContent = value;
+      el.append(name, v);
+      tip.appendChild(el);
+    };
+    addRow('Value', fmtCost(row.totals.cost));
+    addRow('Tokens', fmtTok(row.totals.tokens));
+    addRow('Calls', row.totals.msgs.toLocaleString());
+    if (row.percent > 0) addRow('Quota used', `${Math.round(row.percent)}%`);
+    if (row.rate) {
+      addRow('Per 1%', fmtCost(row.rate.costPerPct));
+      addRow('Full window', `≈${fmtCost(row.rate.projectedCost)}`);
+    }
+    const top = [...row.totals.models.values()].sort((a, b) => b.cost - a.cost).slice(0, 3);
+    for (const m of top) {
+      addRow(prettyModel(m.provider, m.model), metric === 'tokens' ? fmtTok(m.tokens) : fmtCost(m.cost),
+        modelColor(m.provider, m.model));
+    }
+    tip.hidden = false;
+    const tw = tip.offsetWidth;
+    let tx = padL + i * (barW + gap) + barW / 2 - tw / 2;
+    tx = Math.max(0, Math.min(W - tw, tx));
+    tip.style.left = `${tx}px`;
+    tip.style.top = '2px';
+  };
+
+  const repaint = (i) => {
+    if (!quotaGeom) return;
+    const { scope, metric } = quotaGeom;
+    renderQuotaChart(quotaCache.rows, scope, metric, i);
+  };
+
+  canvas.addEventListener('mousemove', (e) => {
+    const i = binAtX(e.clientX);
+    if (i !== quotaHover) {
+      quotaHover = i;
+      repaint(i);
+    }
+    showTip(i);
+  });
+  canvas.addEventListener('mouseleave', () => {
+    if (quotaHover !== -1) { quotaHover = -1; repaint(-1); }
+    tip.hidden = true;
+  });
+  canvas.addEventListener('keydown', (e) => {
+    if (!quotaGeom || !quotaGeom.bars.length) return;
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    e.preventDefault();
+    const last = quotaGeom.bars.length - 1;
+    const start = quotaHover >= 0 ? quotaHover : last;
+    quotaHover = Math.max(0, Math.min(last, start + (e.key === 'ArrowLeft' ? -1 : 1)));
+    repaint(quotaHover);
+    showTip(quotaHover);
+  });
+  canvas.addEventListener('blur', () => {
+    if (quotaHover !== -1) { quotaHover = -1; repaint(-1); }
+    tip.hidden = true;
+  });
+}
+
+function renderQuota(animate = false) {
+  const panel = document.querySelector('.quota-panel');
+  const scopes = quotaScopeList();
+  const scope = activeQuotaScope(scopes);
+  if (!scope) {
+    panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+  state.quotaScope = scope.id;
+
+  const rows = quotaRowsFor(scope);
+  let metric = state.quotaMetric;
+  if (metric === 'perPct' && !rows.some((r) => r.rate)) metric = 'cost';
+
+  renderQuotaScopes(scopes, scope);
+  renderQuotaMetrics(rows, metric);
+  renderQuotaLive(rows, scope, animate);
+  if (quotaHover >= 0) quotaHover = -1;
+  renderQuotaChart(rows, scope, metric, -1);
+  renderQuotaVerdict(rows, scope);
+  renderQuotaRows(rows, scope, metric);
+  $('quotaNote').textContent = scope.meter
+    ? 'unfiltered · plan-metered'
+    : 'unfiltered · rebuilt from logs';
+}
+
+// Only the countdown moves between renders; recomputing the panel every
+// second for it would be wasteful.
+function tickQuotaClock() {
+  const live = quotaCache.rows.find((r) => r.active);
+  if (state.settings.miniMode) {
+    const kind = quotaCache.scope && quotaCache.scope.mode === 'period' ? 'week' : 'session';
+    $('miniWhen').textContent = live
+      ? `${kind} · ${fmtRemaining(live.endsAt - Date.now())}`
+      : `${kind} · idle`;
+    return;
+  }
+  const card = $('quotaLive');
+  if (!card || card.hidden || !live) return;
+  $('quotaLiveClock').textContent = `${fmtClock(live.startedAt)} · ${fmtRemaining(live.endsAt - Date.now())}`;
+}
+
 /* ───────────────────────── plan limits ─────────────────────────
    Two groups — Claude and Codex — each with its own 5-hour session
    tracker and weekly tracker (plus Claude's per-model weekly rows). */
@@ -1590,7 +2336,9 @@ function renderLimits() {
   });
 
   // the ember heats up with the worst window across BOTH providers
+  state.worstLimit = worstAll;
   avatarMood(worstAll);
+  renderMini();
 }
 
 // refresh the "Resets in…" countdowns every second without refetching
@@ -1608,14 +2356,27 @@ function renderStatus() {
   const el = $('lastUpdated');
   if (!state.generatedAt) { el.textContent = 'loading…'; return; }
   const secs = Math.round((Date.now() - state.generatedAt) / 1000);
-  el.textContent = secs < 3 ? 'Updated just now'
+  // Reconciliation runs every few seconds, so anything inside that cadence is
+  // "now" — counting up from one would just be a flickering stopwatch.
+  el.textContent = secs < 10 ? 'Updated just now'
     : secs < 60 ? `Updated ${secs}s ago`
     : `Updated ${Math.round(secs / 60)}m ago`;
-  $('liveDot').classList.toggle('stale', secs > 30);
+  $('liveDot').classList.toggle('stale', secs > 45);
+}
+
+// One quiet beat whenever genuinely new usage lands — the difference between
+// a widget that is running and one that merely looks like it is.
+function pulseLiveDot() {
+  if (reduceMotion.matches) return;
+  const dot = $('liveDot');
+  dot.classList.remove('beat');
+  void dot.offsetWidth;
+  dot.classList.add('beat');
 }
 setInterval(() => {
   renderStatus();
   tickLimitCountdowns();
+  tickQuotaClock();
 }, 1000);
 
 /* ───────────────────────── mascot reactions ───────────────────────── */
@@ -1715,6 +2476,316 @@ function writeCustomControls(fallbackRange = null) {
   validateCustomDraft();
 }
 
+/* ───────────────────────── compact mode ─────────────────────────
+   The strip keeps the one number worth watching while you work: what the
+   window open right now has already cost, and how much of the plan it took. */
+
+function applyMiniMode() {
+  const on = !!state.settings.miniMode;
+  document.body.classList.toggle('mini', on);
+  $('btnMini').classList.toggle('on', on);
+  const setMini = $('setMini');
+  if (setMini) setMini.checked = on;
+  if (on) renderMini();
+}
+
+function renderMini() {
+  if (!state.settings.miniMode) return;
+  const scopes = quotaScopeList();
+  const scope = activeQuotaScope(scopes);
+  const rows = scope ? quotaRowsFor(scope) : [];
+  const live = rows.find((r) => r.active);
+  const view = state.lastView;
+
+  $('miniCost').innerHTML = moneyHTML(live ? live.totals.cost : 0);
+  const kind = scope && scope.mode === 'period' ? 'week' : 'session';
+  $('miniWhen').textContent = live
+    ? `${kind} · ${fmtRemaining(live.endsAt - Date.now())}`
+    : `${kind} · idle`;
+
+  // Without a meter reading for this window, the strip falls back to the
+  // hottest plan bar so it is never blank while a limit is filling up.
+  const pct = live && live.percent > 0 ? live.percent : state.worstLimit;
+  const fill = $('miniFill');
+  const shown = Math.max(0, Math.min(100, pct || 0));
+  fill.style.setProperty('--w', `${shown.toFixed(1)}%`);
+  fill.className = shown >= 95 ? 'crit' : shown >= 80 ? 'warn' : (scope ? scope.provider : 'claude');
+  $('miniPct').textContent = shown > 0 ? `${Math.round(shown)}%` : '–';
+
+  const parts = [];
+  if (live && live.totals.msgs) {
+    parts.push(`${fmtTok(live.totals.tokens)} tokens`);
+    if (live.rate) parts.push(`${fmtCost(live.rate.costPerPct)} per 1%`);
+    else parts.push(`${live.totals.msgs.toLocaleString()} calls`);
+  } else {
+    parts.push('no activity in this window');
+  }
+  if (view) parts.push(`${fmtCost(view.todayCost)} today`);
+  $('miniSub').textContent = parts.join(' · ');
+}
+
+/* ───────────────────────── export ─────────────────────────
+   Everything here is composed from what is already on screen and handed to
+   the main process only when the user picks a destination. */
+
+function csvCell(value) {
+  const s = value == null ? '' : String(value);
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+function toCsv(rows) {
+  return rows.map((row) => row.map(csvCell).join(',')).join('\r\n');
+}
+
+function isoMinute(ms) {
+  const d = new Date(ms);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function round(value, places = 4) {
+  return Number.isFinite(value) ? Number(value.toFixed(places)) : '';
+}
+
+function topModelOf(totals) {
+  const lead = [...totals.models.values()].sort((a, b) => b.cost - a.cost)[0];
+  return lead ? prettyModel(lead.provider, lead.model) : '';
+}
+
+function currentQuotaContext() {
+  const scopes = quotaScopeList();
+  const scope = activeQuotaScope(scopes);
+  return { scope, rows: scope ? quotaRowsFor(scope) : [] };
+}
+
+function buildWindowsCsv() {
+  const { scope, rows } = currentQuotaContext();
+  if (!scope) return null;
+  const out = [[
+    'window_start', 'window_end', 'provider', 'window_kind', 'state', 'quota_measured',
+    'tokens', 'input', 'output', 'cache_read', 'cache_write', 'calls',
+    'value_usd', 'quota_percent', 'value_per_percent', 'tokens_per_percent',
+    'projected_full_window_usd', 'top_model',
+  ]];
+  for (const row of [...rows].reverse()) {
+    const t = row.totals;
+    out.push([
+      isoMinute(row.startedAt), isoMinute(row.endsAt), scope.provider,
+      scope.mode === 'session' ? 'session' : 'weekly',
+      row.active ? 'live' : 'closed',
+      row.observed ? 'yes' : 'no',
+      t.tokens, t.input, t.output, t.cacheRead, t.cacheWrite, t.msgs,
+      round(t.cost, 4),
+      row.percent > 0 ? round(row.percent, 2) : '',
+      row.rate ? round(row.rate.costPerPct, 4) : '',
+      row.rate ? Math.round(row.rate.tokensPerPct) : '',
+      row.rate ? round(row.rate.projectedCost, 2) : '',
+      topModelOf(t),
+    ]);
+  }
+  return toCsv(out);
+}
+
+function buildViewCsv() {
+  const byKey = new Map();
+  for (const b of filteredBuckets()) {
+    if (state.hiddenProjects.has(b.project)) continue;
+    const key = `${b.date}|${b.provider}|${b.model}`;
+    let row = byKey.get(key);
+    if (!row) {
+      row = {
+        date: b.date, provider: b.provider, model: b.model,
+        msgs: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0,
+        cost: 0, unpricedCalls: 0,
+      };
+      byKey.set(key, row);
+    }
+    row.msgs += b.msgs;
+    row.input += b.input;
+    row.output += b.output;
+    row.cacheRead += b.cacheRead;
+    row.cacheWrite += b.cacheWrite;
+    row.reasoning += b.reasoning || 0;
+    row.cost += b.cost;
+    row.unpricedCalls += b.unpricedCalls ?? (b.priced ? 0 : b.msgs);
+  }
+  const out = [[
+    'date', 'provider', 'model', 'calls', 'input', 'output', 'cache_read',
+    'cache_write', 'reasoning', 'value_usd', 'unpriced_calls',
+  ]];
+  for (const row of [...byKey.values()].sort((a, b) => a.date.localeCompare(b.date) || b.cost - a.cost)) {
+    out.push([
+      row.date, row.provider, prettyModel(row.provider, row.model), row.msgs,
+      row.input, row.output, row.cacheRead, row.cacheWrite, row.reasoning,
+      round(row.cost, 4), row.unpricedCalls,
+    ]);
+  }
+  return toCsv(out);
+}
+
+function buildViewJson() {
+  const view = state.lastView;
+  if (!view) return null;
+  const { scope, rows } = currentQuotaContext();
+  const [from, to] = rangeForPreset();
+  return JSON.stringify({
+    generatedAt: new Date().toISOString(),
+    app: { name: 'Ember', version: APP_VERSION, note: 'API-equivalent value of subscription usage, not an invoice' },
+    view: {
+      range: state.preset,
+      from: state.preset === 'all' ? null : from,
+      to: state.preset === 'all' ? null : to,
+      selectedDay: state.selectedDay,
+      providers: [...state.selectedProviders],
+      models: [...state.selectedModels],
+      hiddenProjects: [...state.hiddenProjects],
+    },
+    totals: {
+      valueUsd: round(view.tot.cost, 4),
+      lowerBoundUsd: round(view.tot.costMin, 4),
+      calls: view.tot.msgs,
+      unpricedCalls: view.tot.unpricedCalls,
+      input: view.tot.input,
+      output: view.tot.output,
+      cacheRead: view.tot.cacheRead,
+      cacheWrite: view.tot.cacheWrite,
+      reasoning: view.tot.reasoning,
+      cacheSavingsUsd: round(view.tot.saved, 4),
+      activeDays: view.dayCount,
+      sessions: view.sessionCount,
+    },
+    rolling: {
+      last5h: { valueUsd: round(view.w5.cost, 4), tokens: view.w5.tok, calls: view.w5.msgs },
+      last7d: { valueUsd: round(view.wk.cost, 4), tokens: view.wk.tok, calls: view.wk.msgs },
+      today: { valueUsd: round(view.todayCost, 4) },
+    },
+    models: [...view.byModel.values()].sort((a, b) => b.cost - a.cost).map((m) => ({
+      provider: m.provider, model: m.model, name: prettyModel(m.provider, m.model),
+      calls: m.pricedCalls + m.unpricedCalls, input: m.input, output: m.output,
+      cacheRead: m.cacheRead, cacheWrite: m.cacheWrite, reasoning: m.reasoning,
+      valueUsd: round(m.cost, 4), priced: !!m.priced,
+    })),
+    projects: [...view.byProject.entries()].sort((a, b) => b[1].cost - a[1].cost).map(([name, p]) => ({
+      name, calls: p.msgs, valueUsd: round(p.cost, 4), deleted: !p.live,
+      hidden: state.hiddenProjects.has(name),
+    })),
+    windows: scope ? {
+      provider: scope.provider,
+      kind: scope.mode === 'session' ? 'session' : 'weekly',
+      lengthMinutes: Math.round(scope.windowMs / 60000),
+      entries: [...rows].reverse().map((row) => ({
+        start: new Date(row.startedAt).toISOString(),
+        end: new Date(row.endsAt).toISOString(),
+        live: !!row.active,
+        quotaMeasured: !!row.observed,
+        quotaPercent: row.percent > 0 ? round(row.percent, 2) : null,
+        tokens: row.totals.tokens,
+        calls: row.totals.msgs,
+        valueUsd: round(row.totals.cost, 4),
+        valuePerPercent: row.rate ? round(row.rate.costPerPct, 4) : null,
+        tokensPerPercent: row.rate ? Math.round(row.rate.tokensPerPct) : null,
+      })),
+    } : null,
+  }, null, 2);
+}
+
+function buildSummary() {
+  const view = state.lastView;
+  if (!view) return null;
+  const Q = window.EmberQuota;
+  const { scope, rows } = currentQuotaContext();
+  const label = state.selectedDay ? prettyDay(state.selectedDay) : RANGE_LABELS[state.preset];
+  const lines = [];
+  lines.push(`**Ember — API-equivalent usage · ${label}**`);
+  lines.push('');
+  lines.push(`- Value: **${fmtCost(view.tot.cost)}** across ${view.tot.msgs.toLocaleString()} calls and ${fmtTok(view.tot.input + view.tot.output + view.tot.cacheRead + view.tot.cacheWrite)} tokens`);
+  lines.push(`- Rolling: ${fmtCost(view.w5.cost)} in the last 5 hours · ${fmtCost(view.wk.cost)} in the last 7 days`);
+  if (view.tot.unpricedCalls) {
+    lines.push(`- Coverage: ${view.tot.unpricedCalls.toLocaleString()} calls have no published official price and are excluded from the value`);
+  }
+
+  if (scope && rows.length) {
+    const recent = [...rows].reverse().slice(0, 8);
+    lines.push('');
+    lines.push(`**${scope.label}** — last ${recent.length} windows`);
+    lines.push('');
+    lines.push('| Window | Tokens | Value | Quota | Per 1% |');
+    lines.push('|---|---:|---:|---:|---:|');
+    for (const row of recent) {
+      lines.push(`| ${quotaRowLabel(row, scope)}${row.active ? ' _(live)_' : ''} | ${fmtTok(row.totals.tokens)} | ${fmtCost(row.totals.cost)} | ${row.percent > 0 ? `${Math.round(row.percent)}%` : '—'} | ${row.rate ? fmtCost(row.rate.costPerPct) : '—'} |`);
+    }
+    const rated = rows.filter((r) => r.rate && !r.active);
+    if (rated.length >= 6) {
+      const t = Q.trend(rated.map((r) => r.rate.costPerPct));
+      if (t.ok) {
+        const pct = Math.round(Math.abs(t.change) * 100);
+        lines.push('');
+        lines.push(t.direction === 'steady'
+          ? `Quota rate is holding steady: ${fmtCost(t.recentMean)} per 1% across the last ${t.perSide} windows, within ${pct}% of the ${t.perSide} before.`
+          : `Quota rate ${t.direction === 'down' ? 'fell' : 'rose'} ${pct}%: ${fmtCost(t.recentMean)} per 1% across the last ${t.perSide} windows vs ${fmtCost(t.olderMean)} for the ${t.perSide} before.`);
+      }
+    }
+  }
+  lines.push('');
+  lines.push(`_Ember ${APP_VERSION} · reconstructed from local Claude Code and Codex logs at official API rates. Not a provider invoice._`);
+  return lines.join('\n');
+}
+
+const EXPORTS = {
+  summary: { kind: 'copy', build: buildSummary, done: 'Summary copied to the clipboard' },
+  'windows-csv': { kind: 'file', format: 'csv', name: 'ember-session-windows', build: buildWindowsCsv },
+  'view-csv': { kind: 'file', format: 'csv', name: 'ember-usage', build: buildViewCsv },
+  'view-json': { kind: 'file', format: 'json', name: 'ember-usage', build: buildViewJson },
+};
+
+let toastTimer = 0;
+function toast(message) {
+  const el = $('toast');
+  el.textContent = message;
+  el.hidden = false;
+  requestAnimationFrame(() => el.classList.add('show'));
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    el.classList.remove('show');
+    setTimeout(() => { el.hidden = true; }, 240);
+  }, 3000);
+}
+
+function setExportMenu(open) {
+  $('exportMenu').hidden = !open;
+  $('btnExport').setAttribute('aria-expanded', String(open));
+  $('btnExport').classList.toggle('on', open);
+  if (open) $('exportMenu').querySelector('button')?.focus();
+}
+
+async function runExport(id) {
+  const spec = EXPORTS[id];
+  if (!spec) return;
+  setExportMenu(false);
+  let content = null;
+  try {
+    content = spec.build();
+  } catch (err) {
+    console.error('export build failed:', err);
+  }
+  if (!content) {
+    toast('Nothing to export from this view yet');
+    return;
+  }
+  if (spec.kind === 'copy') {
+    await window.api.copyText(content);
+    toast(spec.done);
+    return;
+  }
+  const result = await window.api.saveExport({
+    suggestedName: `${spec.name}-${today()}.${spec.format}`,
+    content,
+    format: spec.format,
+  });
+  if (result && result.ok) toast(`Saved ${result.name}`);
+  else if (result && result.reason === 'write-failed') toast('Could not write that file');
+}
+
 /* ───────────────────────── events ───────────────────────── */
 
 function setupEvents() {
@@ -1729,6 +2800,29 @@ function setupEvents() {
   $('btnClose').onclick = () => window.api.close();
   $('btnHide').onclick = () => window.api.hide();
   $('btnPin').onclick = () => window.api.setPin(!state.settings.alwaysOnTop);
+  $('btnMini').onclick = () => window.api.setMini(true);
+  $('btnMiniExpand').onclick = () => window.api.setMini(false);
+  $('btnMiniHide').onclick = () => window.api.hide();
+  $('setMini').onchange = (e) => window.api.setMini(e.target.checked);
+  // Double-clicking the strip is the fast way back, the way a collapsed
+  // player expands.
+  $('miniBar').addEventListener('dblclick', (e) => {
+    if (e.target.closest('button')) return;
+    window.api.setMini(false);
+  });
+
+  $('btnExport').onclick = (e) => {
+    e.stopPropagation();
+    setExportMenu($('exportMenu').hidden);
+  };
+  for (const item of $('exportMenu').querySelectorAll('[data-export]')) {
+    item.onclick = () => runExport(item.dataset.export);
+  }
+  document.addEventListener('click', (e) => {
+    if ($('exportMenu').hidden) return;
+    if (e.target.closest('.export-wrap')) return;
+    setExportMenu(false);
+  });
 
   $('btnRefresh').onclick = () => {
     $('btnRefresh').classList.add('spinning');
@@ -1793,6 +2887,17 @@ function setupEvents() {
   });
 
   window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !$('exportMenu').hidden) {
+      e.preventDefault();
+      setExportMenu(false);
+      $('btnExport').focus();
+      return;
+    }
+    if (e.key === 'Escape' && state.settings.miniMode && $('settingsOverlay').hidden) {
+      e.preventDefault();
+      window.api.setMini(false);
+      return;
+    }
     if (e.key === 'Escape' && !$('settingsOverlay').hidden) {
       e.preventDefault();
       setSettingsOpen(false);
@@ -1813,6 +2918,7 @@ function setupEvents() {
     resizeFrame = requestAnimationFrame(() => {
       resizeFrame = 0;
       if (state.lastByDay) renderChart(state.lastByDay);
+      if (quotaGeom) renderQuotaChart(quotaCache.rows, quotaGeom.scope, quotaGeom.metric, -1);
       moveSegThumb();
     });
   });
@@ -1828,20 +2934,32 @@ function setupEvents() {
 async function init() {
   setupEvents();
   setupChartHover();
+  setupQuotaHover();
 
   state.settings = await window.api.getSettings();
+  APP_VERSION = await window.api.getVersion();
   updatePinButton();
+  applyMiniMode();
 
   window.api.onSettings((s) => {
+    const modeChanged = s.miniMode !== state.settings.miniMode;
     state.settings = s;
     updatePinButton();
     $('setAutostart').checked = s.launchAtStartup;
     $('setPin').checked = s.alwaysOnTop;
+    if (modeChanged) {
+      applyMiniMode();
+      // The charts were laid out against a window of a different size.
+      if (!s.miniMode) requestAnimationFrame(() => render());
+    }
   });
 
   window.api.onUsage((data) => {
     const changed = applyUsageData(data);
-    if (changed) scheduleLiveRender();
+    if (changed) {
+      scheduleLiveRender();
+      pulseLiveDot();
+    }
     renderStatus();
     renderPricingStatus();
   });
@@ -1856,8 +2974,15 @@ async function init() {
     state.limits = l;
     renderLimits();
   });
+  window.api.onQuota((q) => {
+    state.quota = q;
+    state.quotaRevision++;
+    if (state.hasRenderedUsage) render();
+  });
   state.limits = await window.api.getLimits();
   renderLimits();
+  state.quota = await window.api.getQuota();
+  state.quotaRevision++;
 
   const data = await window.api.getUsage();
   const changed = applyUsageData(data);

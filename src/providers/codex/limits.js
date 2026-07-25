@@ -18,11 +18,32 @@ function init(userDataDir) {
   cacheFile = path.join(userDataDir, 'codex-limits-cache.json');
 }
 
+// Snapshots cached before window lengths were recorded carry only the row
+// name. The names were generated from the length, so it reads back exactly —
+// without it the quota ledger would file the same meter under two identities.
+const NAME_MINUTES = [
+  [/^Current session \((\d+)h\)$/, (m) => Number(m[1]) * 60],
+  [/^(\d+)-day limit$/, (m) => Number(m[1]) * 1440],
+  [/^Weekly limit$/, () => 7 * 1440],
+];
+
+function hydrateWindow(w) {
+  if (!w || w.windowMinutes) return w;
+  for (const [re, minutes] of NAME_MINUTES) {
+    const match = re.exec(String(w.name || ''));
+    if (match) return { ...w, windowMinutes: minutes(match) };
+  }
+  return w;
+}
+
 // last good snapshot survives restarts, so the card never goes blank
 function loadCached() {
   try {
     const snap = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
-    return snap && snap.ok ? snap : null;
+    if (!snap || !snap.ok) return null;
+    return Array.isArray(snap.windows)
+      ? { ...snap, windows: snap.windows.map(hydrateWindow) }
+      : snap;
   } catch {
     return null;
   }
@@ -66,6 +87,10 @@ function windowRow(w, fallbackName) {
   return {
     name,
     style, // 'countdown' -> "Resets in X hr Y min", 'day' -> "Resets Tue 9:30 AM"
+    // The window length is the meter's stable identity for the quota ledger:
+    // Codex renames the row when the ChatGPT plan changes, but a 7-day meter
+    // stays a 7-day meter.
+    windowMinutes: Math.round(mins) || 0,
     utilization: w.used_percent,
     resetsAt: w.resets_at ? new Date(w.resets_at * 1000).toISOString() : null,
   };

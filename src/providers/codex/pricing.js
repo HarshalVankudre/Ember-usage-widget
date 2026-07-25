@@ -1,44 +1,54 @@
 'use strict';
 
-// USD per million tokens from OpenAI's standard API pricing table.
-// Specific and intentionally-unpriced models must precede broad families.
+// A published price belongs to one model id, optionally with a dated snapshot
+// suffix. Anything else after the name — "-pro", "-fast", "-spark" — is a
+// different product with its own rate, and OpenAI publishes no row for the
+// Codex-only variants. Matching them loosely would hand a base-model price to
+// a model that never had one, so the suffix is pinned and unlisted variants
+// fall through to Unpriced.
+const SNAPSHOT = '(?:-\\d{4}-\\d{2}-\\d{2})?$';
+const id = (pattern) => new RegExp(`^${pattern}${SNAPSHOT}`);
+
+// `longContext` marks the models OpenAI prices in context tiers — the ones its
+// table labels "(<272K context length)". It is never assumed: a model whose
+// published price is flat is billed flat no matter how large the request.
 const PRICING_RULES = [
   { test: /^gpt-5\.3-codex-spark(?:-|$)/, unpriced: true, family: 'codex' },
-  { test: /^chatgpt-4o-latest(?:-|$)/, input: 5, cached: 5, output: 15, family: 'gpt4' },
-  { test: /^chat-latest(?:-|$)/, input: 5, cached: 0.5, output: 30, family: 'gpt5' },
+  { test: id('chatgpt-4o-latest'), input: 5, cached: 5, output: 15, family: 'gpt4' },
+  { test: id('chat-latest'), input: 5, cached: 0.5, output: 30, family: 'gpt5' },
 
-  { test: /^gpt-5\.6-terra(?:-|$)/, input: 2.5, cached: 0.25, write: 3.125, output: 15, longContext: true, family: 'gpt5' },
-  { test: /^gpt-5\.6-luna(?:-|$)/, input: 1, cached: 0.1, write: 1.25, output: 6, longContext: true, family: 'gpt5' },
-  { test: /^gpt-5\.6(?:-sol)?(?:-|$)/, input: 5, cached: 0.5, write: 6.25, output: 30, longContext: true, family: 'gpt5' },
-  { test: /^gpt-5\.5-pro(?:-|$)/, input: 30, cached: 30, output: 180, longContext: true, family: 'pro' },
-  { test: /^gpt-5\.5(?:-|$)/, input: 5, cached: 0.5, output: 30, longContext: true, family: 'gpt5' },
-  { test: /^gpt-5\.4-pro(?:-|$)/, input: 30, cached: 30, output: 180, longContext: true, family: 'pro' },
-  { test: /^gpt-5\.4-mini(?:-|$)/, input: 0.75, cached: 0.075, output: 4.5, family: 'mini' },
-  { test: /^gpt-5\.4-nano(?:-|$)/, input: 0.2, cached: 0.02, output: 1.25, family: 'nano' },
-  { test: /^gpt-5\.4(?:-|$)/, input: 2.5, cached: 0.25, output: 15, longContext: true, family: 'gpt5' },
-  { test: /^gpt-5\.2-pro(?:-|$)/, input: 21, cached: 21, output: 168, family: 'pro' },
-  { test: /^gpt-5\.2(?:-|$)/, input: 1.75, cached: 0.175, output: 14, family: 'gpt5' },
-  { test: /^gpt-5(?:\.1)?-pro(?:-|$)/, input: 15, cached: 15, output: 120, family: 'pro' },
-  { test: /^gpt-5(?:\.1)?-mini(?:-|$)/, input: 0.25, cached: 0.025, output: 2, family: 'mini' },
-  { test: /^gpt-5(?:\.1)?-nano(?:-|$)/, input: 0.05, cached: 0.005, output: 0.4, family: 'nano' },
-  { test: /^gpt-5(?:\.1)?(?:-|$)/, input: 1.25, cached: 0.125, output: 10, family: 'gpt5' },
-  { test: /^codex-mini(?:-latest)?(?:-|$)/, input: 1.5, cached: 0.375, output: 6, family: 'mini' },
+  { test: id('gpt-5\\.6-terra'), input: 2.5, cached: 0.25, write: 3.125, output: 15, family: 'gpt5' },
+  { test: id('gpt-5\\.6-luna'), input: 1, cached: 0.1, write: 1.25, output: 6, family: 'gpt5' },
+  { test: id('gpt-5\\.6(?:-sol)?'), input: 5, cached: 0.5, write: 6.25, output: 30, family: 'gpt5' },
+  { test: id('gpt-5\\.5-pro'), input: 30, cached: 30, output: 180, longContext: true, family: 'pro' },
+  { test: id('gpt-5\\.5'), input: 5, cached: 0.5, output: 30, longContext: true, family: 'gpt5' },
+  { test: id('gpt-5\\.4-pro'), input: 30, cached: 30, output: 180, longContext: true, family: 'pro' },
+  { test: id('gpt-5\\.4-mini'), input: 0.75, cached: 0.075, output: 4.5, family: 'mini' },
+  { test: id('gpt-5\\.4-nano'), input: 0.2, cached: 0.02, output: 1.25, family: 'nano' },
+  { test: id('gpt-5\\.4'), input: 2.5, cached: 0.25, output: 15, longContext: true, family: 'gpt5' },
+  { test: id('gpt-5\\.2-pro'), input: 21, cached: 21, output: 168, family: 'pro' },
+  { test: id('gpt-5\\.2'), input: 1.75, cached: 0.175, output: 14, family: 'gpt5' },
+  { test: id('gpt-5(?:\\.1)?-pro'), input: 15, cached: 15, output: 120, family: 'pro' },
+  { test: id('gpt-5(?:\\.1)?-mini'), input: 0.25, cached: 0.025, output: 2, family: 'mini' },
+  { test: id('gpt-5(?:\\.1)?-nano'), input: 0.05, cached: 0.005, output: 0.4, family: 'nano' },
+  { test: id('gpt-5(?:\\.1)?'), input: 1.25, cached: 0.125, output: 10, family: 'gpt5' },
+  { test: id('codex-mini(?:-latest)?'), input: 1.5, cached: 0.375, output: 6, family: 'mini' },
 
-  { test: /^gpt-4\.1-nano(?:-|$)/, input: 0.1, cached: 0.025, output: 0.4, family: 'nano' },
-  { test: /^gpt-4\.1-mini(?:-|$)/, input: 0.4, cached: 0.1, output: 1.6, family: 'mini' },
-  { test: /^gpt-4\.1(?:-|$)/, input: 2, cached: 0.5, output: 8, family: 'gpt4' },
-  { test: /^gpt-4o-mini(?:-|$)/, input: 0.15, cached: 0.075, output: 0.6, family: 'mini' },
+  { test: id('gpt-4\\.1-nano'), input: 0.1, cached: 0.025, output: 0.4, family: 'nano' },
+  { test: id('gpt-4\\.1-mini'), input: 0.4, cached: 0.1, output: 1.6, family: 'mini' },
+  { test: id('gpt-4\\.1'), input: 2, cached: 0.5, output: 8, family: 'gpt4' },
+  { test: id('gpt-4o-mini'), input: 0.15, cached: 0.075, output: 0.6, family: 'mini' },
   { test: /^gpt-4o-2024-05-13$/, input: 5, cached: 5, output: 15, family: 'gpt4' },
-  { test: /^gpt-4o(?:-|$)/, input: 2.5, cached: 1.25, output: 10, family: 'gpt4' },
+  { test: id('gpt-4o'), input: 2.5, cached: 1.25, output: 10, family: 'gpt4' },
 
-  { test: /^o1-pro(?:-|$)/, input: 150, cached: 150, output: 600, family: 'pro' },
-  { test: /^o1-mini(?:-|$)/, input: 1.1, cached: 0.55, output: 4.4, family: 'o' },
-  { test: /^o1-preview(?:-|$)/, input: 15, cached: 7.5, output: 60, family: 'o' },
-  { test: /^o1(?:-|$)/, input: 15, cached: 7.5, output: 60, family: 'o' },
-  { test: /^o3-pro(?:-|$)/, input: 20, cached: 20, output: 80, family: 'pro' },
-  { test: /^o3-mini(?:-|$)/, input: 1.1, cached: 0.55, output: 4.4, family: 'o' },
-  { test: /^o3(?:-|$)/, input: 2, cached: 0.5, output: 8, family: 'o' },
-  { test: /^o4-mini(?:-|$)/, input: 1.1, cached: 0.275, output: 4.4, family: 'o' },
+  { test: id('o1-pro'), input: 150, cached: 150, output: 600, family: 'pro' },
+  { test: id('o1-mini'), input: 1.1, cached: 0.55, output: 4.4, family: 'o' },
+  { test: id('o1-preview'), input: 15, cached: 7.5, output: 60, family: 'o' },
+  { test: id('o1'), input: 15, cached: 7.5, output: 60, family: 'o' },
+  { test: id('o3-pro'), input: 20, cached: 20, output: 80, family: 'pro' },
+  { test: id('o3-mini'), input: 1.1, cached: 0.55, output: 4.4, family: 'o' },
+  { test: id('o3'), input: 2, cached: 0.5, output: 8, family: 'o' },
+  { test: id('o4-mini'), input: 1.1, cached: 0.275, output: 4.4, family: 'o' },
 ];
 
 const LONG_CONTEXT_THRESHOLD = 272_000;
@@ -70,7 +80,9 @@ function priceFor(model) {
       ...bundled,
       ...live,
       family: (bundled && bundled.family) || live.family || 'other',
-      longContext: !!((bundled && bundled.longContext) || live.longContext),
+      // The official table decides whether a model is tiered by context. The
+      // bundled guess only stands in when the table has not been read yet.
+      longContext: live.longContext == null ? !!(bundled && bundled.longContext) : !!live.longContext,
       source: 'OpenAI pricing (live)',
       official: true,
     };

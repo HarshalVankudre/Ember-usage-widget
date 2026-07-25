@@ -1,14 +1,16 @@
 'use strict';
 
-const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, nativeTheme, screen } = require('electron');
+const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, nativeTheme, screen, dialog, clipboard, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const fsp = require('fs/promises');
 const crypto = require('crypto');
 const claudeUsage = require('./providers/claude/usage');
 const claudeLimits = require('./providers/claude/limits');
 const codexUsage = require('./providers/codex/usage');
 const opencodeUsage = require('./providers/opencode/usage');
 const codexLimits = require('./providers/codex/limits');
+const quotaLedger = require('./providers/quota-ledger');
 const codexPricingLive = require('./providers/codex/pricing-live');
 const claudePricingLive = require('./providers/claude/pricing-live');
 const { normalizeClaude, normalizeCodex } = require('./providers/normalize');
@@ -23,17 +25,40 @@ let watchMaxWait = null;
 let saveBoundsDebounce = null;
 let isQuitting = false;
 
-const WATCH_DEBOUNCE_MS = 150;
-const WATCH_MAX_WAIT_MS = 900;
-const RECONCILE_INTERVAL_MS = 30 * 1000;
+const WATCH_DEBOUNCE_MS = 110;
+// A long streaming write never goes quiet, so this bounds how long a burst can
+// run before publishing anyway — the ceiling on how stale a live number gets.
+const WATCH_MAX_WAIT_MS = 380;
+// An unchanged pass now costs a parallel stat sweep rather than a full rebuild,
+// which is what makes reconciling this often affordable.
+const RECONCILE_INTERVAL_MS = 8 * 1000;
+// The account endpoint rate-limits hard, so polls stay spaced even when usage
+// is pouring in; the periodic poll below is the floor, this is the ceiling.
+const CLAUDE_MIN_POLL_MS = 90 * 1000;
+const CLAUDE_CATCH_UP_MS = 25 * 1000;
 
 const DEFAULT_SETTINGS = {
   bounds: { width: 460, height: 820 },
+  miniBounds: { width: 348, height: 84 },
+  miniMode: false,
   alwaysOnTop: true,
   launchAtStartup: true,
   firstRun: true,
   trayTipShown: false,
 };
+
+// Each mode keeps its own remembered size, so collapsing to the strip and
+// expanding again lands back on the layout the window already had.
+const FULL_MIN = { width: 390, height: 560 };
+const MINI_MIN = { width: 268, height: 72 };
+
+function modeBounds() {
+  return settings.miniMode ? settings.miniBounds : settings.bounds;
+}
+
+function modeMinimum() {
+  return settings.miniMode ? MINI_MIN : FULL_MIN;
+}
 
 // One-time carry-over from the app's previous identity ("ai-usage-widget"):
 // settings and parsed-usage caches move to Ember's userData folder so history
@@ -108,14 +133,15 @@ function clampToScreen(b) {
 }
 
 function createWindow() {
-  const b = clampToScreen({ ...settings.bounds });
+  const b = clampToScreen({ ...modeBounds() });
+  const min = modeMinimum();
   win = new BrowserWindow({
-    width: b.width || 460,
-    height: b.height || 780,
+    width: Math.max(min.width, b.width || min.width),
+    height: Math.max(min.height, b.height || min.height),
     x: b.x,
     y: b.y,
-    minWidth: 390,
-    minHeight: 560,
+    minWidth: min.width,
+    minHeight: min.height,
     frame: false,
     resizable: true,
     skipTaskbar: true,
@@ -135,7 +161,8 @@ function createWindow() {
     clearTimeout(saveBoundsDebounce);
     saveBoundsDebounce = setTimeout(() => {
       if (!win || win.isDestroyed()) return;
-      settings.bounds = win.getBounds();
+      if (settings.miniMode) settings.miniBounds = win.getBounds();
+      else settings.bounds = win.getBounds();
       saveSettings();
     }, 400);
   };
@@ -226,6 +253,12 @@ function buildTrayMenu() {
       checked: !!settings.launchAtStartup,
       click: (item) => setAutostart(item.checked),
     },
+    {
+      label: 'Compact mode',
+      type: 'checkbox',
+      checked: !!settings.miniMode,
+      click: (item) => { setMiniMode(item.checked); showWindow(); },
+    },
     { type: 'separator' },
     { label: 'Refresh data', click: () => { pushUpdate(true); pushClaudeLimits(true); } },
     { type: 'separator' },
@@ -249,8 +282,38 @@ function setAutostart(value) {
   if (win) win.webContents.send('settings:update', publicSettings());
 }
 
+function setMiniMode(value) {
+  const on = !!value;
+  if (settings.miniMode === on) return;
+  if (win && !win.isDestroyed()) {
+    // Bank the size of the mode being left before the switch resizes it.
+    const from = win.getBounds();
+    if (on) settings.bounds = from;
+    else settings.miniBounds = from;
+    settings.miniMode = on;
+    const target = modeBounds();
+    const min = modeMinimum();
+    win.setMinimumSize(min.width, min.height);
+    win.setBounds({
+      x: from.x,
+      y: from.y,
+      width: Math.max(min.width, target.width || min.width),
+      height: Math.max(min.height, target.height || min.height),
+    });
+  } else {
+    settings.miniMode = on;
+  }
+  saveSettings();
+  if (tray) tray.setContextMenu(buildTrayMenu());
+  if (win) win.webContents.send('settings:update', publicSettings());
+}
+
 function publicSettings() {
-  return { alwaysOnTop: !!settings.alwaysOnTop, launchAtStartup: !!settings.launchAtStartup };
+  return {
+    alwaysOnTop: !!settings.alwaysOnTop,
+    launchAtStartup: !!settings.launchAtStartup,
+    miniMode: !!settings.miniMode,
+  };
 }
 
 /* ---------------- usage aggregation (both providers) ---------------- */
@@ -301,14 +364,37 @@ let lastClaudeLimits = null;
 let lastGoodClaudeLimits = null;
 let claudeBackoffUntil = 0;
 let lastForcedAt = 0;
+let lastClaudePollAt = 0;
+let claudeCatchUpTimer = null;
 
 let lastCodexLimits = null;
 let lastCodexSig = '';
 
+function currentLimits() {
+  return { claude: lastClaudeLimits, codex: lastCodexLimits };
+}
+
 function sendLimits() {
+  const payload = currentLimits();
+  // Every reading the renderer sees is also written to the durable quota
+  // history, so a window that closes while Ember is running is never lost.
+  quotaLedger.record(payload);
   if (win && !win.isDestroyed()) {
-    win.webContents.send('limits:update', { claude: lastClaudeLimits, codex: lastCodexLimits });
+    win.webContents.send('limits:update', payload);
+    win.webContents.send('quota:update', quotaLedger.snapshot());
   }
+}
+
+// New usage moves the plan meters, so the headroom bars and the quota rate
+// would otherwise lag the burn by up to five minutes. One catch-up poll after
+// a burst settles keeps them current without adding a faster polling loop.
+function scheduleClaudeCatchUp() {
+  if (claudeCatchUpTimer) return;
+  if (Date.now() - lastClaudePollAt < CLAUDE_MIN_POLL_MS) return;
+  claudeCatchUpTimer = setTimeout(() => {
+    claudeCatchUpTimer = null;
+    pushClaudeLimits();
+  }, CLAUDE_CATCH_UP_MS);
 }
 
 async function pushClaudeLimits(force = false) {
@@ -317,7 +403,10 @@ async function pushClaudeLimits(force = false) {
     // protect the strict endpoint from refresh-button spam
     if (Date.now() - lastForcedAt < 60 * 1000) return;
     lastForcedAt = Date.now();
+  } else if (Date.now() - lastClaudePollAt < CLAUDE_MIN_POLL_MS) {
+    return;
   }
+  lastClaudePollAt = Date.now();
   const res = await claudeLimits.fetchPlanLimits();
   if (res.ok) {
     lastGoodClaudeLimits = res;
@@ -352,6 +441,10 @@ function pushCodexLimits(snapshot) {
   if (sig !== lastCodexSig) {
     lastCodexSig = sig;
     sendLimits();
+  } else {
+    // The renderer is already showing this state, but the ledger still wants
+    // the reading — it is how an unchanged window keeps proving it is open.
+    quotaLedger.record(currentLimits());
   }
 }
 
@@ -438,8 +531,10 @@ async function publishUpdate(force, afterRevision) {
     // observable even when top-level token totals happen to stay unchanged.
     const sig = updateSignature(data);
     if (force || sig !== lastSig) {
+      const changed = sig !== lastSig;
       lastSig = sig;
       win.webContents.send('usage:update', data);
+      if (changed) scheduleClaudeCatchUp();
     } else {
       win.webContents.send('usage:heartbeat', Date.now());
     }
@@ -562,9 +657,18 @@ if (!gotLock) {
     codexUsage.init(userData);
     opencodeUsage.init(userData);
     codexLimits.init(userData);
-    // costs re-push (force: token totals are unchanged) once fresh prices land
-    codexPricingLive.init(userData, () => pushUpdate(true));
-    claudePricingLive.init(userData, () => pushUpdate(true));
+    quotaLedger.init(userData);
+    // Fresh prices change costs without touching a single log, so the cached
+    // aggregation has to be discarded before the re-push (token totals are
+    // unchanged, hence the force).
+    const repriceAll = () => {
+      claudeUsage.invalidate();
+      codexUsage.invalidate();
+      opencodeUsage.invalidate();
+      pushUpdate(true);
+    };
+    codexPricingLive.init(userData, repriceAll);
+    claudePricingLive.init(userData, repriceAll);
 
     lastGoodClaudeLimits = claudeLimits.loadCached();
     if (lastGoodClaudeLimits) lastClaudeLimits = { ...lastGoodClaudeLimits, stale: true };
@@ -609,13 +713,62 @@ ipcMain.handle('usage:get', async () => {
   pushCodexLimits(data.codexLimitsSnapshot);
   return data;
 });
-ipcMain.handle('limits:get', () => ({ claude: lastClaudeLimits, codex: lastCodexLimits }));
+ipcMain.handle('limits:get', () => currentLimits());
+ipcMain.handle('quota:get', () => {
+  quotaLedger.record(currentLimits());
+  return quotaLedger.snapshot();
+});
 ipcMain.handle('settings:get', () => publicSettings());
+ipcMain.handle('app:version', () => app.getVersion());
 ipcMain.on('win:hide', () => hideToTray());
 ipcMain.on('win:close', () => hideToTray());
 ipcMain.on('win:pin', (_e, v) => setPin(v));
+ipcMain.on('win:mini', (_e, v) => setMiniMode(v));
 ipcMain.on('app:autostart', (_e, v) => setAutostart(v));
 ipcMain.on('usage:refresh', () => {
+  // An explicit refresh rebuilds from the caches rather than trusting the
+  // memo — it is the one action that should never be a no-op.
+  claudeUsage.invalidate();
+  codexUsage.invalidate();
+  opencodeUsage.invalidate();
   pushUpdate(true);
   pushClaudeLimits(true);
+});
+
+/* Export stays a main-process job: the renderer composes the text, the user
+   picks the destination, and nothing leaves the machine on its own. */
+
+const EXPORT_FILTERS = {
+  csv: [{ name: 'CSV spreadsheet', extensions: ['csv'] }],
+  json: [{ name: 'JSON', extensions: ['json'] }],
+  md: [{ name: 'Markdown', extensions: ['md'] }],
+};
+
+ipcMain.handle('export:save', async (_e, payload) => {
+  const { suggestedName, content, format } = payload || {};
+  if (typeof content !== 'string' || !content) return { ok: false, reason: 'empty' };
+  try {
+    const result = await dialog.showSaveDialog(win, {
+      title: 'Export Ember usage',
+      defaultPath: path.join(app.getPath('documents'), String(suggestedName || 'ember-usage.csv')),
+      filters: EXPORT_FILTERS[format] || EXPORT_FILTERS.csv,
+    });
+    if (result.canceled || !result.filePath) return { ok: false, reason: 'canceled' };
+    // A byte-order mark keeps Excel from mangling the ° and · characters.
+    const body = format === 'csv' ? `﻿${content}` : content;
+    await fsp.writeFile(result.filePath, body, 'utf8');
+    return { ok: true, path: result.filePath, name: path.basename(result.filePath) };
+  } catch (err) {
+    console.error('export failed:', err);
+    return { ok: false, reason: 'write-failed' };
+  }
+});
+
+ipcMain.handle('export:reveal', (_e, filePath) => {
+  if (typeof filePath === 'string' && filePath) shell.showItemInFolder(filePath);
+});
+
+ipcMain.handle('clipboard:write', (_e, text) => {
+  clipboard.writeText(String(text || ''));
+  return true;
 });
