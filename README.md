@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="scripts/fire.svg" width="88" alt="Ember flame" />
+<img src="src/assets/logo.svg" width="88" alt="Ember mark — an incandescent letter E" />
 
 # Ember
 
@@ -178,7 +178,7 @@ The backend lives in `src-tauri/` (Rust); the renderer in `src/renderer/` (plain
 
 Created and maintained by **[Harshal Vankudre](https://github.com/HarshalVankudre)**.
 
-The Ember flame uses Microsoft's [Fluent Emoji](https://github.com/microsoft/fluentui-emoji) fire artwork under the MIT license. Ember grew from the original Claude and Codex usage widgets into a single, provider-aware ledger.
+The Ember mark — the initial E drawn as incandescent meter bars — is original artwork (`src/assets/logo.svg`; regenerate the icons with `scripts/render-logo.ps1`). Ember grew from the original Claude and Codex usage widgets into a single, provider-aware ledger.
 
 ## License
 

@@ -60,6 +60,13 @@ const $ = (id) => document.getElementById(id);
 const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
 let APP_VERSION = '';
 
+// Canvas text follows the widget's scalable type ramp: the stylesheet drives
+// the root font size from the window width, and chart labels track it.
+function chartFont(remSize, weight = '') {
+  const rem = parseFloat(getComputedStyle(document.documentElement).fontSize) || 10;
+  return `${weight ? `${weight} ` : ''}${Math.round(remSize * rem * 10) / 10}px "Segoe UI", sans-serif`;
+}
+
 /* ───────────────────────── helpers ───────────────────────── */
 
 function fmtTok(n) {
@@ -1349,7 +1356,7 @@ function renderChart(byDay, hoverIdx = -1) {
 
   // scale hint, top-right
   ctx.fillStyle = 'rgba(198,187,176,0.48)';
-  ctx.font = '600 9px "Segoe UI", sans-serif';
+  ctx.font = chartFont(0.95, '600');
   ctx.textAlign = 'right';
   ctx.fillText(fmtCost(maxV), W - padR, padT + 2);
 
@@ -1381,7 +1388,7 @@ function renderChart(byDay, hoverIdx = -1) {
 
   // x labels: first, middle, last
   ctx.fillStyle = 'rgba(198,187,176,0.48)';
-  ctx.font = '9px "Segoe UI", sans-serif';
+  ctx.font = chartFont(0.95);
   const lbl = (b) => b.label.slice(5).replace('-', '/');
   if (n > 0) {
     ctx.textAlign = 'left';
@@ -1918,7 +1925,7 @@ function renderQuotaChart(rows, scope, metric, hoverIdx = -1) {
   quotaGeom = null;
   if (!bars.length) {
     ctx.fillStyle = 'rgba(198,187,176,0.45)';
-    ctx.font = '10px "Segoe UI", sans-serif';
+    ctx.font = chartFont(1.05);
     ctx.textAlign = 'center';
     ctx.fillText('no windows to chart yet', W / 2, H / 2);
     return;
@@ -2019,17 +2026,18 @@ function renderQuotaChart(rows, scope, metric, hoverIdx = -1) {
   const fmtMetric = (v) => (metric === 'tokens' ? fmtTok(v) : fmtCost(v));
   // The scale sits over the tallest bar by definition, so it carries its own
   // backing rather than competing with whatever is behind it.
-  ctx.font = '600 9px "Segoe UI", sans-serif';
+  ctx.font = chartFont(0.95, '600');
+  const fpx = (parseFloat(getComputedStyle(document.documentElement).fontSize) || 10) * 0.95;
   const scaleText = fmtMetric(maxV);
   const scaleW = ctx.measureText(scaleText).width;
   ctx.fillStyle = 'rgba(13,11,10,0.72)';
-  roundRectPath(ctx, W - padR - scaleW - 5, padT - 5, scaleW + 6, 13, 3);
+  roundRectPath(ctx, W - padR - scaleW - 5, padT - 5, scaleW + 6, fpx + 4, 3);
   ctx.fill();
   ctx.fillStyle = 'rgba(198,187,176,0.7)';
   ctx.textAlign = 'right';
   ctx.fillText(scaleText, W - padR - 2, padT + 4);
   ctx.textAlign = 'left';
-  ctx.font = '9px "Segoe UI", sans-serif';
+  ctx.font = chartFont(0.95);
   ctx.fillText(`${n} ${scope.mode === 'session' ? 'sessions' : 'weeks'} · avg ${fmtMetric(mean)}${metric === 'perPct' ? ' per 1%' : ''}`, padL, H - 4);
 
   quotaGeom = { bars, padL, barW, gap, W, scope, metric };
