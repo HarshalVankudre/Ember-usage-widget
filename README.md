@@ -12,7 +12,7 @@ and honest API-equivalent cost — updated live from the logs already on your ma
 [![Latest release](https://img.shields.io/github/v/release/HarshalVankudre/Ember-usage-widget?style=flat-square&label=latest&color=ff7547)](https://github.com/HarshalVankudre/Ember-usage-widget/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/HarshalVankudre/Ember-usage-widget/total?style=flat-square&label=downloads&color=f4b35f)](https://github.com/HarshalVankudre/Ember-usage-widget/releases)
 [![Windows 11](https://img.shields.io/badge/Windows-11-38c98b?style=flat-square&logo=windows11&logoColor=white)](#install)
-[![Electron](https://img.shields.io/badge/Electron-33-8b9dc3?style=flat-square&logo=electron&logoColor=white)](https://www.electronjs.org/)
+[![Tauri](https://img.shields.io/badge/Tauri-2-ffc131?style=flat-square&logo=tauri&logoColor=white)](https://tauri.app/)
 [![MIT](https://img.shields.io/badge/license-MIT-a0968d?style=flat-square)](LICENSE)
 
 **[Download Ember](https://github.com/HarshalVankudre/Ember-usage-widget/releases/latest)** · [What it shows](#why-ember) · [Session burn](#session-burn--what-a-percent-of-your-plan-actually-buys) · [How it works](#how-it-works) · [Build from source](#build-from-source)
@@ -124,12 +124,12 @@ The footer's export menu writes whatever is currently on screen, and only where 
 Ember supports **Windows 11**. Windows 11 22H2 or newer is recommended for the acrylic material.
 
 1. Open the **[latest release](https://github.com/HarshalVankudre/Ember-usage-widget/releases/latest)**.
-2. Choose the build that fits you:
-   - `Ember Setup 1.4.0.exe` — one-click per-user install, shortcuts, tray, and autostart
-   - `Ember Portable 1.4.0.exe` — one self-contained executable, no installation
+2. Run `Ember_2.0.0_x64-setup.exe` — a one-click per-user install with shortcuts, tray, and autostart.
 3. Launch Ember. Existing local Claude Code and Codex sessions appear automatically.
 
-No API keys. No account setup. No database to configure.
+No API keys. No account setup. No database to configure. Upgrading from an Electron-era Ember (1.x)? Usage history, quota history, and settings carry over automatically on first launch.
+
+Since 2.0, Ember is a native [Tauri](https://tauri.app/) app on Windows 11's built-in WebView2 — the Rust backend parses logs faster, and there is no bundled Chromium or Node runtime, so the installer and memory footprint are a fraction of the Electron build's.
 
 ## How it works
 
@@ -156,24 +156,23 @@ Parsed records live in Ember's own local cache, so cleaning up old session logs 
 
 ## Build from source
 
-Requires [Node.js](https://nodejs.org/) and npm.
+Requires [Node.js](https://nodejs.org/) with npm, and a [Rust](https://rustup.rs/) toolchain.
 
 ```bash
 git clone https://github.com/HarshalVankudre/Ember-usage-widget.git
 cd Ember-usage-widget
 npm install
-npm start
+npm start      # tauri dev
 ```
 
 Useful commands:
 
 ```bash
-npm test       # pricing, limits, quota math, attribution, and aggregation checks
-npm run icon   # regenerate application and tray icons
-npm run dist   # build the installer and portable executable
+npm test       # renderer checks (node) + pricing, limits, quota math, attribution, parsing (cargo)
+npm run dist   # tauri build — NSIS installer plus a standalone executable
 ```
 
-For a reproducible UI capture, set `WIDGET_SHOT` before starting Ember. The app waits for the first complete render and writes screenshots automatically.
+The backend lives in `src-tauri/` (Rust); the renderer in `src/renderer/` (plain HTML/CSS/JS over the `window.api` bridge).
 
 ## Author
 

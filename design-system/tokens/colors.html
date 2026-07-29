@@ -1,0 +1,54 @@
+<!-- @dsCard group="Colors" -->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ember · Colors</title>
+<style>
+  body { margin: 0; padding: 20px; background: #0d0806; color: #f9f3e8;
+         font-family: "Bahnschrift", "Segoe UI", system-ui, sans-serif; }
+  h1 { margin: 0 0 4px; font-size: 13px; letter-spacing: .14em; text-transform: uppercase; color: #d9cab7; }
+  p  { margin: 0 0 16px; font-family: "Segoe UI", system-ui, sans-serif; font-size: 11px; color: #a8988a; }
+  .row { display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; margin-bottom: 14px; }
+  .sw { border-radius: 10px; border: 1px solid #271e12; padding: 8px; min-height: 64px;
+        display: flex; flex-direction: column; justify-content: flex-end; }
+  .sw b { font-size: 10px; font-weight: 600; letter-spacing: .04em; }
+  .sw span { font-size: 9px; color: rgba(249,243,232,.55); font-variant-numeric: tabular-nums; }
+  .cap { margin: 14px 0 6px; font-size: 10px; letter-spacing: .12em; text-transform: uppercase; color: #87786a; }
+</style>
+</head>
+<body>
+  <h1>Ember colors</h1>
+  <p>Money as heat: warm-cast blacks, ember accents, and cool status colors reserved for meaning.</p>
+
+  <div class="cap">Surfaces — warm-cast, never neutral gray</div>
+  <div class="row">
+    <div class="sw" style="background:#0d0806"><b>bg</b><span>#0D0806</span></div>
+    <div class="sw" style="background:#161009"><b>surface</b><span>#161009</span></div>
+    <div class="sw" style="background:#1c150d"><b>surface-2</b><span>#1C150D</span></div>
+    <div class="sw" style="background:#271d12"><b>surface-3</b><span>#271D12</span></div>
+    <div class="sw" style="background:#271e12"><b>line-soft</b><span>#271E12</span></div>
+    <div class="sw" style="background:#362917"><b>line</b><span>#362917</span></div>
+  </div>
+
+  <div class="cap">Heat — the brand carries the data</div>
+  <div class="row">
+    <div class="sw" style="background:#ff6d3b"><b style="color:#1a0c05">ember</b><span style="color:rgba(26,12,5,.7)">#FF6D3B</span></div>
+    <div class="sw" style="background:#ffa05c"><b style="color:#1a0c05">ember-bright</b><span style="color:rgba(26,12,5,.7)">#FFA05C</span></div>
+    <div class="sw" style="background:#f2b45c"><b style="color:#1a0c05">amber</b><span style="color:rgba(26,12,5,.7)">#F2B45C</span></div>
+    <div class="sw" style="background:#4fd39c"><b style="color:#06130d">green</b><span style="color:rgba(6,19,13,.7)">#4FD39C</span></div>
+    <div class="sw" style="background:#ff5f66"><b style="color:#1a0608">red</b><span style="color:rgba(26,6,8,.7)">#FF5F66</span></div>
+    <div class="sw" style="background:#0d0806;border-color:#362917"><b>text ramp</b><span>#F9F3E8 → #87786A</span></div>
+  </div>
+
+  <div class="cap">Providers &amp; model families</div>
+  <div class="row">
+    <div class="sw" style="background:#d97757"><b style="color:#1a0c05">Claude</b><span style="color:rgba(26,12,5,.7)">#D97757</span></div>
+    <div class="sw" style="background:#38c98b"><b style="color:#06130d">Codex</b><span style="color:rgba(6,19,13,.7)">#38C98B</span></div>
+    <div class="sw" style="background:#ef746f"><b style="color:#1a0c05">Fable</b><span style="color:rgba(26,12,5,.7)">#EF746F</span></div>
+    <div class="sw" style="background:#7fa8e8"><b style="color:#0a0f1a">Opus</b><span style="color:rgba(10,15,26,.7)">#7FA8E8</span></div>
+    <div class="sw" style="background:#79c995"><b style="color:#06130d">Sonnet</b><span style="color:rgba(6,19,13,.7)">#79C995</span></div>
+    <div class="sw" style="background:#b59bd8"><b style="color:#120a1a">Haiku</b><span style="color:rgba(18,10,26,.7)">#B59BD8</span></div>
+  </div>
+</body>
+</html>

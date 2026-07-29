@@ -1,0 +1,64 @@
+<!-- @dsCard group="Components" -->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ember · Cards</title>
+<style>
+  body { margin: 0; padding: 20px; background: #0d0806; color: #f9f3e8;
+         font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; }
+  h1 { margin: 0 0 4px; font-family: "Bahnschrift", sans-serif; font-size: 13px;
+       letter-spacing: .14em; text-transform: uppercase; color: #d9cab7; }
+  > p { margin: 0 0 16px; font-size: 11px; color: #a8988a; }
+  .intro { margin: 0 0 16px; font-size: 11px; color: #a8988a; }
+  .panel { margin-bottom: 12px; padding: 15px 15px 15px 17px; border: 1px solid #271e12; border-radius: 14px;
+           background: linear-gradient(180deg, rgba(255,255,255,.018), transparent 46%), #161009;
+           box-shadow: inset 0 1px 0 rgba(255,255,255,.035), 0 6px 18px rgba(0,0,0,.22); }
+  .panel-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 12px; }
+  .panel-head h2 { margin: 0; font-family: "Bahnschrift", sans-serif; color: #d9cab7; font-size: 10.5px;
+                   font-weight: 600; letter-spacing: .12em; text-transform: uppercase; }
+  .panel-note { color: #87786a; font-size: 9px; }
+  .quota-live { padding: 13px 14px; border: 1px solid rgba(255,109,59,.16); border-radius: 11px;
+                background: linear-gradient(135deg, rgba(255,109,59,.055), transparent 55%), #1c150d;
+                box-shadow: inset 0 1px 0 rgba(255,255,255,.035); }
+  .ql-top { display: flex; justify-content: space-between; align-items: baseline; }
+  .ql-label { color: #a8988a; font-family: "Bahnschrift", sans-serif; font-size: 9px;
+              letter-spacing: .12em; text-transform: uppercase; }
+  .ql-clock { color: #87786a; font-family: "Bahnschrift", sans-serif; font-size: 9px; font-variant-numeric: tabular-nums; }
+  .ql-cost { margin-top: 4px; font-family: "Bahnschrift", sans-serif; font-size: 26px; font-weight: 600;
+             font-variant-numeric: tabular-nums; }
+  .ql-cost .cur { position: relative; top: -.45em; margin-right: 2px; color: #ff6d3b; font-size: .46em; }
+  .ql-cost .dec { color: #d9cab7; font-size: .6em; }
+  .ql-tokens { color: #a8988a; font-size: 10px; margin-left: 8px; }
+  .stat-grid { display: grid; grid-template-columns: 1fr 1fr; border: 1px solid #271e12; border-radius: 10px;
+               background: #1c150d; box-shadow: inset 0 1px 0 rgba(255,255,255,.035); }
+  .stat { display: grid; grid-template-columns: 1fr auto; align-items: baseline; gap: 3px 8px; padding: 12px; }
+  .stat:nth-child(odd) { border-right: 1px solid #271e12; }
+  .stat:nth-child(-n+2) { border-bottom: 1px solid #271e12; }
+  .stat-k { color: #a8988a; font-size: 9px; font-weight: 600; }
+  .stat-v { grid-row: span 2; align-self: center; font-family: "Bahnschrift", sans-serif; font-size: 17px;
+            font-weight: 600; font-variant-numeric: tabular-nums; }
+  .stat-v .unit { margin-left: 1px; color: #a8988a; font-size: .62em; }
+  .stat-c { color: #87786a; font-size: 9px; }
+</style>
+</head>
+<body>
+  <h1>Cards</h1>
+  <p class="intro">Panels float on the base as warm elevated cards; the live-window card alone carries an ember tint.</p>
+
+  <section class="panel">
+    <div class="panel-head"><h2>Token ledger</h2><span class="panel-note">cost by billable class</span></div>
+    <div class="stat-grid">
+      <article class="stat"><span class="stat-k">Input</span><strong class="stat-v">143.00<span class="unit">M</span></strong><span class="stat-c">$705.3</span></article>
+      <article class="stat"><span class="stat-k">Output</span><strong class="stat-v">34.57<span class="unit">M</span></strong><span class="stat-c">$1,126</span></article>
+      <article class="stat"><span class="stat-k">Cache read</span><strong class="stat-v">7.04<span class="unit">B</span></strong><span class="stat-c">$4,041</span></article>
+      <article class="stat"><span class="stat-k">Cache write</span><strong class="stat-v">73.28<span class="unit">M</span></strong><span class="stat-c">≈$1,062</span></article>
+    </div>
+  </section>
+
+  <article class="quota-live">
+    <div class="ql-top"><span class="ql-label">Current session</span><span class="ql-clock">00:40 · 4 hr 11 min left</span></div>
+    <div><span class="ql-cost"><span class="cur">$</span>30<span class="dec">.73</span></span><span class="ql-tokens">15.18M tokens · 71 calls</span></div>
+  </article>
+</body>
+</html>

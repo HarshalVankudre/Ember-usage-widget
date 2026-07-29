@@ -1,0 +1,56 @@
+<!-- @dsCard group="Signature" -->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ember · Heat</title>
+<style>
+  body { margin: 0; padding: 20px; background: #0d0806; color: #f9f3e8;
+         font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; }
+  h1 { margin: 0 0 4px; font-family: "Bahnschrift", sans-serif; font-size: 13px;
+       letter-spacing: .14em; text-transform: uppercase; color: #d9cab7; }
+  .intro { margin: 0 0 16px; font-size: 11px; color: #a8988a; }
+  .cap { margin: 16px 0 8px; font-family: "Bahnschrift", sans-serif; font-size: 10px;
+         letter-spacing: .12em; text-transform: uppercase; color: #87786a; }
+  .strip { display: grid; grid-template-columns: repeat(24, 1fr); gap: 3px; }
+  .cell { height: 22px; border-radius: 4px; }
+  .frames { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .frame { position: relative; overflow: hidden; height: 96px; border-radius: 14px;
+           border: 1px solid rgba(255,190,140,.09); padding: 10px 12px; }
+  .frame small { position: relative; z-index: 1; color: #d9cab7; font-size: 9px; }
+  .frame::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 2px; }
+  .calm    { background: radial-gradient(130% 120% at 100% 0%, rgba(255,109,59,.12), transparent 55%), #100a07; }
+  .calm::before    { background: linear-gradient(180deg,#ffa05c,#ff6d3b 30%,transparent); opacity: .7; }
+  .worried { background: radial-gradient(130% 120% at 100% 0%, rgba(255,160,70,.22), transparent 58%), #100a07; }
+  .worried::before { background: linear-gradient(180deg,#ffa05c,#ff6d3b 30%,transparent); opacity: .85; }
+  .crit    { background: radial-gradient(130% 120% at 100% 0%, rgba(255,84,62,.3), transparent 62%), #100a07; }
+  .crit::before    { background: linear-gradient(180deg,#ffa05c,#ff6d3b 30%,transparent); opacity: 1; }
+</style>
+</head>
+<body>
+  <h1>Heat is data</h1>
+  <p class="intro">The signature move: ambient light tracks real state. The window's hearth glow warms with plan pressure, and each hour of the day is an ember lit by what it burned.</p>
+
+  <div class="cap">Ambient heat — calm / worried (&gt;70%) / critical (&gt;90%)</div>
+  <div class="frames">
+    <div class="frame calm"><small>headroom OK</small></div>
+    <div class="frame worried"><small>limits tightening</small></div>
+    <div class="frame crit"><small>near the cap</small></div>
+  </div>
+
+  <div class="cap">Time of day — 24 embers, sqrt-scaled glow</div>
+  <div class="strip" id="strip"></div>
+  <script>
+    const strip = document.getElementById('strip');
+    const values = [0,0,0,.05,0,0,.1,.2,.45,.6,.5,.4,.55,.7,.65,.5,.6,.8,1,.9,.7,.5,.3,.1];
+    for (const v of values) {
+      const i = Math.sqrt(v);
+      const cell = document.createElement('span');
+      cell.className = 'cell';
+      cell.style.background = `color-mix(in srgb, #ff6d3b ${i * 84}%, #1c150d)`;
+      cell.style.boxShadow = `inset 0 0 0 1px rgba(255,255,255,.02), 0 0 ${i * 9}px color-mix(in srgb, #ff6d3b ${i * 55}%, transparent)`;
+      strip.appendChild(cell);
+    }
+  </script>
+</body>
+</html>

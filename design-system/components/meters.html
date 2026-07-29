@@ -1,0 +1,57 @@
+<!-- @dsCard group="Components" -->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ember · Meters</title>
+<style>
+  body { margin: 0; padding: 20px; background: #0d0806; color: #f9f3e8;
+         font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; }
+  h1 { margin: 0 0 4px; font-family: "Bahnschrift", sans-serif; font-size: 13px;
+       letter-spacing: .14em; text-transform: uppercase; color: #d9cab7; }
+  p  { margin: 0 0 16px; font-size: 11px; color: #a8988a; }
+  .limit-row { display: grid; grid-template-columns: 150px 1fr 34px; align-items: center; gap: 10px; min-height: 26px; }
+  .limit-name { color: #d9cab7; font-size: 10px; }
+  .limit-sub { color: #87786a; font-size: 8px; }
+  .bar { height: 4px; border-radius: 4px; background: #271d12; overflow: hidden;
+         box-shadow: inset 0 1px 1px rgba(0,0,0,.3); }
+  .bar i { display: block; height: 100%; border-radius: inherit; }
+  .pct { font-family: "Bahnschrift", sans-serif; color: #a8988a; font-size: 9.5px; text-align: right;
+         font-variant-numeric: tabular-nums; }
+  .claude { background: #d97757; } .codex { background: #38c98b; }
+  .warn { background: #f2b45c; }
+  .crit { background: #ff5f66; box-shadow: 0 0 8px rgba(255,95,102,.55); }
+  .cap { margin: 16px 0 8px; font-family: "Bahnschrift", sans-serif; font-size: 10px;
+         letter-spacing: .12em; text-transform: uppercase; color: #87786a; }
+  .quota-meter { display: grid; grid-template-columns: 1fr 36px; align-items: center; gap: 9px; }
+  .quota-meter .bar { height: 5px; }
+  .quota-meter .pct { color: #d9cab7; font-size: 10px; }
+</style>
+</head>
+<body>
+  <h1>Plan meters</h1>
+  <p>Provider color while healthy; amber past 70%; red past 90% with a heat bloom. Bars sit in inset channels.</p>
+
+  <div class="limit-row">
+    <span><div class="limit-name">Current session</div><div class="limit-sub">Resets in 4 hr 11 min</div></span>
+    <div class="bar"><i class="claude" style="width:41%"></i></div><span class="pct">41%</span>
+  </div>
+  <div class="limit-row">
+    <span><div class="limit-name">Weekly · all models</div><div class="limit-sub">Resets Sat 05:59</div></span>
+    <div class="bar"><i class="warn" style="width:78%"></i></div><span class="pct">78%</span>
+  </div>
+  <div class="limit-row">
+    <span><div class="limit-name">Weekly · Fable 5</div><div class="limit-sub">Resets Sat 05:59</div></span>
+    <div class="bar"><i class="crit" style="width:93%"></i></div><span class="pct">93%</span>
+  </div>
+  <div class="limit-row">
+    <span><div class="limit-name">Codex weekly</div><div class="limit-sub">Resets Thu 00:07</div></span>
+    <div class="bar"><i class="codex" style="width:12%"></i></div><span class="pct">12%</span>
+  </div>
+
+  <div class="cap">Session-burn meter — inside the live window card</div>
+  <div class="quota-meter">
+    <div class="bar"><i class="claude" style="width:41%"></i></div><span class="pct">41%</span>
+  </div>
+</body>
+</html>

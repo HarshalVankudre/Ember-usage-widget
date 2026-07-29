@@ -1,0 +1,52 @@
+<!-- @dsCard group="Type" -->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ember · Type</title>
+<style>
+  body { margin: 0; padding: 20px; background: #0d0806; color: #f9f3e8;
+         font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; }
+  h1 { margin: 0 0 4px; font-family: "Bahnschrift", "Segoe UI", sans-serif; font-size: 13px;
+       letter-spacing: .14em; text-transform: uppercase; color: #d9cab7; }
+  p  { margin: 0 0 18px; font-size: 11px; color: #a8988a; }
+  .spec { display: grid; grid-template-columns: 150px 1fr; gap: 4px 16px; align-items: baseline; margin-bottom: 16px; }
+  .spec small { color: #87786a; font-size: 9.5px; font-variant-numeric: tabular-nums; }
+  .money { font-family: "Bahnschrift", "Segoe UI Variable Display", sans-serif; font-weight: 600;
+           font-size: 52px; line-height: 1; letter-spacing: -.01em; font-variant-numeric: tabular-nums;
+           text-shadow: 0 0 34px rgba(255,130,70,.16); }
+  .money .cur { position: relative; top: -.46em; margin-right: 4px; color: #ff6d3b; font-size: .4em; font-weight: 500; }
+  .money .dec { color: #d9cab7; font-size: .52em; }
+  .eyebrow { font-family: "Bahnschrift", sans-serif; font-size: 10px; font-weight: 500;
+             letter-spacing: .14em; text-transform: uppercase; color: #a8988a; }
+  .metric { font-family: "Bahnschrift", sans-serif; font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .body { font-size: 11px; color: #d9cab7; line-height: 1.5; }
+  .caption { font-size: 9px; color: #87786a; }
+</style>
+</head>
+<body>
+  <h1>Ember type</h1>
+  <p>Bahnschrift (DIN, native on Windows) gives the numerals an instrument-cluster voice; Segoe UI Variable carries prose. Every figure is tabular.</p>
+
+  <div class="spec">
+    <small>Display money · Bahnschrift 600</small>
+    <div class="money"><span class="cur">$</span>6,934<span class="dec">.18</span></div>
+  </div>
+  <div class="spec">
+    <small>Eyebrow · Bahnschrift 500 / .14em caps</small>
+    <div class="eyebrow">Priced API value · all time</div>
+  </div>
+  <div class="spec">
+    <small>Metric · Bahnschrift 600 / 17</small>
+    <div class="metric">143.00<span style="color:#a8988a;font-size:.62em">M</span></div>
+  </div>
+  <div class="spec">
+    <small>Body · Segoe UI Variable 400 / 11</small>
+    <div class="body">Your last 47 sessions averaged $69.27 of API value each. Quota rates appear once Ember has watched a session close.</div>
+  </div>
+  <div class="spec">
+    <small>Caption · Segoe UI 400 / 9</small>
+    <div class="caption">19.50M tokens · 155 calls</div>
+  </div>
+</body>
+</html>

@@ -1,0 +1,61 @@
+<!-- @dsCard group="Components" -->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ember · Chips &amp; controls</title>
+<style>
+  body { margin: 0; padding: 20px; background: #0d0806; color: #f9f3e8;
+         font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; }
+  h1 { margin: 0 0 4px; font-family: "Bahnschrift", sans-serif; font-size: 13px;
+       letter-spacing: .14em; text-transform: uppercase; color: #d9cab7; }
+  .intro { margin: 0 0 16px; font-size: 11px; color: #a8988a; }
+  .cap { margin: 16px 0 8px; font-family: "Bahnschrift", sans-serif; font-size: 10px;
+         letter-spacing: .12em; text-transform: uppercase; color: #87786a; }
+  .date-chips { position: relative; display: flex; gap: 3px; padding: 3px; border: 1px solid #362917;
+                border-radius: 10px; background: #0d0806; box-shadow: inset 0 1px 3px rgba(0,0,0,.3); }
+  .chip { position: relative; z-index: 1; flex: 1 1 auto; min-height: 26px; padding: 0 9px; border: 0;
+          border-radius: 7px; background: transparent; color: #a8988a; font: 600 10px "Segoe UI", sans-serif;
+          cursor: pointer; }
+  .chip.active { color: #f9f3e8; }
+  .thumb { position: absolute; top: 3px; bottom: 3px; left: 67%; width: 16%; border-radius: 7px;
+           background: linear-gradient(180deg, #271d12, #1c150d);
+           box-shadow: inset 0 0 0 1px rgba(255,170,110,.1), 0 1px 3px rgba(0,0,0,.3); }
+  .model-row { display: flex; flex-wrap: wrap; gap: 5px; }
+  .model-chip { display: inline-flex; align-items: center; gap: 6px; min-height: 25px; padding: 0 9px;
+                border: 1px solid #362917; border-radius: 7px; background: #0d0806; color: #a8988a;
+                font: 600 10px "Segoe UI", sans-serif; cursor: pointer; }
+  .model-chip .swatch { width: 6px; height: 6px; border-radius: 2px; }
+  .model-chip.active { color: #d9cab7; }
+  .apply { min-height: 28px; padding: 0 12px; border: 1px solid rgba(255,109,59,.38); border-radius: 7px;
+           color: #ffa05c; background: rgba(255,109,59,.06); font: 600 10px "Segoe UI", sans-serif; cursor: pointer; }
+</style>
+</head>
+<body>
+  <h1>Chips &amp; controls</h1>
+  <p class="intro">One segmented range control with a sliding thumb; model chips carry their family color as a lit swatch; the only filled button is the ember-tinted primary.</p>
+
+  <div class="cap">Date range — segmented</div>
+  <div class="date-chips">
+    <span class="thumb"></span>
+    <button class="chip">Today</button><button class="chip">7D</button><button class="chip">30D</button>
+    <button class="chip">Month</button><button class="chip active">All</button><button class="chip">Custom</button>
+  </div>
+
+  <div class="cap">Provider &amp; model filters</div>
+  <div class="model-row">
+    <button class="model-chip active" style="border-color:#6b4335;background:#1d120d;">
+      <span class="swatch" style="background:#d97757;box-shadow:0 0 5px rgba(217,119,87,.6)"></span>Claude</button>
+    <button class="model-chip active" style="border-color:#2b5e46;background:#0f1a14;">
+      <span class="swatch" style="background:#38c98b;box-shadow:0 0 5px rgba(56,201,139,.6)"></span>Codex</button>
+    <button class="model-chip active" style="border-color:#6b3b39;background:#1d0f0e;">
+      <span class="swatch" style="background:#ef746f;box-shadow:0 0 5px rgba(239,116,111,.6)"></span>Fable 5</button>
+    <button class="model-chip"><span class="swatch" style="background:#7fa8e8"></span>Opus 4.8</button>
+    <button class="model-chip"><span class="swatch" style="background:#79c995"></span>Sonnet 5</button>
+    <button class="model-chip"><span class="swatch" style="background:#54c895"></span>GPT-5.6 Sol</button>
+  </div>
+
+  <div class="cap">Primary action</div>
+  <button class="apply">Apply</button>
+</body>
+</html>
