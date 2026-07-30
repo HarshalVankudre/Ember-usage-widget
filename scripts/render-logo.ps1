@@ -1,84 +1,79 @@
-# Renders the Ember mark (incandescent E) to src-tauri/icons/icon.ico and
-# src-tauri/icons/tray.png. Pure GDI+ — no Electron, no npm deps.
-# Master art: src/assets/logo.svg (this script mirrors its geometry).
+# Crops the Ember badge from the supplied master artwork and renders the
+# in-app mark, Windows icon, and tray icon. Pure GDI+ — no npm dependencies.
+# Master art: src/assets/logo.png.
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 
 $root = Split-Path -Parent $PSScriptRoot
 $iconsDir = Join-Path $root 'src-tauri\icons'
+$rendererAssetsDir = Join-Path $root 'src\renderer\assets'
+$sourcePath = Join-Path $root 'src\assets\logo.png'
 New-Item -ItemType Directory -Force $iconsDir | Out-Null
+New-Item -ItemType Directory -Force $rendererAssetsDir | Out-Null
 
-function New-RoundedRect([float]$x, [float]$y, [float]$w, [float]$h, [float]$r) {
-  $p = New-Object System.Drawing.Drawing2D.GraphicsPath
-  $d = 2 * $r
-  $p.AddArc($x, $y, $d, $d, 180, 90)
-  $p.AddArc($x + $w - $d, $y, $d, $d, 270, 90)
-  $p.AddArc($x + $w - $d, $y + $h - $d, $d, $d, 0, 90)
-  $p.AddArc($x, $y + $h - $d, $d, $d, 90, 90)
-  $p.CloseFigure()
-  return $p
+if (-not (Test-Path -LiteralPath $sourcePath)) {
+  throw "Missing master artwork: $sourcePath"
 }
 
-function New-EmberBrush {
-  # gold -> ember gradient across the E (design space y 14..50)
-  $b = New-Object System.Drawing.Drawing2D.LinearGradientBrush(
-    (New-Object System.Drawing.PointF(0, 14)),
-    (New-Object System.Drawing.PointF(0, 50)),
-    [System.Drawing.Color]::FromArgb(255, 255, 209, 102),
-    [System.Drawing.Color]::FromArgb(255, 255, 95, 46))
-  $blend = New-Object System.Drawing.Drawing2D.ColorBlend(3)
-  $blend.Colors = @(
-    [System.Drawing.Color]::FromArgb(255, 255, 209, 102),
-    [System.Drawing.Color]::FromArgb(255, 255, 141, 74),
-    [System.Drawing.Color]::FromArgb(255, 255, 95, 46))
-  $blend.Positions = @([float]0, [float]0.55, [float]1)
-  $b.InterpolationColors = $blend
-  return $b
-}
+$sourceImage = [System.Drawing.Image]::FromFile($sourcePath)
 
-function Draw-E([System.Drawing.Graphics]$g) {
-  $brush = New-EmberBrush
-  foreach ($bar in @(
-      @(19, 14, 8, 36),   # spine
-      @(19, 14, 27, 8),   # top arm
-      @(19, 28, 22, 8),   # middle arm
-      @(19, 42, 27, 8)    # bottom arm
-    )) {
-    $path = New-RoundedRect $bar[0] $bar[1] $bar[2] $bar[3] 4
-    $g.FillPath($brush, $path)
-    $path.Dispose()
-  }
-  $brush.Dispose()
+# The master is 1254px square. This crop isolates the upper badge while the
+# rounded clip removes its surrounding glow and excludes the wordmark.
+$sourceCrop = New-Object System.Drawing.Rectangle(307, 86, 640, 640)
+
+function New-RoundedRect(
+  [float]$x,
+  [float]$y,
+  [float]$width,
+  [float]$height,
+  [float]$radius
+) {
+  $path = New-Object System.Drawing.Drawing2D.GraphicsPath
+  $diameter = 2 * $radius
+  $path.AddArc($x, $y, $diameter, $diameter, 180, 90)
+  $path.AddArc($x + $width - $diameter, $y, $diameter, $diameter, 270, 90)
+  $path.AddArc(
+    $x + $width - $diameter,
+    $y + $height - $diameter,
+    $diameter,
+    $diameter,
+    0,
+    90)
+  $path.AddArc($x, $y + $height - $diameter, $diameter, $diameter, 90, 90)
+  $path.CloseFigure()
+  return $path
 }
 
 function Render-Badge([int]$size) {
-  $bmp = New-Object System.Drawing.Bitmap($size, $size)
+  $bmp = New-Object System.Drawing.Bitmap(
+    $size,
+    $size,
+    [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
   $g = [System.Drawing.Graphics]::FromImage($bmp)
-  $g.SmoothingMode = 'AntiAlias'
-  $s = $size / 64.0
-  $g.ScaleTransform($s, $s)
-  $badge = New-RoundedRect 3 3 58 58 15
-  $bg = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 22, 14, 8))
-  $g.FillPath($bg, $badge)
-  $pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(41, 255, 160, 92), (1.2 / $s))
-  $g.DrawPath($pen, $badge)
-  Draw-E $g
-  $pen.Dispose(); $bg.Dispose(); $badge.Dispose(); $g.Dispose()
-  return $bmp
-}
-
-function Render-Tray([int]$size) {
-  # glyph only, transparent background, 3px breathing room
-  $bmp = New-Object System.Drawing.Bitmap($size, $size)
-  $g = [System.Drawing.Graphics]::FromImage($bmp)
-  $g.SmoothingMode = 'AntiAlias'
-  $scale = ($size - 6) / 36.0
-  $ox = ($size - 27 * $scale) / 2 - 19 * $scale
-  $oy = ($size - 36 * $scale) / 2 - 14 * $scale
-  $g.TranslateTransform($ox, $oy)
-  $g.ScaleTransform($scale, $scale)
-  Draw-E $g
+  $g.CompositingMode = [System.Drawing.Drawing2D.CompositingMode]::SourceCopy
+  $g.CompositingQuality = [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
+  $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+  $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+  $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
+  $scale = $size / 640.0
+  $badgeClip = New-RoundedRect (
+    33 * $scale) (
+    38 * $scale) (
+    574 * $scale) (
+    562 * $scale) (
+    129 * $scale)
+  $g.SetClip($badgeClip)
+  $destination = New-Object System.Drawing.Rectangle(0, 0, $size, $size)
+  $g.DrawImage(
+    $sourceImage,
+    $destination,
+    $sourceCrop.X,
+    $sourceCrop.Y,
+    $sourceCrop.Width,
+    $sourceCrop.Height,
+    [System.Drawing.GraphicsUnit]::Pixel)
+  $badgeClip.Dispose()
   $g.Dispose()
   return $bmp
 }
@@ -157,9 +152,17 @@ foreach ($size in $sizes) {
   $probe.Dispose()
 }
 
+# --- renderer asset: high-resolution mark for every in-app placement ---
+$rendererMark = Render-Badge 512
+$rendererMark.Save(
+  (Join-Path $rendererAssetsDir 'logo-mark.png'),
+  [System.Drawing.Imaging.ImageFormat]::Png)
+$rendererMark.Dispose()
+
 # --- tray.png ---
-$tray = Render-Tray 32
+$tray = Render-Badge 32
 $tray.Save((Join-Path $iconsDir 'tray.png'), [System.Drawing.Imaging.ImageFormat]::Png)
 $tray.Dispose()
+$sourceImage.Dispose()
 
-Write-Output "wrote $icoPath ($($images.Count) sizes) and tray.png"
+Write-Output "wrote logo-mark.png, $icoPath ($($images.Count) sizes), and tray.png"

@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="src/assets/logo.svg" width="88" alt="Ember mark — an incandescent letter E" />
+<img src="src/renderer/assets/logo-mark.png" width="116" alt="Ember flame and usage-meter mark" />
 
 # Ember
 
@@ -124,7 +124,7 @@ The footer's export menu writes whatever is currently on screen, and only where 
 Ember supports **Windows 11**. Windows 11 22H2 or newer is recommended for the acrylic material.
 
 1. Open the **[latest release](https://github.com/HarshalVankudre/Ember-usage-widget/releases/latest)**.
-2. Run `Ember_2.0.0_x64-setup.exe` — a one-click per-user install with shortcuts, tray, and autostart.
+2. Run `Ember_2.0.1_x64-setup.exe` — a one-click per-user install with shortcuts, tray, and autostart.
 3. Launch Ember. Existing local Claude Code and Codex sessions appear automatically.
 
 No API keys. No account setup. No database to configure. Upgrading from an Electron-era Ember (1.x)? Usage history, quota history, and settings carry over automatically on first launch.
@@ -178,7 +178,7 @@ The backend lives in `src-tauri/` (Rust); the renderer in `src/renderer/` (plain
 
 Created and maintained by **[Harshal Vankudre](https://github.com/HarshalVankudre)**.
 
-The Ember mark — the initial E drawn as incandescent meter bars — is original artwork (`src/assets/logo.svg`; regenerate the icons with `scripts/render-logo.ps1`). Ember grew from the original Claude and Codex usage widgets into a single, provider-aware ledger.
+The Ember mark combines a flame with rising usage-meter bars (`src/assets/logo.png`; regenerate the in-app and Windows icons with `scripts/render-logo.ps1`). Ember grew from the original Claude and Codex usage widgets into a single, provider-aware ledger.
 
 ## License
 
