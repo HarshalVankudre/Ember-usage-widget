@@ -24,7 +24,7 @@ rem ---------------------------------------------------------------------------
 setlocal EnableExtensions EnableDelayedExpansion
 
 set "SCRIPT_DIR=%~dp0"
-set "REPO_DIR=%SCRIPT_DIR%.."
+set "REPO_DIR=%SCRIPT_DIR:~0,-1%"
 set "BUNDLE_DIR=%REPO_DIR%\src-tauri\target\release\bundle\nsis"
 set "BACKUP_DIR=%TEMP%\ember-data-backup"
 set "LEGACY_DATA=%APPDATA%\Ember"
@@ -74,7 +74,7 @@ if not defined SETUP call :find_setup
 if not defined SETUP (
     echo   no Ember_^<version^>_x64-setup.exe found in:
     echo     !BUNDLE_DIR!
-    echo     !SCRIPT_DIR!
+    echo     !REPO_DIR!
     echo     %USERPROFILE%\Downloads
     echo(
     if "%ASSUME_YES%"=="1" goto no_setup
@@ -208,7 +208,7 @@ rem "Ember Setup 1.4.0.exe", so the underscore pattern cannot pick one up.
 :find_setup
 for %%D in (
     "%BUNDLE_DIR%"
-    "%SCRIPT_DIR%."
+    "%REPO_DIR%"
     "%USERPROFILE%\Downloads"
 ) do (
     if not defined SETUP (
@@ -332,7 +332,7 @@ echo     /nolaunch      do not start Ember afterwards
 echo     /nobackup      skip the %%APPDATA%%\Ember\*.json backup
 echo(
 echo   With no arguments it uses the newest Ember_*setup.exe from
-echo   src-tauri\target\release\bundle\nsis, this script's folder, or Downloads.
+echo   src-tauri\target\release\bundle\nsis, the repo root, or Downloads.
 echo(
 goto end
 
