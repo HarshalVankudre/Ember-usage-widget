@@ -6,7 +6,7 @@
 
 ### Your AI coding burn, without the blind spots.
 
-One private desktop ledger for **Claude Code + Codex + OpenCode** usage, plan headroom,<br />
+One private desktop ledger for **Claude Code + Codex + OpenCode + Oh My Pi** usage, plan headroom,<br />
 and honest API-equivalent cost — updated live from the logs already on your machine.
 
 [![Latest release](https://img.shields.io/github/v/release/HarshalVankudre/Ember-usage-widget?style=flat-square&label=latest&color=ff7547)](https://github.com/HarshalVankudre/Ember-usage-widget/releases/latest)
@@ -44,9 +44,7 @@ Ember turns those invisible meters into one calm, always-available desktop view.
 - **5-hour, 7-day and month-to-date windows**, with a month-end projection
 - **Period comparison** against the equivalent stretch before it
 - **Provider and model filters** for instant isolation of any slice
-- **Token ledger** for input, output, cache reads, cache writes, and measured reasoning
 - **Interactive burn history** with daily drill-downs and custom date-and-time ranges
-- **Time-of-day strip** showing which hours actually burn
 - **Model and project breakdowns** with screen-share privacy controls
 - **Compact mode**, tray residency, always-on-top, autostart, and Windows 11 acrylic
 - **Export** to CSV or JSON, and a copy-ready Markdown summary
@@ -60,8 +58,6 @@ Both providers publish a single "you are N% through your quota" number and nothi
 
 Ember keeps the record the meters do not.
 
-<img src="docs/ember-windows.png" width="470" alt="A list of recent five-hour windows with tokens, API-equivalent value, percent of quota consumed, and value per one percent" />
-
 **Two independent sources, and they check each other.**
 
 - **Reconstruction.** A Claude session window opens on the first call and closes five hours later, anchored to the top of the hour. Replaying that rule across your local logs measures *every* 5-hour block you have ever worked — available the moment you install, with no waiting.
@@ -69,11 +65,7 @@ Ember keeps the record the meters do not.
 
 Where the two overlap, the observed window wins outright — its boundaries are the provider's own, so the percentage and the usage it is divided by are measured over the same interval. Windows Ember never watched keep their tokens and value and simply carry no percentage, rather than borrowing a neighbour's.
 
-Switch between **Value**, **Tokens** and **Per 1%**, and the panel says plainly whether the rate is holding:
-
-> Holding steady — your last 6 sessions bought $2.21 of API value per 1% of quota, within 4% of the 6 before.
-
-Bars are stacked by model, so a shift you can explain by model mix looks different from one you cannot. Weekly quotas get the same treatment, anchored to your account's own reset time.
+Switch between **Value**, **Tokens** and **Per 1%** to compare windows in the chart. Bars are stacked by model, so a shift you can explain by model mix looks different from one you cannot. Weekly quotas get the same treatment, anchored to your account's own reset time.
 
 ## Compact mode
 
@@ -98,7 +90,7 @@ Ember prices every request under its own provider before combining totals. Offic
 <details>
 <summary><strong>More about attribution and accuracy</strong></summary>
 
-OpenAI model IDs used through Claude Code compatibility gateways or OpenCode's OpenAI provider are reattributed to Codex and repriced with OpenAI rules before aggregation. Codex reasoning is reported as a subset of output and is never counted twice. Non-Claude/OpenAI gateway models (such as Qwen) and internal `nexus-gpt-*` traffic are excluded from totals, charts, filters, projects, and model breakdowns.
+OpenAI model IDs used through Claude Code compatibility gateways or OpenCode's OpenAI provider are reattributed to Codex and repriced with OpenAI rules before aggregation. Oh My Pi's first-party `anthropic`, `openai`, and `openai-codex` request statistics are read directly from the SQLite database behind `omp stats`, then folded into those same Claude and Codex model rows rather than shown as a third provider; every other OMP provider is ignored. OMP rows retain the token counts and recorded cost shown by its own dashboard. Codex reasoning is reported as a subset of output when the source exposes it and is never counted twice. Non-Claude/OpenAI gateway models (such as Qwen) and internal `nexus-gpt-*` traffic are excluded from totals, charts, filters, projects, and model breakdowns.
 
 The long-context surcharge is read from the provider's own table rather than assumed from a model family: a model whose published price is flat is billed flat however large the request.
 
@@ -124,8 +116,8 @@ The footer's export menu writes whatever is currently on screen, and only where 
 Ember supports **Windows 11**. Windows 11 22H2 or newer is recommended for the acrylic material.
 
 1. Open the **[latest release](https://github.com/HarshalVankudre/Ember-usage-widget/releases/latest)**.
-2. Run `Ember_2.0.1_x64-setup.exe` — a one-click per-user install with shortcuts, tray, and autostart.
-3. Launch Ember. Existing local Claude Code and Codex sessions appear automatically.
+2. Run `Ember_2.0.2_x64-setup.exe` — a one-click per-user install with shortcuts, tray, and autostart.
+3. Launch Ember. Existing local Claude Code, Codex, OpenCode, and Oh My Pi sessions appear automatically.
 
 No API keys. No account setup. No database to configure. Upgrading from an Electron-era Ember (1.x)? Usage history, quota history, and settings carry over automatically on first launch.
 
@@ -135,21 +127,22 @@ Since 2.0, Ember is a native [Tauri](https://tauri.app/) app on Windows 11's bui
 
 ```text
 Claude Code logs ─┐
-                  ├─► normalize ─► price per request ─► local history ─► Ember
-Codex rollouts ───┘                                          ▲
+Codex rollouts ───┼─► normalize ─► price per request ─► local history ─► Ember
+OpenCode DB ──────┤                                          ▲
+Oh My Pi logs ────┘                                          │
                                                              │
 plan meters ──────► quota ledger (every window Ember watched)─┘
 ```
 
 | Source | Claude | Codex |
 |---|---|---|
-| Usage | `~/.claude/projects/**/*.jsonl` | `~/.codex/sessions`, `archived_sessions`, and OpenAI requests in `~/.local/share/opencode/opencode.db` |
+| Usage | `~/.claude/projects/**/*.jsonl` plus Anthropic rows in `~/.omp/stats.db` | `~/.codex/sessions`, `archived_sessions`, OpenAI requests in `~/.local/share/opencode/opencode.db`, and OpenAI/OpenAI-Codex rows in `~/.omp/stats.db` |
 | Plan limits | Read-only Anthropic account API using Claude Code's existing OAuth token | Local `rate_limits` snapshots from rollout logs |
 | Updates | Debounced filesystem watcher plus periodic reconciliation | Debounced filesystem watcher plus periodic reconciliation |
 
 A write to a log reaches the screen in about a tenth of a second, and reconciliation sweeps every few seconds behind it. An unchanged sweep costs a parallel `stat` pass rather than a full re-price, so the cadence stays cheap. When new usage lands, Ember schedules one catch-up read of the plan meters so headroom tracks the burn without hammering an endpoint that rate-limits hard.
 
-Parsed records live in Ember's own local cache, so cleaning up old session logs does not erase your history. Deleted projects move into a collapsed group, and projects can be blurred and excluded from totals before a screen share.
+Parsed records live in Ember's own local cache, so cleaning up old session logs does not erase your history. Projects whose source logs are gone stay out of the project list, and visible projects can be blurred and excluded from totals before a screen share.
 
 > [!NOTE]
 > Ember reads your usage sources in place. Usage history, quota history, settings, and pricing caches remain on your machine; Ember adds no telemetry or cloud account.

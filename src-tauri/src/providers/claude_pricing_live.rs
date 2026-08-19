@@ -146,7 +146,7 @@ pub async fn refresh(client: &reqwest::Client) -> bool {
             if let Some(path) = CACHE_PATH.get() {
                 let cache = CacheFile { v: CACHE_VERSION, fetched_at, prices };
                 if let Ok(body) = serde_json::to_string(&cache) {
-                    let _ = std::fs::write(path, body);
+                    let _ = crate::persist::write_atomic(path, body);
                 }
             }
             true

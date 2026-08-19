@@ -29,7 +29,7 @@ pub fn load_cached() -> Option<Value> {
 pub fn save_cached(snap: &Value) {
     let Some(path) = CACHE_FILE.lock().unwrap().clone() else { return };
     if let Ok(body) = serde_json::to_string(snap) {
-        let _ = std::fs::write(path, body);
+        let _ = crate::persist::write_atomic(&path, body);
     }
 }
 

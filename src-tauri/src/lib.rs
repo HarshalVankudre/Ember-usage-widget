@@ -3,13 +3,14 @@
 //! serialized aggregation passes, plan-limit polling with backoff, and the
 //! durable quota ledger.
 
+pub mod persist;
 pub mod providers;
 pub mod settings;
 pub mod signature;
 
 use providers::{
     claude_limits, claude_pricing_live, claude_usage, codex_limits, codex_pricing_live,
-    codex_usage, model_attribution::is_first_party_model, normalize, opencode_usage,
+    codex_usage, model_attribution::is_first_party_model, normalize, omp_usage, opencode_usage,
     quota_ledger::Ledger,
 };
 use serde_json::{json, Value};
@@ -63,7 +64,7 @@ pub fn js_truthy(v: &Value) -> bool {
     match v {
         Value::Null => false,
         Value::Bool(b) => *b,
-        Value::Number(n) => n.as_f64().map_or(false, |f| f != 0.0 && !f.is_nan()),
+        Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0 && !f.is_nan()),
         Value::String(s) => !s.is_empty(),
         _ => true,
     }
@@ -199,13 +200,15 @@ async fn aggregate_all(state: &EmberState) -> Value {
     // every event that preceded it.
     let _guard = AGG_LOCK.lock().await;
     let revision = state.revision.fetch_add(1, Ordering::SeqCst) + 1;
-    let (claude, codex, opencode) = tokio::join!(
+    let (claude, codex, omp, opencode) = tokio::join!(
         tokio::task::spawn_blocking(claude_usage::aggregate),
         tokio::task::spawn_blocking(codex_usage::aggregate),
+        tokio::task::spawn_blocking(omp_usage::aggregate),
         opencode_usage::aggregate(),
     );
     let claude = claude.expect("claude aggregation panicked");
     let codex = codex.expect("codex aggregation panicked");
+    let omp = omp.expect("Oh My Pi aggregation panicked");
 
     // Claude-shaped compatibility transcripts can contain arbitrary gateway
     // models. Ember is a Claude + Codex ledger, so keep only first-party IDs.
@@ -225,12 +228,13 @@ async fn aggregate_all(state: &EmberState) -> Value {
             buckets.push(normalize::normalize_codex(b));
         }
     }
+    buckets.extend(omp.buckets.iter().cloned());
 
     json!({
         "buckets": buckets,
         "generatedAt": now_ms(),
         "revision": revision,
-        "fileCount": claude.file_count + codex.file_count + opencode.file_count,
+        "fileCount": claude.file_count + codex.file_count + omp.file_count + opencode.file_count,
         // newest rate-limit state from the Codex logs
         "codexLimitsSnapshot": codex.limits,
         "pricing": {
@@ -240,7 +244,7 @@ async fn aggregate_all(state: &EmberState) -> Value {
     })
 }
 
-async fn publish_update(app: &AppHandle, force: bool) {
+async fn publish_update(app: &AppHandle, force: bool) -> Value {
     let state = app.state::<EmberState>();
     let data = aggregate_all(&state).await;
     let snapshot = data.get("codexLimitsSnapshot").cloned().unwrap_or(Value::Null);
@@ -262,6 +266,7 @@ async fn publish_update(app: &AppHandle, force: bool) {
         let _ = app.emit("usage:heartbeat", now_ms());
     }
     push_codex_limits(app, &snapshot);
+    data
 }
 
 fn request_update(state: &EmberState, force: bool) {
@@ -758,7 +763,7 @@ async fn update_worker(app: AppHandle, mut rx: mpsc::UnboundedReceiver<bool>) {
         while let Ok(next) = rx.try_recv() {
             force = force || next;
         }
-        publish_update(&app, force).await;
+        let _ = publish_update(&app, force).await;
     }
 }
 
@@ -825,6 +830,10 @@ fn usage_dirs() -> Vec<PathBuf> {
         if !dirs.contains(&dir) {
             dirs.push(dir);
         }
+    }
+    let omp = omp_usage::data_dir();
+    if !dirs.contains(&omp) {
+        dirs.push(omp);
     }
     for dir in [opencode_usage::data_dir(), codex_limits::claudex_usage_dir()] {
         if !dirs.contains(&dir) {
@@ -957,17 +966,24 @@ fn win_drag(window: tauri::WebviewWindow) {
 }
 
 #[tauri::command]
-fn usage_refresh(app: AppHandle) {
+async fn usage_refresh(app: AppHandle) -> Value {
     // An explicit refresh rebuilds from the caches rather than trusting the
     // memo — it is the one action that should never be a no-op.
     claude_usage::invalidate();
     codex_usage::invalidate();
+    omp_usage::invalidate();
     opencode_usage::invalidate();
-    let state = app.state::<EmberState>();
-    request_update(&state, true);
+    let data = publish_update(&app, true).await;
+    let limits_app = app.clone();
     tauri::async_runtime::spawn(async move {
-        push_claude_limits(&app, true).await;
+        push_claude_limits(&limits_app, true).await;
     });
+    json!({
+        "ok": true,
+        "revision": data.get("revision").cloned().unwrap_or(Value::Null),
+        "generatedAt": data.get("generatedAt").cloned().unwrap_or(Value::Null),
+        "fileCount": data.get("fileCount").cloned().unwrap_or(Value::Null),
+    })
 }
 
 /* Export stays a backend job: the renderer composes the text, the user picks
@@ -1090,6 +1106,7 @@ pub fn run() {
             claude_usage::init(&user_data);
             claude_limits::init(&user_data);
             codex_usage::init(&user_data);
+            omp_usage::init(&user_data);
             opencode_usage::init(&user_data);
             codex_limits::init(&user_data);
             claude_pricing_live::init(&user_data);
@@ -1203,6 +1220,7 @@ pub fn run() {
                         if !fresh && ok {
                             claude_usage::invalidate();
                             codex_usage::invalidate();
+                            omp_usage::invalidate();
                             opencode_usage::invalidate();
                             request_update(&app.state::<EmberState>(), true);
                         }
@@ -1220,6 +1238,7 @@ pub fn run() {
                         if !fresh && ok {
                             claude_usage::invalidate();
                             codex_usage::invalidate();
+                            omp_usage::invalidate();
                             opencode_usage::invalidate();
                             request_update(&app.state::<EmberState>(), true);
                         }

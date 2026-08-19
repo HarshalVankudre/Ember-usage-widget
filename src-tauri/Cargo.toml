@@ -1,6 +1,6 @@
 [package]
 name = "ember-widget"
-version = "2.0.1"
+version = "2.0.2"
 description = "Ember — desktop widget showing Claude Code + ChatGPT Codex token usage, API-equivalent cost, plan limits, and what a percent of your plan actually buys"
 authors = ["Harshal Vankudre"]
 license = "MIT"
@@ -26,6 +26,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = "0.4"
 regex = "1"
+rusqlite = { version = "0.37", features = ["bundled"] }
 sha2 = "0.10"
 dirs = "6"
 notify = "8"
@@ -33,7 +34,7 @@ reqwest = { version = "0.12", features = ["json"] }
 tokio = { version = "1", features = ["macros", "time", "sync", "rt-multi-thread", "process"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Graphics_Dwm"] }
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Storage_FileSystem"] }
 
 [profile.release]
 codegen-units = 1

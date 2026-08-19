@@ -95,6 +95,7 @@ rem ---------------------------------------------- find the Electron install(s)
 rem electron-builder names its uninstaller "Uninstall <ProductName>.exe"; the
 rem Tauri one is a plain "uninstall.exe", which is how the two are told apart.
 call :add_candidate "%LOCALAPPDATA%\Programs\Ember\Uninstall Ember.exe"
+call :add_candidate "%LOCALAPPDATA%\Programs\ember-widget\Uninstall Ember.exe"
 call :add_candidate "%LOCALAPPDATA%\Programs\ai-usage-widget\Uninstall ai-usage-widget.exe"
 call :add_candidate "%ProgramFiles%\Ember\Uninstall Ember.exe"
 
@@ -137,9 +138,13 @@ if "%ASSUME_YES%"=="0" (
 echo(
 
 rem -------------------------------------------------------------- close Ember
-tasklist /fi "imagename eq Ember.exe" 2>nul | findstr /i "Ember.exe" >nul && (
+set "EMBER_RUNNING=0"
+tasklist /fi "imagename eq Ember.exe" 2>nul | findstr /i "Ember.exe" >nul && set "EMBER_RUNNING=1"
+tasklist /fi "imagename eq ember-widget.exe" 2>nul | findstr /i "ember-widget.exe" >nul && set "EMBER_RUNNING=1"
+if "!EMBER_RUNNING!"=="1" (
     echo   closing the running Ember...
     taskkill /f /im Ember.exe >nul 2>&1
+    taskkill /f /im ember-widget.exe >nul 2>&1
     call :sleep 3
 )
 
@@ -165,12 +170,14 @@ if "%SILENT%"=="1" (
 )
 
 set "EMBER_EXE="
-call :wait_exists "%LOCALAPPDATA%\Ember\Ember.exe" 60
-if exist "%LOCALAPPDATA%\Ember\Ember.exe" set "EMBER_EXE=%LOCALAPPDATA%\Ember\Ember.exe"
+call :wait_exists "%LOCALAPPDATA%\Ember\ember-widget.exe" 60
+if exist "%LOCALAPPDATA%\Ember\ember-widget.exe" set "EMBER_EXE=%LOCALAPPDATA%\Ember\ember-widget.exe"
+if not defined EMBER_EXE if exist "%LOCALAPPDATA%\Ember\Ember.exe" set "EMBER_EXE=%LOCALAPPDATA%\Ember\Ember.exe"
+if not defined EMBER_EXE if exist "%ProgramFiles%\Ember\ember-widget.exe" set "EMBER_EXE=%ProgramFiles%\Ember\ember-widget.exe"
 if not defined EMBER_EXE if exist "%ProgramFiles%\Ember\Ember.exe" set "EMBER_EXE=%ProgramFiles%\Ember\Ember.exe"
 
 if not defined EMBER_EXE (
-    echo   the installer ran, but Ember.exe is not where it was expected
+    echo   the installer ran, but the Ember executable is not where it was expected
     echo   ^(%LOCALAPPDATA%\Ember^). Check the Start menu shortcut.
     set "RC=1"
     goto end
@@ -222,15 +229,16 @@ exit /b 0
 rem %1 = an electron-builder uninstaller path; queued when it exists.
 :add_candidate
 if exist "%~1" (
+    for /l %%I in (1,1,!UN_COUNT!) do if /i "!UN_%%I!"=="%~1" exit /b 0
     set /a UN_COUNT+=1
     set "UN_!UN_COUNT!=%~1"
 )
 exit /b 0
 
-rem %1 = uninstall hive, %2 = DisplayName to match exactly.
+rem %1 = uninstall hive, %2 = text contained in DisplayName.
 :scan_hive
 set "CURKEY="
-for /f "usebackq delims=" %%L in (`reg query "%~1" /s /f "%~2" /d /e 2^>nul`) do (
+for /f "usebackq delims=" %%L in (`reg query "%~1" /s /f "%~2" /d 2^>nul`) do (
     set "LINE=%%L"
     if /i "!LINE:~0,5!"=="HKEY_" (
         set "CURKEY=!LINE!"
@@ -252,9 +260,8 @@ if not defined US exit /b 0
 call :dequote US !US!
 if not exist "!US!" exit /b 0
 if "!US:\Uninstall =!"=="!US!" exit /b 0
-set /a UN_COUNT+=1
-set "UN_!UN_COUNT!=!US!"
 if not "!KEYPATH:HKEY_LOCAL_MACHINE=!"=="!KEYPATH!" set "NEED_ADMIN=1"
+call :add_candidate "!US!"
 exit /b 0
 
 rem %1 = variable name, %2 = value (quotes stripped by %~2).

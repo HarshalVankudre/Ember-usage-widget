@@ -176,10 +176,7 @@ pub fn init(user_data: &Path) {
 fn save_cache(path: &Path, files: &BTreeMap<String, FileRec>) {
     let snapshot = CacheFile { v: CACHE_VERSION, files: files.clone() };
     if let Ok(body) = serde_json::to_string(&snapshot) {
-        let temp = path.with_extension("json.tmp");
-        if std::fs::write(&temp, body).is_ok() {
-            let _ = std::fs::rename(&temp, path);
-        }
+        let _ = crate::persist::write_atomic(path, body);
     }
 }
 
@@ -190,7 +187,7 @@ fn list_jsonl_files(dir: &Path, out: &mut Vec<PathBuf>) {
         let Ok(kind) = entry.file_type() else { continue };
         if kind.is_dir() {
             list_jsonl_files(&path, out);
-        } else if kind.is_file() && path.extension().map_or(false, |e| e == "jsonl") {
+        } else if kind.is_file() && path.extension().is_some_and(|e| e == "jsonl") {
             out.push(path);
         }
     }
@@ -235,7 +232,7 @@ fn num(v: Option<&serde_json::Value>) -> f64 {
     v.and_then(|v| v.as_f64()).unwrap_or(0.0)
 }
 
-fn str_field<'a>(v: Option<&'a serde_json::Value>) -> Option<&'a str> {
+fn str_field(v: Option<&serde_json::Value>) -> Option<&str> {
     v.and_then(|v| v.as_str()).filter(|s| !s.is_empty())
 }
 

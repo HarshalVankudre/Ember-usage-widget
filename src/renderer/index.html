@@ -8,6 +8,13 @@
 </head>
 <body>
   <main class="app" aria-label="Ember AI usage ledger">
+    <section class="startup-error" id="startupError" role="alert" hidden>
+      <img src="assets/logo-mark.png" alt="" aria-hidden="true" />
+      <p class="section-kicker">Ember needs attention</p>
+      <h1>Usage data could not be loaded</h1>
+      <p id="startupErrorMessage">The local Ember service did not respond.</p>
+      <button id="btnStartupRetry" type="button">Retry</button>
+    </section>
     <div class="mini-bar" id="miniBar">
       <span class="mini-flame" aria-hidden="true">
         <img src="assets/logo-mark.png" alt="" />
@@ -151,31 +158,6 @@
           <div id="quotaTip" class="chart-tip" hidden></div>
         </div>
 
-        <p class="quota-verdict" id="quotaVerdict"></p>
-        <div class="quota-rows" id="quotaRows"></div>
-      </section>
-
-      <section class="token-ledger" aria-labelledby="tokensHeading">
-        <div class="panel-head"><h2 id="tokensHeading">Token ledger</h2><span class="panel-note">cost by billable class</span></div>
-        <div class="stat-grid">
-          <article class="stat" title="Ordinary non-cached input tokens"><span class="stat-k">Input</span><strong class="stat-v" id="stIn">–</strong><span class="stat-c" id="stInCost"></span></article>
-          <article class="stat" title="Output tokens; Codex reasoning is included"><span class="stat-k">Output</span><strong class="stat-v" id="stOut">–</strong><span class="stat-c" id="stOutCost"></span></article>
-          <article class="stat" title="Prompt-cache reads billed at discounted rates"><span class="stat-k">Cache read</span><strong class="stat-v" id="stCr">–</strong><span class="stat-c" id="stCrCost"></span></article>
-          <article class="stat" id="stCwCard" title="Measured cache writes; an estimated premium may also appear in cost"><span class="stat-k" id="stCwLabel">Cache write</span><strong class="stat-v" id="stCw" aria-labelledby="stCwLabel">–</strong><span class="stat-c" id="stCwCost"></span></article>
-        </div>
-      </section>
-
-      <section class="insight-row" aria-label="Usage insights">
-        <article><span>Cache savings</span><strong class="amber" id="insSaved">–</strong></article>
-        <article><span>Burn / active day</span><strong id="insBurn">–</strong></article>
-        <article><span>Sessions</span><strong id="insSessions">–</strong></article>
-        <article><span>Input cache share</span><strong id="insCacheRate">–</strong></article>
-      </section>
-
-      <section class="panel hours-panel" aria-labelledby="hoursHeading">
-        <div class="panel-head"><h2 id="hoursHeading">Time of day</h2><span class="panel-note" id="hoursNote"></span></div>
-        <div class="hour-strip" id="hourStrip" role="img" aria-label="API-equivalent value by hour of day"></div>
-        <div class="hour-axis" aria-hidden="true"><span>00</span><span>06</span><span>12</span><span>18</span><span>23</span></div>
       </section>
 
       <section class="panel" aria-labelledby="chartHeading">
@@ -243,6 +225,7 @@
   <script src="tauri-bridge.js"></script>
   <script src="pricing-confidence.js"></script>
   <script src="quota-view.js"></script>
+  <script src="filter-state.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

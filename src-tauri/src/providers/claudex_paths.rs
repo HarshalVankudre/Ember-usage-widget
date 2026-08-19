@@ -1,14 +1,14 @@
 //! ClaudeX shares its config dir with Ember: projects (Anthropic-shaped
 //! transcripts) and a usage-cache holding shared Codex limit snapshots.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-fn expand_home(value: &str, home: &PathBuf) -> Option<PathBuf> {
+fn expand_home(value: &str, home: &Path) -> Option<PathBuf> {
     if value.is_empty() {
         return None;
     }
     if value == "~" {
-        return Some(home.clone());
+        return Some(home.to_path_buf());
     }
     if let Some(rest) = value
         .strip_prefix("~/")

@@ -177,10 +177,7 @@ pub fn init(user_data: &Path) {
 fn save_cache(path: &Path, files: &BTreeMap<String, FileRec>) {
     let snapshot = CacheFile { v: CACHE_VERSION, files: files.clone() };
     if let Ok(body) = serde_json::to_string(&snapshot) {
-        let temp = path.with_extension("json.tmp");
-        if std::fs::write(&temp, body).is_ok() {
-            let _ = std::fs::rename(&temp, path);
-        }
+        let _ = crate::persist::write_atomic(path, body);
     }
 }
 
@@ -191,7 +188,7 @@ fn list_jsonl_files(dir: &Path, out: &mut Vec<PathBuf>) {
         let Ok(kind) = entry.file_type() else { continue };
         if kind.is_dir() {
             list_jsonl_files(&path, out);
-        } else if kind.is_file() && path.extension().map_or(false, |e| e == "jsonl") {
+        } else if kind.is_file() && path.extension().is_some_and(|e| e == "jsonl") {
             out.push(path);
         }
     }
@@ -208,7 +205,7 @@ pub fn project_of_cwd(cwd: &str) -> String {
         .replace(&norm, "")
         .into_owned();
     let mut parts: Vec<&str> = norm.split('\\').filter(|p| !p.is_empty()).collect();
-    if parts.first().map_or(false, |p| p.eq_ignore_ascii_case("users")) && parts.len() >= 2 {
+    if parts.first().is_some_and(|p| p.eq_ignore_ascii_case("users")) && parts.len() >= 2 {
         parts.drain(0..2);
     }
     if parts.is_empty() { "~ (home)".to_string() } else { parts.join("/") }
@@ -281,7 +278,7 @@ pub fn parse_content(text: &str) -> ParsedFile {
                 || rl.get("plan_type").is_some_and(crate::js_truthy);
             if has_data {
                 if let Some(ts) = crate::parse_ts_ms(timestamp) {
-                    if limits.as_ref().map_or(true, |l| ts >= l.ts) {
+                    if limits.as_ref().is_none_or(|l| ts >= l.ts) {
                         limits = Some(LimitsSnap { ts, rate_limits: rl.clone() });
                     }
                 }
@@ -475,7 +472,7 @@ pub fn aggregate() -> Arc<Aggregate> {
     let mut newest_limits: Option<LimitsSnap> = None;
     for (file, rec) in &file_cache {
         if let Some(limits) = &rec.limits {
-            if newest_limits.as_ref().map_or(true, |n| limits.ts >= n.ts) {
+            if newest_limits.as_ref().is_none_or(|n| limits.ts >= n.ts) {
                 newest_limits = Some(limits.clone());
             }
         }

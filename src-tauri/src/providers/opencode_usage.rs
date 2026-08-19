@@ -103,10 +103,7 @@ pub fn init(user_data: &Path) {
 fn save_cache(path: &Path, rows: &BTreeMap<String, Value>) {
     let snapshot = CacheFile { v: CACHE_VERSION, rows: rows.clone() };
     if let Ok(body) = serde_json::to_string(&snapshot) {
-        let temp = path.with_extension("json.tmp");
-        if std::fs::write(&temp, body).is_ok() {
-            let _ = std::fs::rename(&temp, path);
-        }
+        let _ = crate::persist::write_atomic(path, body);
     }
 }
 

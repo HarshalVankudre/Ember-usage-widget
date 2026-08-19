@@ -19,7 +19,6 @@ const state = {
   selectedProviders: new Set(), // empty = both
   selectedModels: new Set(),    // keys `provider|model`; empty = all
   projectsExpanded: false,
-  deletedExpanded: false,
   expandedProject: null,
   hiddenProjects: loadHiddenProjects(), // excluded from all totals, shown blurred
   settings: { alwaysOnTop: false, launchAtStartup: true },
@@ -141,11 +140,8 @@ function updateValue(el, to, renderFn, animate) {
 
 const paintMoney = (el, v) => { el.innerHTML = moneyHTML(v); };
 const paintCost = (el, v) => { el.textContent = fmtCost(v); };
-const paintTok = (el, v) => { el.innerHTML = tokHTML(Math.max(0, v)); };
 const paintTokens = (el, v) => { el.textContent = `${fmtTok(Math.max(0, v))} tokens`; };
 const paintCalls = (el, v) => { el.textContent = `${Math.round(Math.max(0, v)).toLocaleString()} calls`; };
-const paintCount = (el, v) => { el.textContent = Math.round(Math.max(0, v)).toLocaleString(); };
-const paintPct = (el, v) => { el.textContent = `${Math.round(Math.max(0, v))}%`; };
 
 function dstr(d) {
   const y = d.getFullYear();
@@ -315,6 +311,17 @@ function passesProviderFilter(b) {
   return state.selectedProviders.size === 0 || state.selectedProviders.has(b.provider);
 }
 
+function visibleModelKeys() {
+  return new Set(state.buckets.filter(passesProviderFilter).map(mkey));
+}
+
+function reconcileVisibleModelSelection() {
+  state.selectedModels = window.EmberFilterState.reconcileModelSelection(
+    state.selectedModels,
+    visibleModelKeys(),
+  );
+}
+
 function bucketMatchesRange(b, source, range, frozenBounds = null) {
   const [from, to] = range;
   if (b.date < from || b.date > to) return false;
@@ -458,6 +465,7 @@ function render({ animate = false } = {}) {
     liveRenderFrame = 0;
   }
   state.hasRenderedUsage = true;
+  reconcileVisibleModelSelection();
 
   const rows = filteredBuckets();
   const byDay = dayTotals(chartFilteredBuckets());
@@ -477,7 +485,6 @@ function render({ animate = false } = {}) {
   const byProject = new Map(); // project name -> totals (providers merge)
   const sessions = new Set();
   const days = new Set();
-  const visibleProviders = new Set();
 
   for (const b of rows) {
     const mk = mkey(b);
@@ -542,7 +549,6 @@ function render({ animate = false } = {}) {
     // hidden projects still render (blurred) but count toward nothing else
     if (state.hiddenProjects.has(b.project)) continue;
 
-    visibleProviders.add(b.provider);
     tot.cost += b.cost;
     tot.costMin += b.costMin || 0;
     tot.costMax += b.costMax || b.cost || 0;
@@ -616,40 +622,6 @@ function render({ animate = false } = {}) {
   updateValue($('heroMsgs'), tot.msgs, paintCalls, animate);
   renderPeriodDelta(tot.cost);
   renderPricingConfidence(tot, byModel);
-  renderHours(rows);
-
-  // stat cards
-  const codexOnly = visibleProviders.has('codex') && !visibleProviders.has('claude');
-  const showReasoningCard = tot.cacheWrite === 0 && (codexOnly || tot.reasoning > 0);
-  updateValue($('stIn'), tot.input, paintTok, animate);
-  updateValue($('stOut'), tot.output, paintTok, animate);
-  updateValue($('stCr'), tot.cacheRead, paintTok, animate);
-  $('stInCost').textContent = fmtCost(tot.cIn);
-  $('stOutCost').textContent = fmtCost(tot.cOut)
-    + (tot.cTool > 0 ? ` + ${fmtCost(tot.cTool)} tools` : '')
-    + (!showReasoningCard && tot.reasoning > 0 ? ` · ${fmtTok(tot.reasoning)} reasoning` : '');
-  $('stCrCost').textContent = fmtCost(tot.cCr);
-  if (showReasoningCard) {
-    $('stCwLabel').textContent = 'Reasoning';
-    updateValue($('stCw'), tot.reasoning, paintTok, animate);
-    $('stCwCost').textContent = 'included in output'
-      + (tot.cCw > 0 ? ` · ≈${fmtCost(tot.cCw)} write est.` : '');
-    $('stCwCard').title = 'Codex reasoning tokens are included in output billing'
-      + (tot.cCw > 0 ? '; estimated cache-write premium retained below' : '');
-  } else {
-    $('stCwLabel').textContent = 'Cache write';
-    updateValue($('stCw'), tot.cacheWrite, paintTok, animate);
-    $('stCwCost').textContent = `${tot.estimated && tot.cCw > 0 ? '≈' : ''}${fmtCost(tot.cCw)}`;
-    $('stCwCard').title = 'Measured cache writes; an estimated premium may also appear in cost';
-  }
-
-  // insights
-  updateValue($('insSaved'), tot.saved, paintCost, animate);
-  updateValue($('insBurn'), days.size ? tot.cost / days.size : 0, paintCost, animate);
-  updateValue($('insSessions'), sessions.size, paintCount, animate);
-  const inTotal = tot.input + tot.cacheRead + tot.cacheWrite;
-  if (inTotal) updateValue($('insCacheRate'), (tot.cacheRead / inTotal) * 100, paintPct, animate);
-  else updateValue($('insCacheRate'), 0, (el) => { el.textContent = '–'; }, false);
 
   const providersKey = `${state.dataRevision}|${setKey(state.selectedProviders)}`;
   if (sectionRenderKeys.providers !== providersKey) {
@@ -675,7 +647,7 @@ function render({ animate = false } = {}) {
     sectionRenderKeys.modelTable = detailKey;
   }
 
-  const projectsKey = `${detailKey}|${state.projectsExpanded}|${state.deletedExpanded}|${state.expandedProject}`;
+  const projectsKey = `${detailKey}|${state.projectsExpanded}|${state.expandedProject}`;
   if (sectionRenderKeys.projects !== projectsKey) {
     renderProjects(byProject);
     sectionRenderKeys.projects = projectsKey;
@@ -798,46 +770,6 @@ function renderMonthProjection(animate) {
   el.title = projected
     ? `At the pace set over the first ${elapsed.toFixed(1)} days of the month`
     : '';
-}
-
-/* ───────────────────────── time of day ───────────────────────── */
-
-function renderHours(rows) {
-  const strip = $('hourStrip');
-  const byHour = new Array(24).fill(0);
-  const callsByHour = new Array(24).fill(0);
-  let total = 0;
-  for (const b of rows) {
-    if (state.hiddenProjects.has(b.project)) continue;
-    const hour = Number.isInteger(b.hour) ? b.hour : 0;
-    byHour[hour] += b.cost;
-    callsByHour[hour] += b.msgs;
-    total += b.cost;
-  }
-  const max = Math.max(...byHour);
-  strip.replaceChildren();
-  for (let h = 0; h < 24; h += 1) {
-    const cell = document.createElement('span');
-    cell.className = 'hour-cell';
-    // Square-root shading: a single runaway hour would otherwise flatten
-    // every other hour into the background.
-    const intensity = max > 0 ? Math.sqrt(byHour[h] / max) : 0;
-    cell.style.setProperty('--i', intensity.toFixed(3));
-    if (byHour[h] > 0) cell.classList.add('has');
-    cell.title = `${String(h).padStart(2, '0')}:00 — ${fmtCost(byHour[h])} · ${callsByHour[h].toLocaleString()} calls`;
-    strip.appendChild(cell);
-  }
-  const note = $('hoursNote');
-  if (!total) {
-    note.textContent = 'no usage in this range';
-    strip.setAttribute('aria-label', 'No usage in this range');
-    return;
-  }
-  const peak = byHour.indexOf(max);
-  const share = Math.round((max / total) * 100);
-  note.textContent = `peak ${String(peak).padStart(2, '0')}:00 · ${fmtCost(max)} · ${share}% of the range`;
-  strip.setAttribute('aria-label',
-    `API-equivalent value by hour of day. Busiest hour ${peak}:00 at ${fmtCost(max)}, ${share} percent of the range.`);
 }
 
 function renderPricingConfidence(tot, byModel) {
@@ -1110,12 +1042,11 @@ function appendProjectModels(table, p) {
   }
 }
 
-function buildProjectItem(wrap, name, p, max, isDeleted) {
+function buildProjectItem(wrap, name, p, max) {
   const isHidden = state.hiddenProjects.has(name);
   const item = document.createElement('div');
   item.className = 'proj';
   if (isHidden) item.classList.add('is-hidden');
-  if (isDeleted) item.classList.add('is-deleted');
 
   const summary = document.createElement('button');
   summary.type = 'button';
@@ -1138,9 +1069,7 @@ function buildProjectItem(wrap, name, p, max, isDeleted) {
   else if (p.estimated) costEl.title = `Conservative estimate; lower bound ${fmtCost(p.costMin)}`;
   summary.title = isHidden
     ? 'Hidden from totals — right-click to unhide'
-    : isDeleted
-      ? `${name} — logs deleted from disk; records kept by Ember`
-      : name;
+    : name;
 
   const details = document.createElement('div');
   details.className = 'proj-details';
@@ -1185,7 +1114,7 @@ function buildProjectItem(wrap, name, p, max, isDeleted) {
 function renderProjects(byProject) {
   const wrap = $('projectList');
   wrap.innerHTML = '';
-  const entries = [...byProject.entries()].sort((a, b) =>
+  const entries = [...byProject.entries()].filter(([, p]) => p.live).sort((a, b) =>
     b[1].cost - a[1].cost || a[0].localeCompare(b[0], undefined, { sensitivity: 'base' }));
   const note = $('projNote');
   if (note) {
@@ -1203,25 +1132,20 @@ function renderProjects(byProject) {
   if (!byProject.has(state.expandedProject)) state.expandedProject = null;
   const max = entries[0][1].cost || 1;
 
-  // projects whose logs were deleted from disk live in their own group at
-  // the bottom — records survive (parsed data is kept in Ember's cache)
-  const liveEntries = entries.filter(([, p]) => p.live);
-  const deletedEntries = entries.filter(([, p]) => !p.live);
+  const visibleEntries = state.projectsExpanded ? entries : entries.slice(0, PROJECT_PREVIEW_COUNT);
+  for (const [name, p] of visibleEntries) buildProjectItem(wrap, name, p, max);
 
-  const visibleEntries = state.projectsExpanded ? liveEntries : liveEntries.slice(0, PROJECT_PREVIEW_COUNT);
-  for (const [name, p] of visibleEntries) buildProjectItem(wrap, name, p, max, false);
-
-  if (liveEntries.length > PROJECT_PREVIEW_COUNT) {
+  if (entries.length > PROJECT_PREVIEW_COUNT) {
     const toggle = document.createElement('button');
     toggle.type = 'button';
     toggle.className = 'project-expand';
     toggle.setAttribute('aria-expanded', String(state.projectsExpanded));
     toggle.innerHTML = `
-      <span>${state.projectsExpanded ? `Show top ${PROJECT_PREVIEW_COUNT}` : `Show all ${liveEntries.length} projects`}</span>
+      <span>${state.projectsExpanded ? `Show top ${PROJECT_PREVIEW_COUNT}` : `Show all ${entries.length} projects`}</span>
       <svg viewBox="0 0 12 12" aria-hidden="true"><path d="m2.5 4.5 3.5 3 3.5-3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
     toggle.addEventListener('click', () => {
       state.projectsExpanded = !state.projectsExpanded;
-      if (!state.projectsExpanded && !liveEntries.slice(0, PROJECT_PREVIEW_COUNT).some(([name]) => name === state.expandedProject)) {
+      if (!state.projectsExpanded && !entries.slice(0, PROJECT_PREVIEW_COUNT).some(([name]) => name === state.expandedProject)) {
         state.expandedProject = null;
       }
       renderProjects(byProject);
@@ -1230,27 +1154,6 @@ function renderProjects(byProject) {
     wrap.appendChild(toggle);
   }
 
-  if (deletedEntries.length) {
-    const divider = document.createElement('button');
-    divider.type = 'button';
-    divider.className = 'deleted-divider';
-    divider.setAttribute('aria-expanded', String(state.deletedExpanded));
-    divider.title = 'Projects whose logs were deleted from disk — usage records are kept';
-    divider.innerHTML = `
-      <span>Deleted projects (${deletedEntries.length})</span>
-      <svg viewBox="0 0 12 12" aria-hidden="true"><path d="m2.5 4.5 3.5 3 3.5-3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
-    divider.addEventListener('click', () => {
-      state.deletedExpanded = !state.deletedExpanded;
-      if (!state.deletedExpanded && deletedEntries.some(([name]) => name === state.expandedProject)) {
-        state.expandedProject = null;
-      }
-      renderProjects(byProject);
-    });
-    wrap.appendChild(divider);
-    if (state.deletedExpanded) {
-      for (const [name, p] of deletedEntries) buildProjectItem(wrap, name, p, max, true);
-    }
-  }
 }
 
 /* ───────────────────────── chart ───────────────────────── */
@@ -1811,97 +1714,6 @@ function renderQuotaLive(rows, scope, animate) {
   }
 }
 
-function renderQuotaVerdict(rows, scope) {
-  const Q = window.EmberQuota;
-  const el = $('quotaVerdict');
-  const unit = scope.mode === 'session' ? 'sessions' : 'weeks';
-  const closed = rows.filter((r) => !r.active && r.totals.msgs > 0);
-  const rated = closed.filter((r) => r.rate);
-
-  el.classList.remove('up', 'down');
-  if (rated.length >= 6) {
-    const t = Q.trend(rated.map((r) => r.rate.costPerPct));
-    if (t.ok) {
-      const pct = Math.round(Math.abs(t.change) * 100);
-      if (t.direction === 'steady') {
-        el.textContent = `Holding steady — your last ${t.perSide} ${unit} bought ${fmtCost(t.recentMean)} of API value per 1% of quota, within ${pct}% of the ${t.perSide} before.`;
-        return;
-      }
-      el.classList.add(t.direction);
-      const word = t.direction === 'down' ? 'less' : 'more';
-      el.textContent = `Your last ${t.perSide} ${unit} bought ${fmtCost(t.recentMean)} per 1% of quota — ${pct}% ${word} than the ${t.perSide} before. A change in model mix explains some shifts; a persistent one does not.`;
-      return;
-    }
-  }
-  if (closed.length >= 3) {
-    const values = closed.map((r) => r.totals.cost);
-    const spread = Q.variability(values);
-    const tail = rated.length
-      ? ` ${rated.length} of them carry a measured quota reading.`
-      : ` Quota rates appear once Ember has watched ${unit === 'sessions' ? 'a session' : 'a week'} close.`;
-    el.textContent = `Your last ${closed.length} ${unit} averaged ${fmtCost(Q.mean(values))} of API value each${spread != null ? ` (±${Math.round(spread * 100)}%)` : ''}.${tail}`;
-    return;
-  }
-  el.textContent = closed.length
-    ? `Ember is building this history — ${closed.length} closed ${closed.length === 1 ? unit.slice(0, -1) : unit} so far.`
-    : `No closed ${unit} yet. Each ${scope.mode === 'session' ? 'five-hour window' : 'week'} you work adds a point.`;
-}
-
-const QUOTA_ROW_COUNT = 5;
-
-function renderQuotaRows(rows, scope, metric) {
-  const wrap = $('quotaRows');
-  wrap.innerHTML = '';
-  const recent = [...rows].reverse().slice(0, QUOTA_ROW_COUNT);
-  if (!recent.length) {
-    wrap.innerHTML = '<div class="empty">no windows recorded yet</div>';
-    return;
-  }
-  for (const row of recent) {
-    const item = document.createElement('div');
-    item.className = 'quota-row';
-    if (row.active) item.classList.add('is-live');
-
-    const label = document.createElement('span');
-    label.className = 'qr-when';
-    label.textContent = quotaRowLabel(row, scope);
-    if (row.active) label.textContent += ' · live';
-
-    const tok = document.createElement('span');
-    tok.className = 'qr-tok';
-    tok.textContent = fmtTok(row.totals.tokens);
-
-    const cost = document.createElement('span');
-    cost.className = 'qr-cost';
-    cost.textContent = fmtCost(row.totals.cost);
-
-    const pct = document.createElement('span');
-    pct.className = 'qr-pct';
-    if (row.percent > 0) {
-      pct.textContent = `${Math.round(row.percent)}%`;
-      pct.title = `${Math.round(row.percent)}% of the plan quota, as reported by the provider`;
-    } else {
-      pct.textContent = '—';
-      pct.classList.add('muted');
-      pct.title = 'No plan-meter reading was recorded for this window';
-    }
-
-    const rate = document.createElement('span');
-    rate.className = 'qr-rate';
-    if (row.rate) {
-      rate.textContent = metric === 'tokens'
-        ? `${fmtTok(row.rate.tokensPerPct)}/%`
-        : `${fmtCost(row.rate.costPerPct)}/%`;
-      rate.title = `${fmtCost(row.rate.costPerPct)} and ${fmtTok(row.rate.tokensPerPct)} tokens per 1% of quota`;
-    } else {
-      rate.textContent = '';
-    }
-
-    item.append(label, tok, cost, pct, rate);
-    wrap.appendChild(item);
-  }
-}
-
 let quotaGeom = null;
 let quotaHover = -1;
 function resetQuotaHover() { quotaHover = -1; }
@@ -2157,8 +1969,6 @@ function renderQuota(animate = false) {
   renderQuotaLive(rows, scope, animate);
   if (quotaHover >= 0) quotaHover = -1;
   renderQuotaChart(rows, scope, metric, -1);
-  renderQuotaVerdict(rows, scope);
-  renderQuotaRows(rows, scope, metric);
   $('quotaNote').textContent = scope.meter
     ? 'unfiltered · plan-metered'
     : 'unfiltered · rebuilt from logs';
@@ -2673,8 +2483,8 @@ function buildViewJson() {
       cacheRead: m.cacheRead, cacheWrite: m.cacheWrite, reasoning: m.reasoning,
       valueUsd: round(m.cost, 4), priced: !!m.priced,
     })),
-    projects: [...view.byProject.entries()].sort((a, b) => b[1].cost - a[1].cost).map(([name, p]) => ({
-      name, calls: p.msgs, valueUsd: round(p.cost, 4), deleted: !p.live,
+    projects: [...view.byProject.entries()].filter(([, p]) => p.live).sort((a, b) => b[1].cost - a[1].cost).map(([name, p]) => ({
+      name, calls: p.msgs, valueUsd: round(p.cost, 4),
       hidden: state.hiddenProjects.has(name),
     })),
     windows: scope ? {
@@ -2780,18 +2590,23 @@ async function runExport(id) {
     toast('Nothing to export from this view yet');
     return;
   }
-  if (spec.kind === 'copy') {
-    await window.api.copyText(content);
-    toast(spec.done);
-    return;
+  try {
+    if (spec.kind === 'copy') {
+      const copied = await window.api.copyText(content);
+      toast(copied === false ? 'Could not copy the summary' : spec.done);
+      return;
+    }
+    const result = await window.api.saveExport({
+      suggestedName: `${spec.name}-${today()}.${spec.format}`,
+      content,
+      format: spec.format,
+    });
+    if (result && result.ok) toast(`Saved ${result.name}`);
+    else if (result && result.reason === 'write-failed') toast('Could not write that file');
+  } catch (err) {
+    console.error('export failed:', err);
+    toast('Export failed — please try again');
   }
-  const result = await window.api.saveExport({
-    suggestedName: `${spec.name}-${today()}.${spec.format}`,
-    content,
-    format: spec.format,
-  });
-  if (result && result.ok) toast(`Saved ${result.name}`);
-  else if (result && result.reason === 'write-failed') toast('Could not write that file');
 }
 
 /* ───────────────────────── events ───────────────────────── */
@@ -2832,10 +2647,30 @@ function setupEvents() {
     setExportMenu(false);
   });
 
-  $('btnRefresh').onclick = () => {
-    $('btnRefresh').classList.add('spinning');
-    window.api.refresh();
-    setTimeout(() => $('btnRefresh').classList.remove('spinning'), 1200);
+  $('btnRefresh').onclick = async () => {
+    const button = $('btnRefresh');
+    if (button.disabled) return;
+    button.disabled = true;
+    button.classList.add('spinning');
+    button.setAttribute('aria-busy', 'true');
+    const started = performance.now();
+    try {
+      const result = await window.api.refresh();
+      if (!result || result.ok !== true) throw new Error('refresh did not complete');
+      const files = Number.isFinite(result.fileCount)
+        ? ` · ${result.fileCount.toLocaleString()} local files checked`
+        : '';
+      toast(`Usage refreshed${files}`);
+    } catch (err) {
+      console.error('refresh failed:', err);
+      toast('Refresh failed — please try again');
+    } finally {
+      const remaining = Math.max(0, 350 - (performance.now() - started));
+      if (remaining) await new Promise((resolve) => setTimeout(resolve, remaining));
+      button.classList.remove('spinning');
+      button.removeAttribute('aria-busy');
+      button.disabled = false;
+    }
   };
 
   $('btnSettings').onclick = () => setSettingsOpen(true);
@@ -3022,4 +2857,14 @@ function updatePinButton() {
   $('btnPin').setAttribute('aria-pressed', String(on));
 }
 
-init();
+function showStartupError(error) {
+  console.error('Ember startup failed:', error);
+  const panel = $('startupError');
+  const detail = error && error.message ? error.message : String(error || 'Unknown startup error');
+  $('startupErrorMessage').textContent = `The local Ember service did not respond. ${detail}`;
+  panel.hidden = false;
+  $('btnStartupRetry').onclick = () => window.location.reload();
+  $('btnStartupRetry').focus();
+}
+
+init().catch(showStartupError);

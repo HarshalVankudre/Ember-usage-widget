@@ -9,5 +9,6 @@ pub mod codex_pricing_live;
 pub mod codex_usage;
 pub mod model_attribution;
 pub mod normalize;
+pub mod omp_usage;
 pub mod opencode_usage;
 pub mod quota_ledger;

@@ -68,6 +68,6 @@ pub fn load(user_data: &Path) -> Settings {
 
 pub fn save(user_data: &Path, settings: &Settings) {
     if let Ok(body) = serde_json::to_string_pretty(settings) {
-        let _ = std::fs::write(settings_path(user_data), body);
+        let _ = crate::persist::write_atomic(&settings_path(user_data), body);
     }
 }
