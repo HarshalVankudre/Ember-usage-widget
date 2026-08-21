@@ -5,6 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Ember · AI usage ledger</title>
   <link rel="stylesheet" href="styles.css" />
+  <!-- Blocking, and ahead of the body: the saved theme has to be on the root
+       element before the first paint or the window flashes the wrong palette. -->
+  <script src="theme.js"></script>
 </head>
 <body>
   <main class="app" aria-label="Ember AI usage ledger">
@@ -213,6 +216,10 @@
         <label class="setting-row"><span><strong>Launch at startup</strong><small>Keep usage monitoring ready in the tray</small></span><input type="checkbox" id="setAutostart" class="switch" /></label>
         <label class="setting-row"><span><strong>Always on top</strong><small>Pin Ember above other windows</small></span><input type="checkbox" id="setPin" class="switch" /></label>
         <label class="setting-row"><span><strong>Compact mode</strong><small>Collapse to a strip showing the live window burn</small></span><input type="checkbox" id="setMini" class="switch" /></label>
+        <div class="theme-row">
+          <span><strong>Theme</strong><small>Match the editor you already stare at all day</small></span>
+          <div class="theme-grid" id="themeGrid" role="radiogroup" aria-label="Colour theme"></div>
+        </div>
         <div class="accuracy-note">
           <h3>How the number is calculated</h3>
           <p>API-equivalent value is reconstructed from local Claude Code and Codex token logs. Official standard API rates are refreshed daily and cached for offline use.</p>

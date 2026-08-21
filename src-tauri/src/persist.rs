@@ -6,8 +6,8 @@
 //! temporary file beside the destination and use the native replace primitive
 //! on Windows so every later snapshot is durable too.
 
-use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -52,16 +52,35 @@ fn replace(temp: &Path, destination: &Path) -> io::Result<()> {
 }
 
 pub fn write_atomic(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
+    write_atomic_with(path, |file| file.write_all(contents.as_ref()))
+}
+
+/// Same durability contract as [`write_atomic`], for payloads large enough that
+/// building them in memory is the expensive part. The usage caches are tens of
+/// megabytes; serializing one to a `String` first cost a transient allocation
+/// the size of the whole cache on every save, on top of the copy already
+/// resident. The callback writes straight into the temporary file instead.
+pub fn write_atomic_with<F>(path: &Path, fill: F) -> io::Result<()>
+where
+    F: FnOnce(&mut BufWriter<File>) -> io::Result<()>,
+{
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let temp = temp_path(path)?;
     let result = (|| {
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temp)?;
-        file.write_all(contents.as_ref())?;
+        let mut writer = BufWriter::new(file);
+        fill(&mut writer)?;
+        // Both steps matter: the buffer has to reach the file, and the file has
+        // to reach the disk, before the replace makes it the live copy.
+        writer.flush()?;
+        let file = writer
+            .into_inner()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         file.sync_all()?;
         drop(file);
         replace(&temp, path)
@@ -94,6 +113,43 @@ mod tests {
 
         assert_eq!(std::fs::read(&path).unwrap(), br#"{"revision":2}"#);
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn streaming_writes_replace_in_place_and_leave_no_temporaries() {
+        let dir = std::env::temp_dir().join(format!("ember-stream-{}", std::process::id()));
+        let path = dir.join("cache.json");
+
+        write_atomic(&path, br#"{"v":1}"#).unwrap();
+        write_atomic_with(&path, |w| {
+            // written in pieces, exactly as a serializer would
+            w.write_all(br#"{"v":2,"#)?;
+            w.write_all(br#""files":{}}"#)
+        })
+        .unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), br#"{"v":2,"files":{}}"#);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no .tmp left behind");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A serializer that fails partway must leave the previous file intact
+    /// rather than a truncated one.
+    #[test]
+    fn a_failed_streaming_write_keeps_the_previous_file() {
+        let dir = std::env::temp_dir().join(format!("ember-stream-fail-{}", std::process::id()));
+        let path = dir.join("cache.json");
+        write_atomic(&path, br#"{"good":true}"#).unwrap();
+
+        let err = write_atomic_with(&path, |w| {
+            w.write_all(b"partial")?;
+            Err(io::Error::new(io::ErrorKind::Other, "serializer gave up"))
+        });
+
+        assert!(err.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), br#"{"good":true}"#, "old copy survives");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no .tmp left behind");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

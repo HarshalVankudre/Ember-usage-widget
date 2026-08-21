@@ -61,9 +61,35 @@ let APP_VERSION = '';
 
 // Canvas text follows the widget's scalable type ramp: the stylesheet drives
 // the root font size from the window width, and chart labels track it.
+// Reading it is a forced style recalculation, so it is measured once per
+// resize instead of once per label — a chart draws a dozen of those.
+let rootRem = 0;
+function remPx() {
+  if (!rootRem) rootRem = parseFloat(getComputedStyle(document.documentElement).fontSize) || 10;
+  return rootRem;
+}
+window.addEventListener('resize', () => { rootRem = 0; }, { passive: true });
+
 function chartFont(remSize, weight = '') {
-  const rem = parseFloat(getComputedStyle(document.documentElement).fontSize) || 10;
-  return `${weight ? `${weight} ` : ''}${Math.round(remSize * rem * 10) / 10}px "Segoe UI", sans-serif`;
+  const px = Math.round(remSize * remPx() * 10) / 10;
+  return `${weight ? `${weight} ` : ''}${px}px "Cascadia Mono", Consolas, "Segoe UI", sans-serif`;
+}
+
+/* Resizing a canvas reallocates its backing store and resets the context, so
+   it is only done when the box actually changed size. Everything else is a
+   clear-and-draw. */
+function prepCanvas(canvas, W, H) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.round(W * dpr);
+  const h = Math.round(H * dpr);
+  const ctx = canvas.getContext('2d');
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  return ctx;
 }
 
 /* ───────────────────────── helpers ───────────────────────── */
@@ -247,42 +273,51 @@ function prettyModel(provider, model) {
   return provider === 'codex' ? prettyCodexModel(model) : prettyClaudeModel(model);
 }
 
-// family palettes (dark mode) — checked in order, first substring match wins
-const CLAUDE_FAMILY_COLOR = {
-  fable: '#ef746f', mythos: '#ef746f',
-  opus: '#7fa8e8',
-  sonnet: '#79c995',
-  haiku: '#b59bd8',
-  other: '#8f857c',
+/* Family palettes — checked in order, first substring match wins. The values
+   are token names rather than hexes so a model keeps its place in the
+   hierarchy across every theme. */
+const CLAUDE_FAMILY_TOKEN = {
+  fable: 'fable', mythos: 'fable',
+  opus: 'opus',
+  sonnet: 'sonnet',
+  haiku: 'haiku',
+  other: 'other',
 };
-const CODEX_FAMILY_COLOR = {
-  pro: '#eeb261',
-  mini: '#72b8d0',
-  nano: '#aa92cd',
-  'gpt-5': '#54c895',
-  codex: '#54c895',
-  'gpt-4': '#df7a73',
-  'o4': '#7fa8e8',
-  'o3': '#7fa8e8',
-  other: '#8f857c',
+const CODEX_FAMILY_TOKEN = {
+  pro: 'pro',
+  mini: 'mini',
+  nano: 'nano',
+  'gpt-5': 'gpt5',
+  codex: 'gpt5',
+  'gpt-4': 'gpt4',
+  'o4': 'o3',
+  'o3': 'o3',
+  other: 'other',
 };
 
 const modelColorCache = new Map();
 function modelColor(provider, model) {
   const key = `${provider}|${model}`;
   if (modelColorCache.has(key)) return modelColorCache.get(key);
-  const palette = provider === 'codex' ? CODEX_FAMILY_COLOR : CLAUDE_FAMILY_COLOR;
+  const palette = provider === 'codex' ? CODEX_FAMILY_TOKEN : CLAUDE_FAMILY_TOKEN;
   const lower = model.toLowerCase();
   let fam = 'other';
   for (const f of Object.keys(palette)) if (f !== 'other' && lower.includes(f)) { fam = f; break; }
   let hash = 0;
   for (const ch of key) hash = (hash * 31 + ch.charCodeAt(0)) >>> 0;
-  const base = palette[fam];
+  const base = window.EmberTheme.tokens()[palette[fam]];
   // shift lightness slightly per variant so e.g. Opus 4.7 vs 4.8 differ
   const shift = ((hash % 5) - 2) * 7;
   const c = shade(base, shift);
   modelColorCache.set(key, c);
   return c;
+}
+
+/* A theme swap invalidates every colour the renderer derived from it. */
+function invalidateThemeColors() {
+  modelColorCache.clear();
+  PROVIDERS.claude.color = window.EmberTheme.tokens().claude;
+  PROVIDERS.codex.color = window.EmberTheme.tokens().codex;
 }
 
 function shade(c, amt) {
@@ -904,10 +939,15 @@ function renderModelTable(byModel) {
     modelCell.appendChild(name);
     tr.appendChild(modelCell);
 
+    // Reasoning rides under the output figure rather than beside it. Inline, it
+    // was the widest thing in the row by far — enough to push the whole table
+    // past the panel and shove the cost column, the one number this panel is
+    // for, off the right edge entirely.
     const values = [
       { text: fmtTok(m.input) },
       {
-        text: fmtTok(m.output) + (m.reasoning > 0 ? ` · R ${fmtTok(m.reasoning)}` : ''),
+        text: fmtTok(m.output),
+        sub: m.reasoning > 0 ? `R ${fmtTok(m.reasoning)}` : '',
         title: m.reasoning > 0
           ? `${fmtTok(m.output)} output tokens · ${fmtTok(m.reasoning)} reasoning tokens`
           : '',
@@ -918,6 +958,12 @@ function renderModelTable(byModel) {
     for (const value of values) {
       const td = document.createElement('td');
       td.textContent = value.text;
+      if (value.sub) {
+        const sub = document.createElement('span');
+        sub.className = 'tok-sub';
+        sub.textContent = value.sub;
+        td.appendChild(sub);
+      }
       if (value.title) td.title = value.title;
       tr.appendChild(td);
     }
@@ -1165,13 +1211,10 @@ function renderChart(byDay, hoverIdx = -1) {
   state.lastByDay = byDay;
   const canvas = $('chart');
   const wrap = canvas.parentElement;
-  const dpr = window.devicePixelRatio || 1;
   const W = wrap.clientWidth, H = wrap.clientHeight;
-  canvas.width = W * dpr;
-  canvas.height = H * dpr;
-  const ctx = canvas.getContext('2d');
-  ctx.scale(dpr, dpr);
-  ctx.clearRect(0, 0, W, H);
+  if (!W || !H) return;
+  const ctx = prepCanvas(canvas, W, H);
+  const T = window.EmberTheme.tokens();
 
   // build continuous day list for the visible range
   let [from, to] = chartRangeForSelection();
@@ -1243,7 +1286,7 @@ function renderChart(byDay, hoverIdx = -1) {
     : bins.findIndex((bin) => !bin.week && bin.label === state.selectedDay);
 
   // faint gridlines at 25 / 50 / 75 % and the baseline
-  ctx.strokeStyle = 'rgba(245,239,232,0.05)';
+  ctx.strokeStyle = T.grid;
   for (const f of [0.25, 0.5, 0.75]) {
     const gy = H - padB - plotH * f + 0.5;
     ctx.beginPath();
@@ -1251,14 +1294,14 @@ function renderChart(byDay, hoverIdx = -1) {
     ctx.lineTo(W - padR, gy);
     ctx.stroke();
   }
-  ctx.strokeStyle = 'rgba(245,239,232,0.12)';
+  ctx.strokeStyle = T.axis;
   ctx.beginPath();
   ctx.moveTo(padL, H - padB + 0.5);
   ctx.lineTo(W - padR, H - padB + 0.5);
   ctx.stroke();
 
   // scale hint, top-right
-  ctx.fillStyle = 'rgba(198,187,176,0.48)';
+  ctx.fillStyle = T.label;
   ctx.font = chartFont(0.95, '600');
   ctx.textAlign = 'right';
   ctx.fillText(fmtCost(maxV), W - padR, padT + 2);
@@ -1273,24 +1316,23 @@ function renderChart(byDay, hoverIdx = -1) {
       if (h < 0.5) continue;
       const yTop = y - h;
       const [pv, model] = splitKey(mk);
-      const color = modelColor(pv, model);
-      const grad = ctx.createLinearGradient(0, yTop, 0, y);
-      grad.addColorStop(0, shade(color, 26));
-      grad.addColorStop(1, shade(color, -6));
-      ctx.fillStyle = grad;
+      // Flat fill: a per-segment gradient meant allocating one object per
+      // model per bar — hundreds a frame — for a shading nobody can see at
+      // three pixels wide.
+      ctx.fillStyle = modelColor(pv, model);
       roundRectPath(ctx, x, yTop, barW, h, Math.min(2.5, barW / 2));
       ctx.fill();
       y = yTop;
     }
     if (bin.total === 0) {
-      ctx.fillStyle = 'rgba(245,239,232,0.08)';
+      ctx.fillStyle = T.zero;
       ctx.fillRect(x, H - padB - 1.5, barW, 1.5);
     }
     ctx.globalAlpha = 1;
   });
 
   // x labels: first, middle, last
-  ctx.fillStyle = 'rgba(198,187,176,0.48)';
+  ctx.fillStyle = T.label;
   ctx.font = chartFont(0.95);
   const lbl = (b) => b.label.slice(5).replace('-', '/');
   if (n > 0) {
@@ -1554,17 +1596,39 @@ function buildQuotaScopes() {
       'Claude weekly quota periods');
   }
   if (providers.has('codex')) {
-    // Codex session length varies by plan, so it is only offered once the
-    // account snapshot has reported one. Guessing five hours would be wrong.
-    const session = meterFor('codex', 'session');
-    if (session && session.windowMinutes) {
-      push('codex', 'session', session, session.windowMinutes * 60000,
-        `${Math.round(session.windowMinutes / 60)}h session`, 'Codex session windows');
+    const Q = window.EmberQuota;
+    const current = state.limits && state.limits.codex;
+    const activeWindows = current && current.ok && Array.isArray(current.windows)
+      ? current.windows.filter((w) => Number(w.windowMinutes) > 0) : [];
+    const windowFor = (kind) => activeWindows.find((w) =>
+      (kind === 'session') === (Number(w.windowMinutes) <= 720));
+
+    if (activeWindows.length) {
+      // Current account telemetry decides which scopes exist. Old ledger rows
+      // must not resurrect a removed account window or a model-specific quota
+      // that an earlier parser accidentally attributed to Codex as a whole.
+      const sessionWindow = windowFor('session');
+      if (sessionWindow) {
+        const minutes = Number(sessionWindow.windowMinutes);
+        const session = Q.reconcileCodexMeter(meterFor('codex', 'session'), sessionWindow);
+        push('codex', 'session', session, minutes * 60000,
+          `${Math.round(minutes / 60)}h session`, 'Codex session windows');
+      }
+      const weeklyWindow = windowFor('weekly');
+      if (weeklyWindow) {
+        const minutes = Number(weeklyWindow.windowMinutes);
+        const weekly = Q.reconcileCodexMeter(meterFor('codex', 'weekly'), weeklyWindow);
+        push('codex', 'period', weekly, minutes * 60000, 'Week', 'Codex weekly quota periods');
+      }
+    } else {
+      // Never resurrect a Codex session scope from ledger history alone: old
+      // versions could have put a model-specific quota there. Weekly usage can
+      // still be reconstructed offline without asserting a session limit.
+      const weekly = meterFor('codex', 'weekly');
+      push('codex', 'period', weekly,
+        (weekly && weekly.windowMinutes ? weekly.windowMinutes : 7 * 24 * 60) * 60000,
+        'Week', 'Codex weekly quota periods');
     }
-    const weekly = meterFor('codex', 'weekly');
-    push('codex', 'period', weekly,
-      (weekly && weekly.windowMinutes ? weekly.windowMinutes : 7 * 24 * 60) * 60000,
-      'Week', 'Codex weekly quota periods');
   }
   return out;
 }
@@ -1693,7 +1757,7 @@ function renderQuotaLive(rows, scope, animate) {
 
   const meter = $('quotaMeter');
   const projection = $('quotaProjection');
-  if (live.percent > 0) {
+  if (Number.isFinite(live.percent)) {
     meter.hidden = false;
     const pct = Math.max(0, Math.min(100, live.percent));
     const fill = $('quotaMeterFill');
@@ -1703,8 +1767,8 @@ function renderQuotaLive(rows, scope, animate) {
     meter.title = `${Math.round(pct)}% of the plan ${scope.mode === 'session' ? 'session' : 'weekly'} quota consumed`;
     projection.textContent = live.rate
       ? `${fmtCost(live.rate.costPerPct)} and ${fmtTok(live.rate.tokensPerPct)} tokens per 1% · a full window at this rate is worth ${fmtCost(live.rate.projectedCost)}`
-      : '';
-    projection.hidden = !live.rate;
+      : 'The provider reports 0% used in this window.';
+    projection.hidden = false;
   } else {
     meter.hidden = true;
     projection.hidden = false;
@@ -1721,22 +1785,18 @@ function resetQuotaHover() { quotaHover = -1; }
 function renderQuotaChart(rows, scope, metric, hoverIdx = -1) {
   const canvas = $('quotaChart');
   const wrap = canvas.parentElement;
-  const dpr = window.devicePixelRatio || 1;
   const W = wrap.clientWidth;
   const H = wrap.clientHeight;
   if (!W || !H) return;
-  canvas.width = W * dpr;
-  canvas.height = H * dpr;
-  const ctx = canvas.getContext('2d');
-  ctx.scale(dpr, dpr);
-  ctx.clearRect(0, 0, W, H);
+  const ctx = prepCanvas(canvas, W, H);
+  const T = window.EmberTheme.tokens();
 
   // The rate view only has a value where a meter reading exists, so plotting
   // the unmeasured windows as zero would invent a collapse that never happened.
   const bars = metric === 'perPct' ? rows.filter((r) => r.rate) : rows;
   quotaGeom = null;
   if (!bars.length) {
-    ctx.fillStyle = 'rgba(198,187,176,0.45)';
+    ctx.fillStyle = T.label;
     ctx.font = chartFont(1.05);
     ctx.textAlign = 'center';
     ctx.fillText('no windows to chart yet', W / 2, H / 2);
@@ -1753,7 +1813,7 @@ function renderQuotaChart(rows, scope, metric, hoverIdx = -1) {
   const barW = Math.max(2, (plotW - gap * (n - 1)) / n);
   const scaleY = (v) => (v / maxV) * plotH;
 
-  ctx.strokeStyle = 'rgba(245,239,232,0.05)';
+  ctx.strokeStyle = T.grid;
   for (const f of [0.25, 0.5, 0.75]) {
     const gy = H - padB - plotH * f + 0.5;
     ctx.beginPath();
@@ -1761,7 +1821,7 @@ function renderQuotaChart(rows, scope, metric, hoverIdx = -1) {
     ctx.lineTo(W - padR, gy);
     ctx.stroke();
   }
-  ctx.strokeStyle = 'rgba(245,239,232,0.12)';
+  ctx.strokeStyle = T.axis;
   ctx.beginPath();
   ctx.moveTo(padL, H - padB + 0.5);
   ctx.lineTo(W - padR, H - padB + 0.5);
@@ -1777,11 +1837,7 @@ function renderQuotaChart(rows, scope, metric, hoverIdx = -1) {
       const h = scaleY(values[i]);
       const top = H - padB - h;
       const lead = [...row.totals.models.values()].sort((a, b) => b.cost - a.cost)[0];
-      const color = lead ? modelColor(lead.provider, lead.model) : PROVIDERS[scope.provider].color;
-      const grad = ctx.createLinearGradient(0, top, 0, H - padB);
-      grad.addColorStop(0, shade(color, 26));
-      grad.addColorStop(1, shade(color, -6));
-      ctx.fillStyle = grad;
+      ctx.fillStyle = lead ? modelColor(lead.provider, lead.model) : PROVIDERS[scope.provider].color;
       if (h >= 0.5) {
         roundRectPath(ctx, x, top, barW, h, Math.min(2.5, barW / 2));
         ctx.fill();
@@ -1797,23 +1853,19 @@ function renderQuotaChart(rows, scope, metric, hoverIdx = -1) {
         const h = scaleY(value);
         if (h < 0.5) continue;
         const top = y - h;
-        const color = modelColor(m.provider, m.model);
-        const grad = ctx.createLinearGradient(0, top, 0, y);
-        grad.addColorStop(0, shade(color, 26));
-        grad.addColorStop(1, shade(color, -6));
-        ctx.fillStyle = grad;
+        ctx.fillStyle = modelColor(m.provider, m.model);
         roundRectPath(ctx, x, top, barW, h, Math.min(2.5, barW / 2));
         ctx.fill();
         y = top;
       }
       if (values[i] === 0) {
-        ctx.fillStyle = 'rgba(245,239,232,0.08)';
+        ctx.fillStyle = T.zero;
         ctx.fillRect(x, H - padB - 1.5, barW, 1.5);
       }
     }
     if (row.active) {
       ctx.globalAlpha = dim ? 0.3 : 0.75;
-      ctx.strokeStyle = 'rgba(255,155,101,0.9)';
+      ctx.strokeStyle = T.live;
       ctx.setLineDash([2, 2]);
       ctx.lineWidth = 1;
       ctx.strokeRect(x - 0.5, padT - 2, barW + 1, H - padB - padT + 2);
@@ -1826,26 +1878,28 @@ function renderQuotaChart(rows, scope, metric, hoverIdx = -1) {
   const mean = window.EmberQuota.mean(values.filter((v) => v > 0));
   if (mean > 0) {
     const my = H - padB - scaleY(mean) + 0.5;
-    ctx.strokeStyle = 'rgba(244,179,95,0.42)';
+    ctx.globalAlpha = 0.45;
+    ctx.strokeStyle = T.mean;
     ctx.setLineDash([3, 3]);
     ctx.beginPath();
     ctx.moveTo(padL, my);
     ctx.lineTo(W - padR, my);
     ctx.stroke();
     ctx.setLineDash([]);
+    ctx.globalAlpha = 1;
   }
 
   const fmtMetric = (v) => (metric === 'tokens' ? fmtTok(v) : fmtCost(v));
   // The scale sits over the tallest bar by definition, so it carries its own
   // backing rather than competing with whatever is behind it.
   ctx.font = chartFont(0.95, '600');
-  const fpx = (parseFloat(getComputedStyle(document.documentElement).fontSize) || 10) * 0.95;
+  const fpx = remPx() * 0.95;
   const scaleText = fmtMetric(maxV);
   const scaleW = ctx.measureText(scaleText).width;
-  ctx.fillStyle = 'rgba(13,11,10,0.72)';
+  ctx.fillStyle = T.scaleBg;
   roundRectPath(ctx, W - padR - scaleW - 5, padT - 5, scaleW + 6, fpx + 4, 3);
   ctx.fill();
-  ctx.fillStyle = 'rgba(198,187,176,0.7)';
+  ctx.fillStyle = T.label;
   ctx.textAlign = 'right';
   ctx.fillText(scaleText, W - padR - 2, padT + 4);
   ctx.textAlign = 'left';
@@ -1897,7 +1951,7 @@ function setupQuotaHover() {
     addRow('Value', fmtCost(row.totals.cost));
     addRow('Tokens', fmtTok(row.totals.tokens));
     addRow('Calls', row.totals.msgs.toLocaleString());
-    if (row.percent > 0) addRow('Quota used', `${Math.round(row.percent)}%`);
+    if (Number.isFinite(row.percent)) addRow('Quota used', `${Math.round(row.percent)}%`);
     if (row.rate) {
       addRow('Per 1%', fmtCost(row.rate.costPerPct));
       addRow('Full window', `≈${fmtCost(row.rate.projectedCost)}`);
@@ -2131,7 +2185,18 @@ function renderLimits() {
   addGroup('claude', lims.claude, claudeRows, claudeErrorMsg, (l) => {
     if (l.stale && l.fetchedAt) {
       const mins = Math.round((Date.now() - l.fetchedAt) / 60000);
-      if (mins >= 5) return `Snapshot from ${mins} min ago — refreshing soon.`;
+      const age = mins < 120 ? `${mins} min` : `${Math.round(mins / 60)} hr`;
+      if (l.lastError === 'http-429') {
+        const retry = Number(l.retryAt) - Date.now();
+        const retryText = retry > 0
+          ? ` Retry available in ${fmtRemaining(retry).replace(/ left$/, '')}.` : '';
+        return `Snapshot from ${age} ago — Anthropic rate-limited the refresh.${retryText}`;
+      }
+      if (l.lastError === 'http-401' || l.lastError === 'http-403') {
+        return `Snapshot from ${age} ago — Claude Code sign-in has expired.`;
+      }
+      if (l.lastError) return `Snapshot from ${age} ago — refresh failed (${l.lastError}).`;
+      if (mins >= 5) return `Snapshot from ${age} ago — refreshing soon.`;
     }
     if (l.ok) {
       const ex = (l.data || {}).extra_usage;
@@ -2203,6 +2268,11 @@ function avatarMood(worstUtilization) {
   const pet = $('pet');
   pet.classList.toggle('worried', worstUtilization >= 80 && worstUtilization < 95);
   pet.classList.toggle('crit', worstUtilization >= 95);
+  // Drives the edge thermometer and the hearth bloom. A custom property on
+  // the root costs a style recalc; the two things reading it animate on
+  // transform and opacity, so nothing repaints.
+  const heat = Math.max(0, Math.min(1, (worstUtilization || 0) / 100));
+  document.documentElement.style.setProperty('--heat', heat.toFixed(3));
 }
 
 /* ───────────────────────── segmented control thumb ───────────────────────── */
@@ -2323,12 +2393,13 @@ function renderMini() {
 
   // Without a meter reading for this window, the strip falls back to the
   // hottest plan bar so it is never blank while a limit is filling up.
-  const pct = live && live.percent > 0 ? live.percent : state.worstLimit;
+  const measured = !!live && Number.isFinite(live.percent);
+  const pct = measured ? live.percent : state.worstLimit;
   const fill = $('miniFill');
   const shown = Math.max(0, Math.min(100, pct || 0));
   fill.style.setProperty('--w', `${shown.toFixed(1)}%`);
   fill.className = shown >= 95 ? 'crit' : shown >= 80 ? 'warn' : (scope ? scope.provider : 'claude');
-  $('miniPct').textContent = shown > 0 ? `${Math.round(shown)}%` : '–';
+  $('miniPct').textContent = measured || shown > 0 ? `${Math.round(shown)}%` : '–';
 
   const parts = [];
   if (live && live.totals.msgs) {
@@ -2394,7 +2465,7 @@ function buildWindowsCsv() {
       row.observed ? 'yes' : 'no',
       t.tokens, t.input, t.output, t.cacheRead, t.cacheWrite, t.msgs,
       round(t.cost, 4),
-      row.percent > 0 ? round(row.percent, 2) : '',
+      Number.isFinite(row.percent) ? round(row.percent, 2) : '',
       row.rate ? round(row.rate.costPerPct, 4) : '',
       row.rate ? Math.round(row.rate.tokensPerPct) : '',
       row.rate ? round(row.rate.projectedCost, 2) : '',
@@ -2496,7 +2567,7 @@ function buildViewJson() {
         end: new Date(row.endsAt).toISOString(),
         live: !!row.active,
         quotaMeasured: !!row.observed,
-        quotaPercent: row.percent > 0 ? round(row.percent, 2) : null,
+        quotaPercent: Number.isFinite(row.percent) ? round(row.percent, 2) : null,
         tokens: row.totals.tokens,
         calls: row.totals.msgs,
         valueUsd: round(row.totals.cost, 4),
@@ -2530,7 +2601,7 @@ function buildSummary() {
     lines.push('| Window | Tokens | Value | Quota | Per 1% |');
     lines.push('|---|---:|---:|---:|---:|');
     for (const row of recent) {
-      lines.push(`| ${quotaRowLabel(row, scope)}${row.active ? ' _(live)_' : ''} | ${fmtTok(row.totals.tokens)} | ${fmtCost(row.totals.cost)} | ${row.percent > 0 ? `${Math.round(row.percent)}%` : '—'} | ${row.rate ? fmtCost(row.rate.costPerPct) : '—'} |`);
+      lines.push(`| ${quotaRowLabel(row, scope)}${row.active ? ' _(live)_' : ''} | ${fmtTok(row.totals.tokens)} | ${fmtCost(row.totals.cost)} | ${Number.isFinite(row.percent) ? `${Math.round(row.percent)}%` : '—'} | ${row.rate ? fmtCost(row.rate.costPerPct) : '—'} |`);
     }
     const rated = rows.filter((r) => r.rate && !r.active);
     if (rated.length >= 6) {
@@ -2660,7 +2731,23 @@ function setupEvents() {
       const files = Number.isFinite(result.fileCount)
         ? ` · ${result.fileCount.toLocaleString()} local files checked`
         : '';
-      toast(`Usage refreshed${files}`);
+      // Refresh overrides a rate-limit backoff, so a 429 here means the button
+      // genuinely went out and asked — worth saying, and so is the success.
+      const claude = result.limits && result.limits.claude;
+      const claudeState = claude ? claude.state : null;
+      let limitsNote = '';
+      if (claudeState === 'updated') {
+        limitsNote = ' · Claude limits updated';
+      } else if (claude && (claude.reason === 'http-429' || claudeState === 'backoff')) {
+        limitsNote = ' · Claude limits rate-limited';
+      } else if (claudeState === 'cooldown' || claudeState === 'recent') {
+        limitsNote = ' · Claude limits checked recently';
+      } else if (claudeState === 'in-flight') {
+        limitsNote = ' · Claude limit check already running';
+      } else if (claudeState === 'error') {
+        limitsNote = ' · Claude limits unavailable';
+      }
+      toast(`Local usage rescanned${files}${limitsNote}`);
     } catch (err) {
       console.error('refresh failed:', err);
       toast('Refresh failed — please try again');
@@ -2775,6 +2862,16 @@ function setupEvents() {
 /* ───────────────────────── init ───────────────────────── */
 
 async function init() {
+  // theme.js already put the saved palette on the root element; from here the
+  // renderer only needs the resolved values and a repaint when they change.
+  invalidateThemeColors();
+  window.EmberTheme.onChange(() => {
+    invalidateThemeColors();
+    renderLimits();
+    if (state.hasRenderedUsage) render();
+  });
+  renderThemePicker();
+
   setupEvents();
   setupChartHover();
   setupQuotaHover();
@@ -2833,6 +2930,32 @@ async function init() {
   renderStatus();
   renderPricingStatus();
   document.body.dataset.ready = 'true';
+}
+
+/* Theme picker. Each button paints itself from the theme it selects — base,
+   then the three gauge steps — so the swatch is the preview. */
+function renderThemePicker() {
+  const grid = $('themeGrid');
+  if (!grid) return;
+  const active = window.EmberTheme.current();
+  grid.innerHTML = '';
+  for (const theme of window.EmberTheme.THEMES) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = `theme-swatch${theme.id === active ? ' active' : ''}`;
+    btn.setAttribute('role', 'radio');
+    btn.setAttribute('aria-checked', String(theme.id === active));
+    btn.innerHTML = `
+      <span class="tsw" aria-hidden="true">${theme.swatch.map((c) => `<i style="background:${c}"></i>`).join('')}</span>
+      <span class="tname">${theme.name}</span>`;
+    btn.onclick = () => {
+      if (window.EmberTheme.current() === theme.id) return;
+      window.EmberTheme.apply(theme.id);
+      renderThemePicker();
+      toast(`${theme.name} applied`);
+    };
+    grid.appendChild(btn);
+  }
 }
 
 function renderPricingStatus() {

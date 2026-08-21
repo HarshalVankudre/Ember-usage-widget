@@ -112,7 +112,7 @@ test('window usage is measured over the provider boundaries, not when Ember star
   assert.equal(win.rate.projectedCost, (2 / 40) * 100);
 });
 
-test('a window with no reported utilization yields no rate rather than a divide by zero', () => {
+test('a reported zero-percent window stays observed without dividing by zero', () => {
   const start = at('2026-07-20', 9, 0);
   const meter = {
     provider: 'claude',
@@ -123,6 +123,28 @@ test('a window with no reported utilization yields no rate rather than a divide 
   const [win] = Q.quotaWindows([bucket('2026-07-20', 9, 10)], meter, { now: at('2026-07-20', 10, 0) });
 
   assert.equal(win.percent, 0);
+  assert.equal(win.rate, null);
+
+  const block = {
+    startedAt: start,
+    endsAt: start + 5 * HOUR,
+    totals: win.totals,
+  };
+  Q.attachObserved([block], [win], { now: at('2026-07-20', 10, 0) });
+  assert.equal(block.observed, true);
+  assert.equal(block.percent, 0);
+  assert.equal(block.rate, null);
+});
+
+test('an absent utilization remains distinct from a real zero-percent reading', () => {
+  const start = at('2026-07-20', 9, 0);
+  const meter = {
+    provider: 'claude',
+    current: { startedAt: start, resetsAt: start + 5 * HOUR },
+    history: [],
+  };
+  const [win] = Q.quotaWindows([], meter, { now: at('2026-07-20', 10, 0) });
+  assert.equal(win.percent, null);
   assert.equal(win.rate, null);
 });
 
@@ -261,4 +283,60 @@ test('an exactly matching window supplies both the percentage and the rate', () 
   assert.equal(blocks[0].percent, 20);
   assert.equal(blocks[0].rate.costPerPct, 4 / 20);
   assert.equal(blocks[0].rate.projectedCost, 20);
+});
+
+test('Codex session burn follows the active account window and rejects a foreign reset schedule', () => {
+  const hour = 3600 * 1000;
+  const week = 7 * 24 * hour;
+  const now = at('2026-07-20', 12, 0);
+  const accountReset = now + 2 * hour;
+  const foreignReset = now + week;
+  const meter = {
+    provider: 'codex',
+    kind: 'weekly',
+    windowMinutes: 10080,
+    current: {
+      startedAt: foreignReset - week,
+      resetsAt: foreignReset,
+      peakUtil: 0,
+    },
+    history: [
+      { startedAt: accountReset - week, resetsAt: accountReset, peakUtil: 68 },
+      { startedAt: accountReset - week, resetsAt: accountReset, peakUtil: 69 },
+    ],
+  };
+  const fixed = Q.reconcileCodexMeter(meter, {
+    windowMinutes: 10080,
+    resetsAt: new Date(accountReset).toISOString(),
+  }, { now });
+
+  assert.equal(fixed.current.peakUtil, 69);
+  assert.equal(fixed.current.resetsAt, accountReset);
+  assert.equal(fixed.history.length, 0, 'duplicate account instances are folded together');
+  assert.equal(
+    Q.reconcileCodexMeter(meter, null, { now }),
+    null,
+    'a retained 5h meter cannot create a scope absent from current account telemetry',
+  );
+});
+
+test('Codex rolling session history is not forced onto the current five-hour cadence', () => {
+  const now = at('2026-07-20', 12, 0);
+  const activeReset = now + HOUR;
+  const oldReset = activeReset - 7 * HOUR; // deliberately not a multiple of 5h
+  const meter = {
+    provider: 'codex',
+    kind: 'session',
+    windowMinutes: 300,
+    current: { startedAt: activeReset - 5 * HOUR, resetsAt: activeReset, peakUtil: 12 },
+    history: [{ startedAt: oldReset - 5 * HOUR, resetsAt: oldReset, peakUtil: 88 }],
+  };
+  const fixed = Q.reconcileCodexMeter(meter, {
+    windowMinutes: 300,
+    resetsAt: new Date(activeReset).toISOString(),
+  }, { now });
+
+  assert.equal(fixed.current.peakUtil, 12);
+  assert.equal(fixed.history.length, 1);
+  assert.equal(fixed.history[0].peakUtil, 88);
 });

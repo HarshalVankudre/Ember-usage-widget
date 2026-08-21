@@ -3,3 +3,6 @@ dist/
 build/
 src-tauri/target/
 src-tauri/gen/
+
+# scraped theme research, not source
+.firecrawl/

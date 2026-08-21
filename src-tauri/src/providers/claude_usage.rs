@@ -50,6 +50,14 @@ struct CacheFile {
     files: BTreeMap<String, FileRec>,
 }
 
+/// Serialize-only twin of [`CacheFile`] that borrows the map instead of owning
+/// a clone of it. Must stay field-compatible with `CacheFile`.
+#[derive(Serialize)]
+struct CacheFileRef<'a> {
+    v: u32,
+    files: &'a BTreeMap<String, FileRec>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Bucket {
     pub date: String,
@@ -149,6 +157,12 @@ pub fn init(user_data: &Path) {
     state.memo = None;
     state.file_cache = BTreeMap::new();
     let Some(path) = state.cache_path.clone() else { return };
+    if let Some(files) = read_current_cache(&path) {
+        state.file_cache = files;
+        return;
+    }
+    // Older versions, and anything the fast path could not read, fall through
+    // to the migration arms below.
     let Ok(raw) = std::fs::read_to_string(&path) else { return };
     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw) else { return };
     match parsed.get("v").and_then(|v| v.as_u64()) {
@@ -173,11 +187,29 @@ pub fn init(user_data: &Path) {
     }
 }
 
+/// Load a cache that is already at the current version, straight from the file
+/// into the typed map.
+///
+/// The migration path below goes via `serde_json::Value` and then clones the
+/// `files` subtree out of it, which costs several times the file's size in
+/// transient allocation — on a cache of tens of megabytes that peak, retained
+/// by the allocator, was most of the process's resident footprint. Any older
+/// file fails the version check here and takes that path instead, which is
+/// affordable because it runs once per upgrade.
+fn read_current_cache(path: &Path) -> Option<BTreeMap<String, FileRec>> {
+    let file = std::fs::File::open(path).ok()?;
+    let parsed: CacheFile = serde_json::from_reader(std::io::BufReader::new(file)).ok()?;
+    (parsed.v == CACHE_VERSION).then_some(parsed.files)
+}
+
 fn save_cache(path: &Path, files: &BTreeMap<String, FileRec>) {
-    let snapshot = CacheFile { v: CACHE_VERSION, files: files.clone() };
-    if let Ok(body) = serde_json::to_string(&snapshot) {
-        let _ = crate::persist::write_atomic(path, body);
-    }
+    // Borrowed, and streamed: the old form cloned the whole map and then built
+    // the entire JSON document as one String, so a save briefly held three
+    // copies of a cache that is tens of megabytes.
+    let snapshot = CacheFileRef { v: CACHE_VERSION, files };
+    let _ = crate::persist::write_atomic_with(path, |w| {
+        serde_json::to_writer(w, &snapshot).map_err(std::io::Error::from)
+    });
 }
 
 fn list_jsonl_files(dir: &Path, out: &mut Vec<PathBuf>) {

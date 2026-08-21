@@ -61,6 +61,16 @@ pub fn load_cached() -> Option<Value> {
     if snap.get("ok").and_then(|v| v.as_bool()) != Some(true) {
         return None;
     }
+    // Native caches written before quota identities were preserved may be a
+    // model-specific Spark snapshot mislabeled as the account meter. Discard
+    // that one ambiguous warm-start value; the rollout scan immediately
+    // rebuilds it with an explicit identity. ClaudeX already filtered its
+    // model-specific limits before caching.
+    if snap.get("source").and_then(|v| v.as_str()) == Some("codex")
+        && snap.get("limitId").is_none()
+    {
+        return None;
+    }
     if let Some(windows) = snap.get("windows").and_then(|v| v.as_array()) {
         let hydrated: Vec<Value> = windows.iter().map(hydrate_window).collect();
         snap["windows"] = Value::Array(hydrated);
@@ -177,6 +187,7 @@ pub fn from_claudex_payload(payload: &Value) -> Value {
     json!({
         "ok": true,
         "fetchedAt": timestamp_ms(payload.get("fetched_at")),
+        "limitId": "codex",
         "plan": if label.is_empty() { Value::Null } else {
             json!({ "type": payload.get("plan_type"), "label": label })
         },
@@ -223,7 +234,7 @@ pub fn from_snapshot(snap: Option<&LimitsSnap>) -> Value {
         return json!({ "ok": false, "reason": "no-data" });
     };
     let rl = &snap.rate_limits;
-    if !crate::js_truthy(rl) {
+    if !crate::js_truthy(rl) || !super::codex_usage::is_account_rate_limits(rl) {
         return json!({ "ok": false, "reason": "no-data" });
     }
     let mut windows = Vec::new();
@@ -240,6 +251,7 @@ pub fn from_snapshot(snap: Option<&LimitsSnap>) -> Value {
     json!({
         "ok": true,
         "fetchedAt": snap.ts,
+        "limitId": rl.get("limit_id").cloned().unwrap_or(json!("codex-legacy")),
         "plan": if label.is_empty() { Value::Null } else {
             json!({ "type": rl.get("plan_type"), "label": label })
         },

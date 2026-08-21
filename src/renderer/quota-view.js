@@ -27,6 +27,7 @@
   const HOUR_MS = 3600 * 1000;
   const SESSION_MS = 5 * HOUR_MS;
   const WEEK_MS = 7 * 24 * HOUR_MS;
+  const RESET_TOLERANCE_MS = 90 * 1000;
 
   // Both providers publish reset times on an exact hour boundary, so a window
   // starts at the top of the hour containing its first call.
@@ -202,8 +203,9 @@
   /* ---------------- observed quota windows ---------------- */
 
   function pctConsumed(win) {
-    const peak = Number(win && win.peakUtil);
-    return Number.isFinite(peak) ? Math.max(0, Math.min(100, peak)) : 0;
+    if (!win || win.peakUtil == null) return null;
+    const peak = Number(win.peakUtil);
+    return Number.isFinite(peak) ? Math.max(0, Math.min(100, peak)) : null;
   }
 
   // Ember only reads Claude Code and Codex logs. A plan meter also counts the
@@ -251,6 +253,71 @@
     return out.sort((a, b) => b.startedAt - a.startedAt).slice(0, opts.limit || 60);
   }
 
+  /* An earlier parser filed model-specific Codex meters (notably Spark) under
+     the account-wide meter id. Reconcile the retained ledger non-destructively
+     against the window the current account snapshot actually publishes. This
+     hides foreign reset schedules, folds duplicate instances of the same real
+     window back together, and leaves the on-disk history available for a
+     future migration. */
+  function reconcileCodexMeter(meter, limitWindow, opts = {}) {
+    if (!meter || !limitWindow) return null;
+    const windowMinutes = Number(limitWindow.windowMinutes);
+    const meterMinutes = Number(meter.windowMinutes);
+    if (!(windowMinutes > 0) || meterMinutes !== windowMinutes) return null;
+
+    const anchor = typeof limitWindow.resetsAt === 'number'
+      ? limitWindow.resetsAt : Date.parse(limitWindow.resetsAt || '');
+    if (!Number.isFinite(anchor) || anchor <= 0) return meter;
+    const periodMs = windowMinutes * 60000;
+    const fixedSchedule = windowMinutes > 720;
+    const now = Number.isFinite(opts.now) ? opts.now : Date.now();
+    const instances = [];
+    if (meter.current) instances.push(meter.current);
+    instances.push(...(meter.history || []));
+
+    const aligned = new Map();
+    for (const instance of instances) {
+      const reset = Number(instance && instance.resetsAt);
+      if (!Number.isFinite(reset) || reset <= 0) continue;
+      const remainder = Math.abs(reset - anchor) % periodMs;
+      // Weekly periods share one fixed reset cadence. Session windows are
+      // rolling and can restart after idle, so only their active boundary is
+      // matched exactly; valid older sessions need not be congruent with it.
+      if (fixedSchedule && Math.min(remainder, periodMs - remainder) > RESET_TOLERANCE_MS) continue;
+      const key = Math.round(reset / 60000);
+      const previous = aligned.get(key);
+      if (!previous) {
+        aligned.set(key, {
+          ...instance,
+          resetsAt: reset,
+          startedAt: reset - periodMs,
+          peakUtil: Number(instance.peakUtil) || 0,
+        });
+        continue;
+      }
+      previous.peakUtil = Math.max(previous.peakUtil, Number(instance.peakUtil) || 0);
+      previous.firstUtil = Math.min(
+        Number(previous.firstUtil) || previous.peakUtil,
+        Number(instance.firstUtil) || Number(instance.peakUtil) || 0,
+      );
+      previous.joinedLate = !!previous.joinedLate && !!instance.joinedLate;
+      previous.observedFor = Math.max(
+        Number(previous.observedFor) || 0,
+        Number(instance.observedFor) || 0,
+      );
+    }
+
+    const windows = [...aligned.values()].sort((a, b) => b.resetsAt - a.resetsAt);
+    const current = anchor > now
+      ? windows.find((instance) => Math.abs(instance.resetsAt - anchor) <= RESET_TOLERANCE_MS) || null
+      : null;
+    return {
+      ...meter,
+      current,
+      history: windows.filter((instance) => instance !== current),
+    };
+  }
+
   /* ---------------- pairing the two sources ---------------- */
 
   // A reconstructed block and an observed window describe the same stretch of
@@ -260,7 +327,8 @@
   function attachObserved(blocks, windows, opts = {}) {
     const now = Number.isFinite(opts.now) ? opts.now : Date.now();
     const rows = opts.rows || [];
-    const pool = (windows || []).filter((w) => Number.isFinite(w.startedAt) && w.percent > 0);
+    const pool = (windows || []).filter((w) =>
+      Number.isFinite(w.startedAt) && Number.isFinite(w.percent));
     for (const block of blocks) {
       const span = Math.max(1, block.endsAt - block.startedAt);
       let best = null;
@@ -348,6 +416,7 @@
     sessionBlocks,
     fixedPeriods,
     quotaWindows,
+    reconcileCodexMeter,
     attachObserved,
     rateFor,
     trend,

@@ -3,6 +3,7 @@
 //! serialized aggregation passes, plan-limit polling with backoff, and the
 //! durable quota ledger.
 
+pub mod journal;
 pub mod persist;
 pub mod providers;
 pub mod settings;
@@ -38,7 +39,18 @@ const RECONCILE_INTERVAL_MS: u64 = 8 * 1000;
 // The account endpoint rate-limits hard, so polls stay spaced even when usage
 // is pouring in; the periodic poll below is the floor, this is the ceiling.
 const CLAUDE_MIN_POLL_MS: f64 = 90.0 * 1000.0;
+const CLAUDE_FORCE_COOLDOWN_MS: f64 = 60.0 * 1000.0;
 const CLAUDE_CATCH_UP_MS: u64 = 25 * 1000;
+// A poll that never returns must not own the slot forever. The request itself
+// is capped at 15s, so anything still "in flight" past this was dropped or
+// wedged (a suspend mid-request outlives tokio's timer, which is monotonic and
+// stops while the machine sleeps) and the slot is taken back.
+const CLAUDE_POLL_STALL_MS: f64 = 60.0 * 1000.0;
+// Retry-After is honored, but only within a window a person would wait through:
+// below the floor the endpoint just gets hammered again, above the ceiling the
+// meter silently sits out the rest of the day.
+const CLAUDE_BACKOFF_MIN_MS: f64 = 10.0 * 60.0 * 1000.0;
+const CLAUDE_BACKOFF_MAX_MS: f64 = 30.0 * 60.0 * 1000.0;
 
 /* ---------------- small JS-parity helpers ---------------- */
 
@@ -124,6 +136,36 @@ struct ClaudeLimitsState {
     backoff_until: f64,
     last_forced_at: f64,
     last_poll_at: f64,
+    /// wall-clock start of the poll that currently owns the slot; 0.0 when idle
+    poll_started_at: f64,
+}
+
+/// Frees the poll slot even if the future is dropped mid-request — a Tauri
+/// command whose webview goes away takes its future with it, and a slot leaked
+/// that way wedges the Claude meter until the app restarts. The stamp makes the
+/// release idempotent so a late drop cannot cancel a newer poll.
+struct ClaudePollSlot<'a> {
+    cell: &'a Mutex<ClaudeLimitsState>,
+    started_at: f64,
+}
+
+/// How long a 429 parks the poller, given the server's Retry-After in seconds.
+/// A missing or unparseable header reads as 0 and lands on the floor.
+fn claude_backoff_ms(retry_after_secs: f64) -> f64 {
+    if !retry_after_secs.is_finite() {
+        return CLAUDE_BACKOFF_MIN_MS;
+    }
+    (retry_after_secs * 1000.0).clamp(CLAUDE_BACKOFF_MIN_MS, CLAUDE_BACKOFF_MAX_MS)
+}
+
+impl Drop for ClaudePollSlot<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut cl) = self.cell.lock() {
+            if cl.poll_started_at == self.started_at {
+                cl.poll_started_at = 0.0;
+            }
+        }
+    }
 }
 
 struct CodexLimitsCell {
@@ -328,28 +370,92 @@ fn schedule_claude_catch_up(app: &AppHandle) {
     });
 }
 
-async fn push_claude_limits(app: &AppHandle, force: bool) {
+/// Whether a poll may go out right now, and if not, the status the caller
+/// reports back. Split out from the poll so the policy — above all "the Refresh
+/// button always gets through" — can be tested without a running app.
+enum PollGate {
+    Go,
+    Skip(Value),
+}
+
+fn claude_poll_gate(cl: &ClaudeLimitsState, now: f64, force: bool) -> PollGate {
+    // A request is already on the wire and its answer lands within seconds;
+    // a second one would only duplicate it. Stalled slots age out separately.
+    if cl.poll_started_at > 0.0 && now - cl.poll_started_at < CLAUDE_POLL_STALL_MS {
+        return PollGate::Skip(json!({ "updated": false, "state": "in-flight" }));
+    }
+    if force {
+        // The 429 backoff is deliberately not consulted here. Refresh is the
+        // manual override, and a widget that cannot be told to try again is how
+        // one transient rate limit turns into a snapshot frozen for hours. The
+        // cooldown below is what keeps the strict endpoint safe from spam: even
+        // held down, the button is worth at most one request a minute.
+        let retry_at = (cl.last_forced_at + CLAUDE_FORCE_COOLDOWN_MS)
+            .max(cl.last_poll_at + CLAUDE_FORCE_COOLDOWN_MS);
+        if now < retry_at {
+            return PollGate::Skip(
+                json!({ "updated": false, "state": "cooldown", "retryAt": retry_at }),
+            );
+        }
+        return PollGate::Go;
+    }
+    if now < cl.backoff_until {
+        return PollGate::Skip(json!({
+            "updated": false,
+            "state": "backoff",
+            "reason": "http-429",
+            "retryAt": cl.backoff_until,
+        }));
+    }
+    if now - cl.last_poll_at < CLAUDE_MIN_POLL_MS {
+        return PollGate::Skip(json!({
+            "updated": false,
+            "state": "recent",
+            "retryAt": cl.last_poll_at + CLAUDE_MIN_POLL_MS,
+        }));
+    }
+    PollGate::Go
+}
+
+async fn push_claude_limits(app: &AppHandle, force: bool) -> Value {
     let state = app.state::<EmberState>();
+    let started_at;
     {
         let mut cl = state.claude.lock().unwrap();
         let now = now_ms();
-        if !force && now < cl.backoff_until {
-            return;
+        match claude_poll_gate(&cl, now, force) {
+            PollGate::Skip(status) => {
+                // "recent" is the ordinary spacing guard and would drown the
+                // log; the other two are the states that can latch, and are
+                // exactly what you want a record of when the meter goes quiet.
+                let skipped = status["state"].as_str().unwrap_or("?");
+                if skipped != "recent" {
+                    journal::note(format!(
+                        "claude poll skipped state={skipped} force={force} \
+                         retry_in={}s",
+                        ((status["retryAt"].as_f64().unwrap_or(0.0) - now) / 1000.0).round()
+                    ));
+                }
+                return status;
+            }
+            PollGate::Go => {}
         }
         if force {
-            // protect the strict endpoint from refresh-button spam
-            if now - cl.last_forced_at < 60.0 * 1000.0 {
-                return;
-            }
             cl.last_forced_at = now;
-        } else if now - cl.last_poll_at < CLAUDE_MIN_POLL_MS {
-            return;
         }
         cl.last_poll_at = now;
+        cl.poll_started_at = now;
+        started_at = now;
     }
+    let _slot = ClaudePollSlot { cell: &state.claude, started_at };
+    // Paired with the outcome line below: a request that never returns leaves
+    // this line alone in the log, which names the failure by itself.
+    journal::note(format!("claude poll -> {} force={force}", claude_limits::USAGE_URL));
     let res = claude_limits::fetch_plan_limits(&state.http).await;
+    let mut retry_at = 0.0;
     {
         let mut cl = state.claude.lock().unwrap();
+        cl.poll_started_at = 0.0;
         if is_ok(&res) {
             cl.last_good = Some(res.clone());
             cl.last = Some(res.clone());
@@ -360,20 +466,55 @@ async fn push_claude_limits(app: &AppHandle, force: bool) {
             // countdowns keep ticking client-side
             if res.get("reason").and_then(|r| r.as_str()) == Some("http-429") {
                 let retry = res.get("retryAfter").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                cl.backoff_until = now_ms() + (retry * 1000.0).max(10.0 * 60.0 * 1000.0);
+                cl.backoff_until = now_ms() + claude_backoff_ms(retry);
+            } else {
+                // the endpoint answered with something other than a rate limit,
+                // so whatever backoff was outstanding is settled
+                cl.backoff_until = 0.0;
             }
+            retry_at = cl.backoff_until;
             cl.last = match &cl.last_good {
                 Some(good) => {
                     let mut stale = good.clone();
                     stale["stale"] = json!(true);
                     stale["lastError"] = res.get("reason").cloned().unwrap_or(Value::Null);
+                    // an elapsed deadline would render as a countdown that
+                    // never counts, so only a live one is published
+                    if retry_at > now_ms() {
+                        stale["retryAt"] = json!(retry_at);
+                    } else {
+                        stale["retryAt"] = Value::Null;
+                    }
                     Some(stale)
                 }
-                None => Some(res),
+                None => Some(res.clone()),
             };
         }
     }
+    if is_ok(&res) {
+        journal::note("claude poll ok");
+    } else {
+        journal::note(format!(
+            "claude poll failed reason={} backoff={}s",
+            res.get("reason").and_then(|r| r.as_str()).unwrap_or("?"),
+            ((retry_at - now_ms()) / 1000.0).max(0.0).round()
+        ));
+    }
     send_limits(app);
+    if is_ok(&res) {
+        json!({
+            "updated": true,
+            "state": "updated",
+            "fetchedAt": res.get("fetchedAt").cloned().unwrap_or(Value::Null),
+        })
+    } else {
+        json!({
+            "updated": false,
+            "state": "error",
+            "reason": res.get("reason").cloned().unwrap_or(Value::Null),
+            "retryAt": if retry_at > 0.0 { json!(retry_at) } else { Value::Null },
+        })
+    }
 }
 
 fn push_codex_limits(app: &AppHandle, snapshot: &Value) {
@@ -973,16 +1114,32 @@ async fn usage_refresh(app: AppHandle) -> Value {
     codex_usage::invalidate();
     omp_usage::invalidate();
     opencode_usage::invalidate();
-    let data = publish_update(&app, true).await;
-    let limits_app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        push_claude_limits(&limits_app, true).await;
-    });
+    // The button completes only after both the local rescan and the Claude
+    // meter attempt have completed (or been truthfully skipped by backoff).
+    let (data, claude_status) =
+        tokio::join!(publish_update(&app, true), push_claude_limits(&app, true));
+    let codex = app
+        .state::<EmberState>()
+        .codex
+        .lock()
+        .unwrap()
+        .last
+        .clone()
+        .unwrap_or(Value::Null);
     json!({
         "ok": true,
         "revision": data.get("revision").cloned().unwrap_or(Value::Null),
         "generatedAt": data.get("generatedAt").cloned().unwrap_or(Value::Null),
         "fileCount": data.get("fileCount").cloned().unwrap_or(Value::Null),
+        "limits": {
+            "claude": claude_status,
+            "codex": {
+                "source": "local-snapshot",
+                "ok": codex.get("ok").cloned().unwrap_or(json!(false)),
+                "fetchedAt": codex.get("fetchedAt").cloned().unwrap_or(Value::Null),
+                "stale": codex.get("stale").cloned().unwrap_or(json!(false)),
+            },
+        },
     })
 }
 
@@ -1102,6 +1259,9 @@ pub fn run() {
             std::fs::create_dir_all(&user_data)?;
             migrate_legacy_data(&user_data);
 
+            journal::init(&user_data);
+            journal::note(format!("ember {} starting", env!("CARGO_PKG_VERSION")));
+
             let loaded_settings = settings::load(&user_data);
             claude_usage::init(&user_data);
             claude_limits::init(&user_data);
@@ -1154,6 +1314,7 @@ pub fn run() {
                     backoff_until: 0.0,
                     last_forced_at: 0.0,
                     last_poll_at: 0.0,
+                    poll_started_at: 0.0,
                 }),
                 codex: Mutex::new(CodexLimitsCell { last: last_codex, last_sig: String::new() }),
                 last_sig: Mutex::new(String::new()),
@@ -1187,6 +1348,10 @@ pub fn run() {
             // Claude plan-limit polling: a fresh-enough snapshot from the last
             // run means startup costs no request; the periodic poll stays
             // gentle because the endpoint 429s easily.
+            journal::note(format!(
+                "cached claude snapshot {}",
+                if cache_fresh { "fresh, first poll skipped" } else { "stale, polling at +2s" }
+            ));
             if !cache_fresh {
                 let app = handle.clone();
                 tauri::async_runtime::spawn(async move {
@@ -1262,4 +1427,149 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod claude_poll_tests {
+    use super::*;
+
+    fn idle_state() -> Mutex<ClaudeLimitsState> {
+        Mutex::new(ClaudeLimitsState {
+            last: None,
+            last_good: None,
+            backoff_until: 0.0,
+            last_forced_at: 0.0,
+            last_poll_at: 0.0,
+            poll_started_at: 0.0,
+        })
+    }
+
+    /// The regression: a poll whose future is dropped mid-request used to leave
+    /// the in-flight flag set, and every later poll — periodic *and* the
+    /// Refresh button — returned early forever. The meter then froze on the
+    /// last snapshot it had, which is how a card ends up reading "snapshot from
+    /// 16 hr ago" while the endpoint is answering fine.
+    #[test]
+    fn a_dropped_poll_hands_the_slot_back() {
+        let cell = idle_state();
+        let started_at = 1_000.0;
+        cell.lock().unwrap().poll_started_at = started_at;
+        drop(ClaudePollSlot { cell: &cell, started_at });
+        assert_eq!(cell.lock().unwrap().poll_started_at, 0.0);
+    }
+
+    /// A slot released late must not evict whoever took the slot next.
+    #[test]
+    fn a_late_drop_leaves_a_newer_poll_alone() {
+        let cell = idle_state();
+        let slot = ClaudePollSlot { cell: &cell, started_at: 1_000.0 };
+        cell.lock().unwrap().poll_started_at = 2_000.0; // a newer poll claimed it
+        drop(slot);
+        assert_eq!(cell.lock().unwrap().poll_started_at, 2_000.0);
+    }
+
+    /// A future that never resolves and is never dropped (a request wedged
+    /// across a system suspend) still has to time out of the slot.
+    #[test]
+    fn a_wedged_poll_ages_out_of_the_slot() {
+        let now = now_ms();
+        let held_briefly = now - (CLAUDE_POLL_STALL_MS / 2.0);
+        let held_forever = now - (CLAUDE_POLL_STALL_MS + 1.0);
+        assert!(now - held_briefly < CLAUDE_POLL_STALL_MS, "a live poll keeps the slot");
+        assert!(now - held_forever >= CLAUDE_POLL_STALL_MS, "a wedged poll gives it up");
+    }
+
+    fn skip_state(gate: PollGate) -> Option<String> {
+        match gate {
+            PollGate::Go => None,
+            PollGate::Skip(v) => Some(v["state"].as_str().unwrap_or_default().to_string()),
+        }
+    }
+
+    /// The point of the button: a rate-limit backoff can park the *automatic*
+    /// poller for half an hour, but the person watching a frozen card must
+    /// still be able to say "try now".
+    #[test]
+    fn refresh_gets_through_a_rate_limit_backoff() {
+        let now = 1_000_000.0;
+        let mut cl = idle_state().into_inner().unwrap();
+        cl.backoff_until = now + 20.0 * 60.0 * 1000.0;
+
+        assert_eq!(
+            skip_state(claude_poll_gate(&cl, now, false)).as_deref(),
+            Some("backoff"),
+            "the automatic poller waits out the backoff"
+        );
+        assert!(
+            matches!(claude_poll_gate(&cl, now, true), PollGate::Go),
+            "Refresh overrides it"
+        );
+    }
+
+    /// Overriding the backoff must not turn the button into a hammer.
+    #[test]
+    fn refresh_is_still_spam_guarded_while_rate_limited() {
+        let now = 1_000_000.0;
+        let mut cl = idle_state().into_inner().unwrap();
+        cl.backoff_until = now + 20.0 * 60.0 * 1000.0;
+        cl.last_forced_at = now - 5_000.0; // pressed five seconds ago
+        cl.last_poll_at = now - 5_000.0;
+
+        assert_eq!(
+            skip_state(claude_poll_gate(&cl, now, true)).as_deref(),
+            Some("cooldown"),
+            "a second press inside the cooldown is refused"
+        );
+        let later = now + CLAUDE_FORCE_COOLDOWN_MS;
+        assert!(
+            matches!(claude_poll_gate(&cl, later, true), PollGate::Go),
+            "once the cooldown elapses the button works again"
+        );
+    }
+
+    /// A fresh snapshot is worth more than a duplicate request, so the button
+    /// declines rather than re-asking for a number it already has.
+    #[test]
+    fn refresh_declines_right_after_a_background_poll() {
+        let now = 1_000_000.0;
+        let mut cl = idle_state().into_inner().unwrap();
+        cl.last_poll_at = now - 5_000.0;
+        assert_eq!(
+            skip_state(claude_poll_gate(&cl, now, true)).as_deref(),
+            Some("cooldown")
+        );
+    }
+
+    #[test]
+    fn refresh_waits_on_a_request_already_in_flight() {
+        let now = 1_000_000.0;
+        let mut cl = idle_state().into_inner().unwrap();
+        cl.poll_started_at = now - 1_000.0;
+        assert_eq!(
+            skip_state(claude_poll_gate(&cl, now, true)).as_deref(),
+            Some("in-flight")
+        );
+
+        // ...but not on one that never came back
+        cl.poll_started_at = now - (CLAUDE_POLL_STALL_MS + 1.0);
+        assert!(matches!(claude_poll_gate(&cl, now, true), PollGate::Go));
+    }
+
+    #[test]
+    fn an_idle_widget_polls_on_both_paths() {
+        let now = 1_000_000.0;
+        let cl = idle_state().into_inner().unwrap();
+        assert!(matches!(claude_poll_gate(&cl, now, true), PollGate::Go));
+        assert!(matches!(claude_poll_gate(&cl, now, false), PollGate::Go));
+    }
+
+    #[test]
+    fn backoff_honors_retry_after_within_a_waitable_window() {
+        assert_eq!(claude_backoff_ms(0.0), CLAUDE_BACKOFF_MIN_MS, "no header -> floor");
+        assert_eq!(claude_backoff_ms(30.0), CLAUDE_BACKOFF_MIN_MS, "a short one -> floor");
+        assert_eq!(claude_backoff_ms(1_140.0), 1_140.0 * 1000.0, "19 min is honored as sent");
+        // Left uncapped this is what sits the meter out for the rest of the day.
+        assert_eq!(claude_backoff_ms(86_400.0), CLAUDE_BACKOFF_MAX_MS, "a day -> ceiling");
+        assert_eq!(claude_backoff_ms(f64::NAN), CLAUDE_BACKOFF_MIN_MS, "garbage -> floor");
+    }
 }
