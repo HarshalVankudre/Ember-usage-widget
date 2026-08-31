@@ -11,8 +11,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-const CACHE_VERSION: u32 = 4; // v4: local minute precision appended to cached entries
+const CACHE_VERSION: u32 = 5; // v5: reasoning (thinking) tokens appended to cached entries
 const LEGACY_ENTRY_LENGTH: usize = 13;
+const V4_ENTRY_LENGTH: usize = 14;
 
 /// entry: [dedupKey, date, hour, model, input, output, cacheRead, cacheW5m,
 ///         cacheW1h, speed, inferenceGeo, webSearches, serviceTier, minute]
@@ -32,6 +33,7 @@ pub struct Entry(
     pub f64,         // web searches
     pub String,      // service tier
     pub Option<u32>, // minute
+    pub f64,         // reasoning (thinking subset of output — informational)
 );
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -71,6 +73,7 @@ pub struct Bucket {
     pub cache_read: f64,
     pub cache_w5m: f64,
     pub cache_w1h: f64,
+    pub reasoning: f64,
     pub web_searches: f64,
     pub msgs: u64,
     pub cost: f64,
@@ -80,6 +83,7 @@ pub struct Bucket {
     pub c_out: f64,
     pub c_cr: f64,
     pub c_cw: f64,
+    pub c_reasoning: f64,
     pub c_tool: f64,
     pub cache_savings: f64,
     pub priced_calls: u64,
@@ -131,7 +135,7 @@ pub fn invalidate() {
     STATE.lock().unwrap().memo = None;
 }
 
-fn upgrade_v3_files(files: BTreeMap<String, serde_json::Value>) -> BTreeMap<String, FileRec> {
+fn upgrade_old_files(files: BTreeMap<String, serde_json::Value>) -> BTreeMap<String, FileRec> {
     let mut upgraded = BTreeMap::new();
     for (file, mut rec) in files {
         if let Some(entries) = rec.get_mut("entries").and_then(|e| e.as_array_mut()) {
@@ -139,6 +143,9 @@ fn upgrade_v3_files(files: BTreeMap<String, serde_json::Value>) -> BTreeMap<Stri
                 if let Some(arr) = entry.as_array_mut() {
                     if arr.len() == LEGACY_ENTRY_LENGTH {
                         arr.push(serde_json::Value::Null);
+                    }
+                    if arr.len() == V4_ENTRY_LENGTH {
+                        arr.push(serde_json::json!(0.0));
                     }
                 }
             }
@@ -173,12 +180,12 @@ pub fn init(user_data: &Path) {
                 }
             }
         }
-        Some(3) => {
+        Some(3) | Some(4) => {
             if let Some(files) = parsed.get("files") {
                 if let Ok(files) =
                     serde_json::from_value::<BTreeMap<String, serde_json::Value>>(files.clone())
                 {
-                    state.file_cache = upgrade_v3_files(files);
+                    state.file_cache = upgrade_old_files(files);
                     state.cache_needs_reparse = true;
                 }
             }
@@ -307,6 +314,13 @@ pub fn parse_content(text: &str, source: &str) -> Vec<Entry> {
             .max(0.0);
         let speed = str_field(u.get("speed"));
         let geo = str_field(u.get("inference_geo"));
+        // Anthropic reports thinking as a breakdown of output_tokens, not as
+        // an extra charge; older logs omit the field entirely.
+        let reasoning = num(
+            u.get("output_tokens_details")
+                .and_then(|d| d.get("thinking_tokens")),
+        )
+        .max(0.0);
         let key = match msg.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
             Some(id) => format!("{id}:{}", obj.get("requestId").and_then(|v| v.as_str()).unwrap_or("")),
             None => match obj.get("uuid").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
@@ -342,6 +356,7 @@ pub fn parse_content(text: &str, source: &str) -> Vec<Entry> {
             web_searches,
             str_field(u.get("service_tier")).unwrap_or("standard").to_string(),
             Some(parts.minute),
+            reasoning,
         ));
     }
     entries
@@ -461,7 +476,7 @@ pub fn aggregate() -> Arc<Aggregate> {
         }
         let session = session_of(file, &roots);
         for entry in &rec.entries {
-            let Entry(key, date, hour, model, inp, out, cr, cw5, cw1, speed, geo, web_searches, service_tier, minute) = entry;
+            let Entry(key, date, hour, model, inp, out, cr, cw5, cw1, speed, geo, web_searches, service_tier, minute, reasoning) = entry;
             if seen.contains(key) {
                 continue;
             }
@@ -478,9 +493,10 @@ pub fn aggregate() -> Arc<Aggregate> {
                     project: project.clone(),
                     session: session.clone(),
                     input: 0.0, output: 0.0, cache_read: 0.0, cache_w5m: 0.0, cache_w1h: 0.0,
+                    reasoning: 0.0,
                     web_searches: 0.0, msgs: 0,
                     cost: 0.0, cost_min: 0.0, cost_max: 0.0,
-                    c_in: 0.0, c_out: 0.0, c_cr: 0.0, c_cw: 0.0, c_tool: 0.0, cache_savings: 0.0,
+                    c_in: 0.0, c_out: 0.0, c_cr: 0.0, c_cw: 0.0, c_reasoning: 0.0, c_tool: 0.0, cache_savings: 0.0,
                     priced_calls: 0, unpriced_calls: 0, estimated: false,
                     fast_calls: 0, us_region_calls: 0, long_context_calls: 0,
                     pricing_source: String::new(),
@@ -493,6 +509,7 @@ pub fn aggregate() -> Arc<Aggregate> {
             bucket.cache_read += cr;
             bucket.cache_w5m += cw5;
             bucket.cache_w1h += cw1;
+            bucket.reasoning += reasoning;
             bucket.web_searches += web_searches;
             bucket.msgs += 1;
 
@@ -505,7 +522,7 @@ pub fn aggregate() -> Arc<Aggregate> {
                     cache_write: cw5 + cw1,
                     cache_write_known: true,
                     total_input: inp + cr + cw5 + cw1,
-                    reasoning: 0.0,
+                    reasoning: *reasoning,
                 });
                 bucket.cost += c.total;
                 bucket.cost_min += c.cost_min;
@@ -514,6 +531,7 @@ pub fn aggregate() -> Arc<Aggregate> {
                 bucket.c_out += c.output;
                 bucket.c_cr += c.cached;
                 bucket.c_cw += c.cache_write;
+                bucket.c_reasoning += c.reasoning;
                 bucket.cache_savings += c.cache_savings;
                 bucket.estimated = bucket.estimated || c.estimated;
                 bucket.long_context_calls += if c.long_context { 1 } else { 0 };
@@ -541,6 +559,11 @@ pub fn aggregate() -> Arc<Aggregate> {
                 bucket.c_out += c.output;
                 bucket.c_cr += c.cache_read;
                 bucket.c_cw += c.cache_write;
+                // Thinking is billed inside output at the same rate, so carve the
+                // share out of the output cost instead of adding to the total.
+                if *out > 0.0 {
+                    bucket.c_reasoning += c.output * (*reasoning / *out);
+                }
                 bucket.c_tool += c.tool_fee;
                 bucket.cache_savings += c.cache_savings;
                 bucket.estimated = bucket.estimated || c.estimated;
@@ -618,6 +641,34 @@ mod tests {
         .to_string();
         let e = &parse_content(&line, "claude")[0];
         assert_eq!((e.7, e.8), (77.0, 0.0));
+    }
+
+    #[test]
+    fn thinking_tokens_are_read_as_a_subset_of_output() {
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-07-01T10:00:00Z",
+                "message": { "id": "m1", "model": "claude-opus-5", "usage": {
+                    "input_tokens": 10, "output_tokens": 15086,
+                    "output_tokens_details": { "thinking_tokens": 7415 }
+                }}
+            })
+            .to_string(),
+            // Older logs, and models with thinking off, carry no breakdown.
+            serde_json::json!({
+                "timestamp": "2026-07-01T10:00:00Z",
+                "message": { "id": "m2", "model": "claude-opus-5", "usage": {
+                    "input_tokens": 10, "output_tokens": 20, "output_tokens_details": null
+                }}
+            })
+            .to_string(),
+        ]
+        .join("
+");
+        let entries = parse_content(&lines, "claude");
+        assert_eq!(entries[0].14, 7415.0);
+        assert!(entries[0].14 < entries[0].5, "thinking is part of output, never on top of it");
+        assert_eq!(entries[1].14, 0.0);
     }
 
     #[test]

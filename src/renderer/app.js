@@ -1041,7 +1041,9 @@ function projTableRow(label, tok, cost, opts = {}) {
 // One aligned group per model — rows of label | tokens | cost — plus an
 // "All models" totals group when the project used more than one model.
 // Rows adapt to the provider: Claude models have real cache-write counts;
-// Codex models show cached input, reasoning, and an estimated write surcharge.
+// Codex models show cached input and an estimated write surcharge. Both report
+// reasoning when the logs carry it — as a sub-row, since it is already billed
+// inside output.
 function appendProjectModels(table, p) {
   const entries = [...p.models.values()].sort((a, b) =>
     b.cost - a.cost || a.model.localeCompare(b.model, undefined, { sensitivity: 'base' }));
@@ -1066,6 +1068,10 @@ function appendProjectModels(table, p) {
           { title: 'Conservative cache-write premium; native Codex logs do not expose write-token counts' }));
       }
     } else if (provider === 'claude') {
+      if (m.reasoning > 0) {
+        g.appendChild(projTableRow('Reasoning', fmtTok(m.reasoning), money(m.cRs, priced),
+          { sub: true, title: 'Billed inside output — already counted in the total' }));
+      }
       g.appendChild(projTableRow('Cache write', fmtTok(m.cacheWrite), money(m.cCw, priced)));
     } else {
       g.appendChild(projTableRow(m.estimated ? 'Cache write / premium' : 'Cache write', fmtTok(m.cacheWrite), money(m.cCw, priced, m.estimated)));
