@@ -340,3 +340,50 @@ test('Codex rolling session history is not forced onto the current five-hour cad
   assert.equal(fixed.history.length, 1);
   assert.equal(fixed.history[0].peakUtil, 88);
 });
+
+test('a window the provider replaced before its reset hands the shared hours to its successor', () => {
+  // Seen in the field: the account published a 19:50–00:50 window at 2%, then
+  // an hour later a fresh 20:50–01:50 window that climbed to 89%. Every call
+  // after 20:50 belongs to the second window, and the second window is the
+  // live one.
+  const meter = {
+    provider: 'claude',
+    current: { startedAt: at('2026-09-01', 20, 50), resetsAt: at('2026-09-02', 1, 50), peakUtil: 89 },
+    history: [
+      // An older ledger let the replaced window run on to its published reset.
+      { startedAt: at('2026-09-01', 19, 50), resetsAt: at('2026-09-02', 0, 50), endedAt: at('2026-09-02', 0, 50), peakUtil: 2 },
+    ],
+  };
+  const buckets = [
+    bucket('2026-09-01', 19, 55),
+    bucket('2026-09-01', 21, 0),
+    bucket('2026-09-01', 23, 0, { cost: 40 }),
+  ];
+  const now = at('2026-09-02', 0, 20);
+  const rows = Q.timeline(buckets, 'claude');
+  const windows = Q.quotaWindows(null, meter, { rows, now });
+  const blocks = Q.sessionBlocks(null, { rows, now, anchors: windows });
+  Q.attachObserved(blocks, windows, { rows, now });
+
+  assert.equal(blocks.length, 2);
+  const [old, live] = blocks;
+  assert.equal(old.active, false);
+  assert.equal(old.totals.msgs, 1);
+  assert.equal(live.active, true);
+  assert.equal(live.startedAt, at('2026-09-01', 20, 50));
+  assert.equal(live.percent, 89);
+  assert.equal(live.totals.msgs, 2);
+  assert.equal(live.totals.cost, 41);
+});
+
+test('a finished window ends where the ledger says, not at the reset it never reached', () => {
+  const meter = {
+    provider: 'claude',
+    current: null,
+    history: [
+      { startedAt: at('2026-09-01', 19, 50), resetsAt: at('2026-09-02', 0, 50), endedAt: at('2026-09-01', 20, 50), peakUtil: 2 },
+    ],
+  };
+  const [win] = Q.quotaWindows([], meter, { now: at('2026-09-02', 3, 0) });
+  assert.equal(win.endsAt, at('2026-09-01', 20, 50));
+});

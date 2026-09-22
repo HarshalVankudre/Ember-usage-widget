@@ -12,7 +12,7 @@ pub mod signature;
 use providers::{
     claude_limits, claude_pricing_live, claude_usage, codex_limits, codex_pricing_live,
     codex_usage, model_attribution::is_first_party_model, normalize, omp_usage, opencode_usage,
-    quota_ledger::Ledger,
+    pricing_overrides, quota_ledger::Ledger, zcode_usage,
 };
 use serde_json::{json, Value};
 use settings::Settings;
@@ -242,15 +242,17 @@ async fn aggregate_all(state: &EmberState) -> Value {
     // every event that preceded it.
     let _guard = AGG_LOCK.lock().await;
     let revision = state.revision.fetch_add(1, Ordering::SeqCst) + 1;
-    let (claude, codex, omp, opencode) = tokio::join!(
+    let (claude, codex, omp, opencode, zcode) = tokio::join!(
         tokio::task::spawn_blocking(claude_usage::aggregate),
         tokio::task::spawn_blocking(codex_usage::aggregate),
         tokio::task::spawn_blocking(omp_usage::aggregate),
         opencode_usage::aggregate(),
+        tokio::task::spawn_blocking(zcode_usage::aggregate),
     );
     let claude = claude.expect("claude aggregation panicked");
     let codex = codex.expect("codex aggregation panicked");
     let omp = omp.expect("Oh My Pi aggregation panicked");
+    let zcode = zcode.expect("zcode aggregation panicked");
 
     // Claude-shaped compatibility transcripts can contain arbitrary gateway
     // models. Ember is a Claude + Codex ledger, so keep only first-party IDs.
@@ -271,12 +273,16 @@ async fn aggregate_all(state: &EmberState) -> Value {
         }
     }
     buckets.extend(omp.buckets.iter().cloned());
+    // zcode rows are already normalized, and are neither Claude nor OpenAI
+    // models, so they bypass the first-party filter above.
+    buckets.extend(zcode.buckets.iter().cloned());
 
     json!({
         "buckets": buckets,
         "generatedAt": now_ms(),
         "revision": revision,
-        "fileCount": claude.file_count + codex.file_count + omp.file_count + opencode.file_count,
+        "fileCount": claude.file_count + codex.file_count + omp.file_count + opencode.file_count
+            + zcode.file_count,
         // newest rate-limit state from the Codex logs
         "codexLimitsSnapshot": codex.limits,
         "pricing": {
@@ -976,7 +982,11 @@ fn usage_dirs() -> Vec<PathBuf> {
     if !dirs.contains(&omp) {
         dirs.push(omp);
     }
-    for dir in [opencode_usage::data_dir(), codex_limits::claudex_usage_dir()] {
+    for dir in [
+        opencode_usage::data_dir(),
+        codex_limits::claudex_usage_dir(),
+        zcode_usage::data_dir(),
+    ] {
         if !dirs.contains(&dir) {
             dirs.push(dir);
         }
@@ -1114,6 +1124,7 @@ async fn usage_refresh(app: AppHandle) -> Value {
     codex_usage::invalidate();
     omp_usage::invalidate();
     opencode_usage::invalidate();
+    zcode_usage::invalidate();
     // The button completes only after both the local rescan and the Claude
     // meter attempt have completed (or been truthfully skipped by backoff).
     let (data, claude_status) =
@@ -1268,9 +1279,11 @@ pub fn run() {
             codex_usage::init(&user_data);
             omp_usage::init(&user_data);
             opencode_usage::init(&user_data);
+            zcode_usage::init(&user_data);
             codex_limits::init(&user_data);
             claude_pricing_live::init(&user_data);
             codex_pricing_live::init(&user_data);
+            pricing_overrides::init(&user_data);
             let ledger = Ledger::load(&user_data);
 
             // Cached limits keep the cards warm before the first live reading.
@@ -1379,17 +1392,44 @@ pub fn run() {
                 let app = handle.clone();
                 tauri::async_runtime::spawn(async move {
                     let http = app.state::<EmberState>().http.clone();
+                    // Wakes every TICK rather than sleeping out the day, so a
+                    // model released since the cached table (seen in the logs
+                    // without a live row) gets its official price early.
+                    let mut next_due = 0.0_f64;
                     loop {
-                        let fresh = claude_pricing_live::is_fresh();
-                        let ok = fresh || claude_pricing_live::refresh(&http).await;
-                        if !fresh && ok {
+                        let early = claude_pricing_live::wants_early_refresh();
+                        let fresh = claude_pricing_live::is_fresh() && !early;
+                        if !fresh && (early || now_ms() >= next_due) {
+                            let ok = claude_pricing_live::refresh(&http).await;
+                            if ok {
+                                claude_usage::invalidate();
+                                codex_usage::invalidate();
+                                omp_usage::invalidate();
+                                opencode_usage::invalidate();
+                                zcode_usage::invalidate();
+                                request_update(&app.state::<EmberState>(), true);
+                            }
+                            let wait = if ok { claude_pricing_live::REFRESH } else { claude_pricing_live::RETRY };
+                            next_due = now_ms() + wait.as_millis() as f64;
+                        }
+                        tokio::time::sleep(claude_pricing_live::TICK).await;
+                    }
+                });
+            }
+            // Saving pricing-overrides.json re-prices everything within seconds.
+            {
+                let app = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        tokio::time::sleep(pricing_overrides::POLL).await;
+                        if pricing_overrides::reload_if_changed() {
                             claude_usage::invalidate();
                             codex_usage::invalidate();
                             omp_usage::invalidate();
                             opencode_usage::invalidate();
+                            zcode_usage::invalidate();
                             request_update(&app.state::<EmberState>(), true);
                         }
-                        tokio::time::sleep(if ok { claude_pricing_live::REFRESH } else { claude_pricing_live::RETRY }).await;
                     }
                 });
             }
@@ -1405,6 +1445,7 @@ pub fn run() {
                             codex_usage::invalidate();
                             omp_usage::invalidate();
                             opencode_usage::invalidate();
+                            zcode_usage::invalidate();
                             request_update(&app.state::<EmberState>(), true);
                         }
                         tokio::time::sleep(if ok { codex_pricing_live::REFRESH } else { codex_pricing_live::RETRY }).await;

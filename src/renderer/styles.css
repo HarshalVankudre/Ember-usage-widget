@@ -15,7 +15,22 @@
 
    Type scales with the window: every size is in rem and the root font size
    follows the widget's width, so a strip on a laptop and a full-height
-   ledger on a monitor both stay readable. */
+   ledger on a monitor both stay readable.
+
+   Two rules of composition, added in 2.2 after the shell had drifted into a
+   stack of unrelated strips:
+
+   One gutter. Every band and every panel's first character starts on the
+   same left rail (--gutter), so the eye has one edge to track down the whole
+   window instead of five. Sections change their padding by changing the
+   token, never by hand — which is why the responsive blocks below now
+   redefine --gutter rather than re-listing every element's padding.
+
+   Rules are spent, not sprinkled. A full-bleed hairline says "different
+   surface" and is reserved for the window chrome, top and bottom. Inside the
+   readout deck, separations are drawn the way the section plaques already
+   draw theirs — strongest at the gutter, dead before the right edge — and
+   where a band already changes background colour it gets no rule at all. */
 
 html {
   font-size: clamp(9.5px, 7px + 0.65vw, 15px);
@@ -35,17 +50,25 @@ html {
   --bg: #0d0806;
   --surface: #161009;
   --surface-2: #1c150d;
-  --surface-3: #271d12;
+  --surface-3: #2b2015;
   --line: #362917;
   --line-soft: #271e12;
 
   --text: #f9f3e8;
   --text-2: #d9cab7;
   --muted: #a8988a;
-  --faint: #87786a;
+  /* --faint carries the smallest type in the app — column heads, units,
+     timestamps, the sub-line under every meter — at .82–.9rem. The old value
+     measured 4.43:1 on --surface, i.e. under AA for text that small, so it is
+     lifted to 4.95:1. The borrowed editor palettes below keep their own
+     values: they are quoted, and a quotation that has been "corrected" no
+     longer matches the editor it is there to match. */
+  --faint: #8f8073;
 
-  /* the gauge ramp — one scale, cold to hot, shared by every meter */
-  --gauge-ok: #4fd39c;
+  /* The gauge ramp — one scale, cold to hot, shared by every meter. "OK" is
+     deliberately the dimmest step: a meter with room left is a non-event, and
+     a bright green non-event competes with the two readings that aren't. */
+  --gauge-ok: #46c194;
   --gauge-warn: #f2b45c;
   --gauge-crit: #ff5f66;
 
@@ -74,7 +97,7 @@ html {
 
   --app-alpha: .955;
   --shadow-window: 0 18px 48px rgba(0, 0, 0, .55);
-  --shadow-panel: 0 1px 2px rgba(0, 0, 0, .28);
+  --shadow-panel: 0 1px 2px rgba(0, 0, 0, .32);
   --shadow-pop: 0 12px 32px rgba(0, 0, 0, .5);
   --scrim: rgba(8, 5, 3, .72);
   --pop-bg: #1c150d;
@@ -84,8 +107,8 @@ html {
   --gauge-tick: rgba(10, 6, 4, .5);
   --gauge-redline: rgba(255, 95, 102, .13);
 
-  --hairline: rgba(255, 255, 255, .05);
-  --hover: rgba(255, 255, 255, .04);
+  --hairline: rgba(255, 255, 255, .055);
+  --hover: rgba(255, 255, 255, .05);
 }
 
 :root[data-theme="catppuccin"] {
@@ -212,14 +235,15 @@ html {
   --bg: #0b0e14;
   --surface: #11151d;
   --surface-2: #161b25;
-  --surface-3: #1f2531;
+  --surface-3: #232a37;
   --line: #2a3140;
   --line-soft: #1c2029;
   --text: #e8edf7;
   --text-2: #b3bdd0;
   --muted: #7c8699;
-  --faint: #5a6375;
-  --gauge-ok: #35c6a8;
+  /* 3.03:1 before — the worst offender of the two Ember palettes; 4.54 now. */
+  --faint: #767f92;
+  --gauge-ok: #2fb59c;
   --gauge-warn: #f0b44f;
   --gauge-crit: #ff5d63;
   --ember: #ff7a45;
@@ -253,6 +277,22 @@ html {
   --radius: 14px;
   --card-radius: 12px;
   --gauge-r: 3px;
+
+  /* The left rail. Every band's first character and every panel's inner edge
+     resolve to this one distance from the window edge; the panels get there
+     by subtracting the inset their card is already carrying. */
+  --gutter: 2.1rem;
+  --gutter-r: 1.5rem;
+  --card-inset: .9rem;
+
+  /* The interior separation: a hairline that starts on the gutter at full
+     strength and dies before the right edge, matching .section-kicker::after.
+     Painted through border-image so it survives on a scrolling band. */
+  --rule: linear-gradient(90deg,
+    transparent 0 var(--gutter),
+    var(--line) var(--gutter),
+    var(--line-soft) 46%,
+    transparent 92%);
 
   /* One curve, and short. The instrument should feel like it responds,
      not like it plays an animation. */
@@ -352,24 +392,6 @@ input:focus-visible,
   pointer-events: none;
 }
 
-/* The thermometer. The left edge fills from the bottom with the worst plan
-   meter Ember can see — the one reading that stays visible mid-scroll. */
-.app::after {
-  content: "";
-  position: absolute;
-  inset: 0 auto 0 0;
-  z-index: 3;
-  width: 2px;
-  border-radius: 0 2px 2px 0;
-  background: var(--gauge-ok);
-  transform: scaleY(var(--heat));
-  transform-origin: 50% 100%;
-  transition: transform 600ms var(--ease), background-color 400ms linear;
-  pointer-events: none;
-}
-.app:has(.pet.worried)::after { background: var(--gauge-warn); }
-.app:has(.pet.crit)::after { background: var(--gauge-crit); }
-
 /* ═══════════════════ titlebar ═══════════════════ */
 
 .titlebar {
@@ -377,7 +399,9 @@ input:focus-visible,
   display: flex;
   align-items: center;
   gap: 1.2rem;
-  padding: 0 1rem 0 1.5rem;
+  /* The mark overflows its 2.5rem cell by .15rem a side, so the box is pulled
+     back by that much to put the flame itself on the rail. */
+  padding: 0 .8rem 0 calc(var(--gutter) - .15rem);
   border-bottom: 1px solid var(--line-soft);
   user-select: none;
   cursor: default;
@@ -484,8 +508,9 @@ input:focus-visible,
   grid-template-columns: minmax(0, 1fr) 7.6rem;
   align-items: center;
   gap: 1.2rem;
-  padding: 1.8rem 1.8rem 1.6rem 2.1rem;
+  padding: 1.8rem var(--gutter-r) 1.6rem var(--gutter);
   border-bottom: 1px solid var(--line-soft);
+  border-image: var(--rule) 1;
 }
 .hero-main { min-width: 0; }
 
@@ -648,11 +673,16 @@ input:focus-visible,
   width: var(--w);
   height: 100%;
   border-radius: inherit;
-  /* brighter at the leading edge: the fill reads as a needle, not a block */
-  background: linear-gradient(90deg,
-    color-mix(in srgb, var(--fill) 66%, transparent) 0%,
-    var(--fill) 88%,
-    color-mix(in srgb, var(--fill) 78%, #fff) 100%);
+  /* A needle, not a ramp. The tip is a fixed 1.1rem of brightened fill however
+     far along the scale it sits; the body behind it is the fill colour, flat.
+     The percentage version this replaces stretched with the reading, so a 95%
+     meter spent its whole left half at two-thirds alpha over the track —
+     washing out the one colour that is supposed to BE the reading, and only
+     looking right on the short bars nobody needs to read carefully. */
+  background:
+    linear-gradient(90deg, transparent, color-mix(in srgb, var(--fill) 72%, #fff))
+      100% 0 / 1.1rem 100% no-repeat,
+    var(--fill);
   transition: width var(--meter) var(--ease);
 }
 .limit-bar i.warn, .quota-meter-bar i.warn, .mini-meter-bar i.warn { --fill: var(--gauge-warn); }
@@ -664,8 +694,9 @@ input:focus-visible,
   flex: 0 0 auto;
   max-height: 22rem;
   overflow-y: auto;
-  padding: 1.1rem 1.8rem 1.2rem 2.1rem;
+  padding: 1.1rem var(--gutter-r) 1.2rem var(--gutter);
   border-bottom: 1px solid var(--line-soft);
+  border-image: var(--rule) 1;
 }
 .limits > .section-kicker { margin-bottom: .9rem; }
 .limit-group-head {
@@ -726,16 +757,27 @@ input:focus-visible,
   flex: 0 0 auto;
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  border-bottom: 1px solid var(--line-soft);
 }
 .window-metric {
+  position: relative;
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: .15rem .6rem;
   min-width: 0;
-  padding: 1rem 1.2rem .95rem 2.1rem;
+  padding: 1rem 1.2rem .95rem var(--gutter);
 }
-.window-metric + .window-metric { border-left: 1px solid var(--line-soft); padding-left: 1.3rem; }
+.window-metric + .window-metric { padding-left: 1.3rem; }
+/* Inset and fading at both ends: a divider between two readings, not a wall
+   between two rooms. Out of flow, so it takes no grid track. */
+.window-metric + .window-metric::before {
+  content: "";
+  position: absolute;
+  top: .5rem;
+  bottom: .5rem;
+  left: 0;
+  width: 1px;
+  background: linear-gradient(180deg, transparent, var(--line-soft) 28%, var(--line-soft) 72%, transparent);
+}
 .window-metric > span {
   color: var(--muted);
   font-family: var(--font-mono);
@@ -767,9 +809,11 @@ input:focus-visible,
 
 .filters {
   flex: 0 0 auto;
-  padding: .9rem 1.4rem .8rem 1.8rem;
-  border-bottom: 1px solid var(--line-soft);
+  padding: .85rem var(--gutter-r) .8rem var(--gutter);
   background: var(--surface);
+  /* The surface step is the edge; a hairline along its top just makes the
+     step legible as deliberate. */
+  box-shadow: inset 0 1px 0 var(--hairline);
 }
 .chip-row { position: relative; display: flex; align-items: center; gap: 3px; }
 .date-chips {
@@ -785,7 +829,7 @@ input:focus-visible,
   bottom: 3px;
   border-radius: .6rem;
   background: var(--surface-3);
-  box-shadow: inset 0 0 0 1px var(--hairline);
+  box-shadow: inset 0 1px 0 var(--hairline), 0 1px 2px rgba(0, 0, 0, .3);
   transition: left var(--med) var(--ease), width var(--med) var(--ease);
   pointer-events: none;
 }
@@ -856,7 +900,7 @@ input:focus-visible,
 
 .filter-scroller { overflow-x: auto; scrollbar-width: none; }
 .filter-scroller::-webkit-scrollbar { display: none; }
-.chip-row.models { width: max-content; min-width: 100%; margin-top: .7rem; gap: .4rem; }
+.chip-row.models { width: max-content; min-width: 100%; margin-top: .55rem; gap: .4rem; }
 .model-chip {
   display: inline-flex;
   align-items: center;
@@ -867,12 +911,24 @@ input:focus-visible,
   background: var(--bg);
   color: var(--muted);
 }
+/* Every chip is active until something is filtered, so "active" is the resting
+   state of this whole block — nine saturated outlines at rest is decoration,
+   and this instrument spends colour on readings. The swatch already carries the
+   identity at full chroma; the border only has to say "on". */
 .model-chip.active {
-  border-color: color-mix(in srgb, var(--c) 45%, var(--line));
+  border-color: color-mix(in srgb, var(--c) 24%, var(--line));
   color: var(--text-2);
   background: color-mix(in srgb, var(--c) 10%, var(--bg));
 }
 .swatch { display: inline-block; flex: 0 0 auto; width: .6rem; height: .6rem; border-radius: 2px; background: var(--c, var(--muted)); }
+
+/* Providers sit above models in the filter hierarchy and now look like it:
+   a round swatch — the same round-is-a-provider cue the headroom list uses
+   for .pdot — on a raised body. Models keep the square swatch and the recessed
+   one. Declared after .model-chip so the active fill wins on equal weight. */
+.provider-chip { background: var(--surface-2); font-weight: 600; }
+.provider-chip .swatch { width: .65rem; height: .65rem; border-radius: 50%; }
+.provider-chip.active { background: color-mix(in srgb, var(--c) 13%, var(--surface-2)); }
 
 /* ═══════════════════ panels ═══════════════════ */
 
@@ -881,7 +937,7 @@ input:focus-visible,
   min-height: 0;
   overflow-x: hidden;
   overflow-y: auto;
-  padding: 1rem 1rem 1.3rem;
+  padding: 1rem var(--card-inset) 1.3rem;
   scrollbar-color: var(--line) transparent;
   scrollbar-width: thin;
 }
@@ -890,12 +946,17 @@ input:focus-visible,
 
 .panel {
   contain: layout;
-  margin: 0 2px .9rem;
-  padding: 1.4rem 1.4rem 1.4rem 1.6rem;
+  margin: 0 0 .9rem;
+  /* Inner padding = gutter − card inset − the card's own border, so a panel
+     heading starts on exactly the same rail as the hero label above it. The
+     bands are only inside the window border; a panel is inside two. */
+  padding: 1.4rem calc(var(--gutter) - var(--card-inset) - 1px);
   border: 1px solid var(--line-soft);
   border-radius: var(--card-radius);
   background: var(--surface);
-  box-shadow: var(--shadow-panel);
+  /* A lit top edge: the card reads as a machined face rather than a rectangle
+     of slightly different paint. */
+  box-shadow: var(--shadow-panel), inset 0 1px 0 var(--hairline);
 }
 .scroll-area > :last-child { margin-bottom: 0; }
 
@@ -963,6 +1024,7 @@ input:focus-visible,
   border: 1px solid color-mix(in srgb, var(--ember) 16%, var(--line-soft));
   border-radius: .9rem;
   background: var(--surface-2);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--ember) 13%, transparent);
 }
 .quota-live-top { display: flex; align-items: baseline; justify-content: space-between; gap: .8rem; }
 .quota-live-label { color: var(--ember-bright); font-family: var(--font-mono); font-size: .9rem; letter-spacing: .1em; text-transform: uppercase; }
@@ -1082,6 +1144,84 @@ input:focus-visible,
 .project-expand[aria-expanded="true"] svg { transform: rotate(180deg); }
 .proj.is-hidden { opacity: .3; }
 
+/* export selection */
+.proj-head { display: grid; grid-template-columns: 1.9rem minmax(0, 1fr) 2.1rem; align-items: center; }
+.proj-archive {
+  display: grid;
+  place-items: center;
+  width: 2.1rem;
+  height: 2.1rem;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--faint);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity var(--fast) linear, color var(--fast) linear;
+}
+.proj-archive svg { width: 1.35rem; height: 1.35rem; }
+.proj:hover .proj-archive, .proj-archive:focus-visible { opacity: .7; }
+.proj-archive:hover, .proj-archive.on { opacity: 1; color: var(--text-2); }
+.archived-toggle { color: var(--faint); font-family: var(--font-mono); font-size: .88rem; }
+.archived-list { margin-bottom: .4rem; padding: .2rem .6rem; border: 1px solid var(--line-soft); border-radius: .7rem; background: var(--surface-2); }
+.proj.is-archived .proj-name { color: var(--muted); font-weight: 500; }
+.proj-check {
+  display: grid;
+  place-items: center;
+  width: 1.9rem;
+  height: 1.9rem;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--faint);
+  cursor: pointer;
+  opacity: .45;
+  transition: opacity var(--fast) linear, color var(--fast) linear;
+}
+.proj-check .box {
+  display: grid;
+  place-items: center;
+  width: 1.35rem;
+  height: 1.35rem;
+  border: 1px solid currentColor;
+  border-radius: .35rem;
+}
+.proj-check svg { width: 1rem; height: 1rem; opacity: 0; transition: opacity var(--fast) linear; }
+.proj:hover .proj-check, .proj-check:focus-visible { opacity: 1; }
+.proj-check.on { opacity: 1; color: var(--ember); }
+.proj-check.on .box { background: color-mix(in srgb, var(--ember) 16%, transparent); }
+.proj-check.on svg { opacity: 1; }
+.proj-selbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: .6rem 1rem;
+  margin-bottom: .5rem;
+  padding: .7rem .8rem;
+  border: 1px solid var(--line-soft);
+  border-radius: .7rem;
+  background: var(--surface-2);
+}
+.proj-modelbar { border-color: color-mix(in srgb, var(--ember) 30%, var(--line-soft)); }
+.proj-selinfo { color: var(--text-2); font-family: var(--font-mono); font-size: .9rem; font-variant-numeric: tabular-nums; }
+.proj-selactions { display: flex; gap: .4rem; }
+.proj-selbtn {
+  padding: .35rem .7rem;
+  border: 1px solid var(--line-soft);
+  border-radius: .5rem;
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: .85rem;
+  letter-spacing: .04em;
+  cursor: pointer;
+  transition: color var(--fast) linear, border-color var(--fast) linear, background-color var(--fast) linear;
+}
+.proj-selbtn:hover, .proj-selbtn:focus-visible { color: var(--text); border-color: var(--muted); background: var(--surface-3); }
+.proj-selbtn.primary { color: var(--ember); border-color: color-mix(in srgb, var(--ember) 45%, transparent); }
+.proj-selbtn.primary:hover, .proj-selbtn.primary:focus-visible { background: color-mix(in srgb, var(--ember) 14%, transparent); border-color: var(--ember); }
+
 /* ═══════════════════ footer ═══════════════════ */
 
 footer {
@@ -1089,7 +1229,7 @@ footer {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 1rem 0 2rem;
+  padding: 0 .8rem 0 var(--gutter);
   border-top: 1px solid var(--line-soft);
   background: var(--surface);
   color: var(--faint);
@@ -1259,18 +1399,19 @@ body.mini .app { border-radius: 10px; }
 @keyframes flamePulse { from { transform: scale(.98); } to { transform: scale(1.04); } }
 
 @media (max-width: 420px) {
+  /* The rail moves in and everything that sits on it follows; the only
+     paddings still listed here are the ones that are not the rail. */
+  :root { --gutter: 1.55rem; --gutter-r: 1.1rem; --card-inset: .7rem; }
   .brand-copy small { display: none; }
-  .titlebar { gap: .7rem; padding-left: 1.2rem; }
-  .hero { grid-template-columns: minmax(0, 1fr) 6.2rem; padding-left: 1.7rem; }
+  .titlebar { gap: .7rem; }
+  .hero { grid-template-columns: minmax(0, 1fr) 6.2rem; }
   .pet { width: 5.8rem; }
   .pet-logo { width: 4.4rem; height: 4.4rem; }
   .custom-chip span { display: none; }
   .range-pair { flex-basis: 100%; }
   .range-end-mode { flex: 1 1 auto; }
-  .filters { padding-left: 1.4rem; }
-  .scroll-area { padding: .9rem .7rem 1.2rem; }
-  .panel { padding-right: 1.1rem; padding-left: 1.3rem; }
-  .window-metric { padding-right: .8rem; padding-left: 1.7rem; }
+  .scroll-area { padding-top: .9rem; padding-bottom: 1.2rem; }
+  .window-metric { padding-right: .8rem; }
   .window-metric + .window-metric { padding-left: 1rem; }
   .window-metric > span { font-size: .78rem; letter-spacing: .03em; }
   .hero-delta { display: none; }

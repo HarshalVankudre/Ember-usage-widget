@@ -12,7 +12,11 @@ use std::time::Duration;
 pub const SOURCE_URL: &str = "https://platform.claude.com/docs/en/about-claude/pricing.md";
 pub const REFRESH: Duration = Duration::from_secs(24 * 3600);
 pub const RETRY: Duration = Duration::from_secs(3600);
-const CACHE_VERSION: u32 = 1;
+/// How often the refresh loop wakes to check for an early refresh.
+pub const TICK: Duration = Duration::from_secs(10 * 60);
+const EARLY_MIN_GAP: Duration = Duration::from_secs(30 * 60);
+// 2: rows carry fast-mode rates, and Opus 5.5 must not wait out a v1 cache.
+const CACHE_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Default)]
 struct LiveState {
@@ -42,14 +46,25 @@ pub fn build_map(markdown: &str) -> HashMap<String, LivePrice> {
     static ROW: OnceLock<Regex> = OnceLock::new();
     static NAME: OnceLock<Regex> = OnceLock::new();
     static STANDARD: OnceLock<Regex> = OnceLock::new();
+    static INTRO: OnceLock<Regex> = OnceLock::new();
     let row_re = ROW.get_or_init(|| Regex::new(r"(?i)^\|\s*Claude\s+").unwrap());
     let name_re = NAME.get_or_init(|| {
         Regex::new(r"(?i)Claude\s+(Fable|Mythos|Opus|Sonnet|Haiku)\s+(\d+(?:\.\d+)?)").unwrap()
     });
-    let standard_re = STANDARD.get_or_init(|| Regex::new(r"(?i)starting september").unwrap());
+    // A row qualified by a date ("through August 31", "starting September 1")
+    // is a dated variant, keyed apart so it never masquerades as the standing
+    // price. An unqualified row is the price, whatever the model.
+    let standard_re = STANDARD.get_or_init(|| Regex::new(r"(?i)\bstarting\b").unwrap());
+    let intro_re = INTRO.get_or_init(|| Regex::new(r"(?i)\bthrough\b").unwrap());
 
     let mut map = HashMap::new();
+    let mut fast = Vec::new();
+    let mut section = "";
     for line in markdown.lines() {
+        if line.starts_with('#') {
+            section = line.trim_start_matches('#').trim();
+            continue;
+        }
         if !row_re.is_match(line) {
             continue;
         }
@@ -58,6 +73,16 @@ pub fn build_map(markdown: &str) -> HashMap<String, LivePrice> {
             continue;
         }
         let cells: Vec<&str> = parts[1..parts.len() - 1].iter().map(|c| c.trim()).collect();
+        // "| Claude Opus 5 / Claude Opus 4.8 | $10 / MTok | $50 / MTok |"
+        if section.eq_ignore_ascii_case("Fast mode pricing") && cells.len() == 3 {
+            if let (Some(input), Some(output)) = (dollars(cells[1]), dollars(cells[2])) {
+                for hit in name_re.captures_iter(cells[0]) {
+                    let key = format!("{}-{}", hit[1].to_lowercase(), hit[2].replacen('.', "-", 1));
+                    fast.push((key, input, output));
+                }
+            }
+            continue;
+        }
         if cells.len() != 6 {
             continue;
         }
@@ -65,8 +90,10 @@ pub fn build_map(markdown: &str) -> HashMap<String, LivePrice> {
         let family = hit[1].to_lowercase();
         let version = hit[2].replacen('.', "-", 1);
         let mut key = format!("{family}-{version}");
-        if key == "sonnet-5" {
-            key.push_str(if standard_re.is_match(cells[0]) { "@standard" } else { "@intro" });
+        if standard_re.is_match(cells[0]) {
+            key.push_str("@standard");
+        } else if intro_re.is_match(cells[0]) {
+            key.push_str("@intro");
         }
         if map.contains_key(&key) {
             continue;
@@ -75,7 +102,16 @@ pub fn build_map(markdown: &str) -> HashMap<String, LivePrice> {
         let [Some(input), Some(cache_w5m), Some(cache_w1h), Some(cache_read), Some(output)] = vals[..] else {
             continue;
         };
-        map.insert(key, LivePrice { input, cache_w5m, cache_w1h, cache_read, output, family: Some(family) });
+        map.insert(key, LivePrice {
+            input, cache_w5m, cache_w1h, cache_read, output,
+            family: Some(family), fast_input: None, fast_output: None,
+        });
+    }
+    for (key, input, output) in fast {
+        if let Some(row) = map.get_mut(&key) {
+            row.fast_input = Some(input);
+            row.fast_output = Some(output);
+        }
     }
     map
 }
@@ -102,6 +138,16 @@ pub fn status() -> serde_json::Value {
     })
 }
 
+/// Last refresh attempt, successful or not, so early refreshes stay rare.
+static LAST_ATTEMPT: RwLock<f64> = RwLock::new(0.0);
+
+/// A model the live table does not price has turned up (a release newer than
+/// the cached table), and the last attempt was long enough ago to try again.
+pub fn wants_early_refresh() -> bool {
+    let since = crate::now_ms() - *LAST_ATTEMPT.read().unwrap();
+    since >= EARLY_MIN_GAP.as_millis() as f64 && super::claude_pricing::take_live_miss()
+}
+
 pub fn is_fresh() -> bool {
     let s = *STATE.read().unwrap();
     s.live && crate::now_ms() - s.fetched_at < REFRESH.as_millis() as f64
@@ -120,6 +166,7 @@ pub fn init(user_data: &std::path::Path) {
 }
 
 pub async fn refresh(client: &reqwest::Client) -> bool {
+    *LAST_ATTEMPT.write().unwrap() = crate::now_ms();
     let result = async {
         let res = client
             .get(SOURCE_URL)
@@ -167,10 +214,33 @@ mod tests {
         let map = build_map(
             "| Model | Base Input Tokens | 5m Cache Writes | 1h Cache Writes | Cache Hits & Refreshes | Output Tokens |\n\
              | Claude Opus 4.8 | $5 / MTok | $6.25 / MTok | $10 / MTok | $0.50 / MTok | $25 / MTok |\n\
+             | Claude Fable 5.1 | $10 / MTok | $12.50 / MTok | $20 / MTok | $0.25 / MTok<sup>1</sup> | $50 / MTok |\n\
+             | Claude Mythos 5.1 ([limited availability](x)) | $10 / MTok | $12.50 / MTok | $20 / MTok | $0.25 / MTok<sup>1</sup> | $50 / MTok |\n\
+             | Claude Sonnet 5 | $2 / MTok | $2.50 / MTok | $4 / MTok | $0.20 / MTok | $10 / MTok |\n\
+             | Claude Sonnet 4 ([retired, except on Bedrock](x)) | $3 / MTok | $3.75 / MTok | $6 / MTok | $0.30 / MTok | $15 / MTok |\n\
              | Claude Sonnet 5 [through August 31, 2026](x) | $2 / MTok | $2.50 / MTok | $4 / MTok | $0.20 / MTok | $10 / MTok |\n\
-             | Claude Sonnet 5 starting September 1, 2026 | $3 / MTok | $3.75 / MTok | $6 / MTok | $0.30 / MTok | $15 / MTok |",
+             | Claude Sonnet 5 starting September 1, 2026 | $3 / MTok | $3.75 / MTok | $6 / MTok | $0.30 / MTok | $15 / MTok |\n\
+             | Claude Opus 5.5 | $4 / MTok | $5 / MTok | $8 / MTok | $0.20 / MTok<sup>2</sup> | $20 / MTok |\n\
+             | Claude Opus 5 | $5 / MTok | $6.25 / MTok | $10 / MTok | $0.50 / MTok | $25 / MTok |\n\
+             ### Fast mode pricing\n\
+             | Model | Input | Output |\n\
+             | Claude Opus 5.5 | $8 / MTok | $40 / MTok |\n\
+             | Claude Opus 5 / Claude Opus 4.8 | $10 / MTok | $50 / MTok |\n\
+             ### Batch processing\n\
+             | Claude Opus 5.5 | $2 / MTok | $10 / MTok |",
         );
+        assert_eq!(map["opus-5-5"].input, 4.0);
+        assert_eq!(map["opus-5-5"].cache_read, 0.2);
+        assert_eq!(map["opus-5-5"].fast_input, Some(8.0));
+        assert_eq!(map["opus-5-5"].fast_output, Some(40.0));
+        assert_eq!(map["opus-5"].fast_input, Some(10.0));
+        assert_eq!(map["opus-4-8"].fast_output, Some(50.0));
+        assert_eq!(map["sonnet-5"].fast_input, None);
         assert_eq!(map["opus-4-8"].output, 25.0);
+        assert_eq!(map["fable-5-1"].cache_read, 0.25);
+        assert_eq!(map["mythos-5-1"].cache_read, 0.25);
+        assert_eq!(map["sonnet-5"].input, 2.0);
+        assert_eq!(map["sonnet-4"].input, 3.0);
         assert_eq!(map["sonnet-5@intro"].input, 2.0);
         assert_eq!(map["sonnet-5@standard"].output, 15.0);
     }

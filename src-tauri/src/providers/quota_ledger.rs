@@ -161,6 +161,20 @@ fn normalize_stored_meter(v: &Value) -> Option<Meter> {
     if instances.len() > MAX_INSTANCES {
         instances.drain(0..instances.len() - MAX_INSTANCES);
     }
+    // Earlier builds let a superseded window run on to its published reset,
+    // so a stored history can hold two windows over the same hours. Trim each
+    // closed window back to where its successor begins.
+    for i in 1..instances.len() {
+        let next_started_at = instances[i].started_at;
+        let prev = &mut instances[i - 1];
+        if !prev.closed {
+            continue;
+        }
+        let ended_at = prev.ended_at.unwrap_or(if prev.resets_at != 0.0 { prev.resets_at } else { prev.last_seen_at });
+        if next_started_at > prev.started_at && ended_at > next_started_at {
+            prev.ended_at = Some(next_started_at);
+        }
+    }
     Some(Meter {
         id,
         provider: provider.to_string(),
@@ -218,7 +232,9 @@ fn scoped_model_label(display_name: &str) -> String {
     if name.is_empty() {
         return "Scoped model".to_string();
     }
-    if fable.is_match(name) { "Fable 5".to_string() } else { name.to_string() }
+    // One meter covers every Fable release (5, 5.1, ...), so the label names
+    // the family rather than a version.
+    if fable.is_match(name) { "Fable".to_string() } else { name.to_string() }
 }
 
 pub fn claude_meters(limits: Option<&Value>) -> Vec<Reading> {
@@ -266,8 +282,8 @@ pub fn claude_meters(limits: Option<&Value>) -> Vec<Reading> {
     for (field, name) in [
         ("seven_day_opus", "Opus"),
         ("seven_day_sonnet", "Sonnet"),
-        ("seven_day_fable", "Fable 5"),
-        ("seven_day_fable_5", "Fable 5"),
+        ("seven_day_fable", "Fable"),
+        ("seven_day_fable_5", "Fable"),
     ] {
         let Some(v) = d.get(field).filter(|v| crate::js_truthy(v)) else { continue };
         if v.get("utilization").is_none_or(|u| u.is_null()) {
@@ -440,9 +456,34 @@ fn start_instance(meter: &Meter, resets_at: f64, utilization: f64, now: f64) -> 
     }
 }
 
+/// Close a window that a newer one has replaced. It ends at its published
+/// reset time when that has passed; otherwise the provider abandoned it early,
+/// and it ends where the replacement begins — its derived start when that is
+/// known, else the moment the replacement was first seen. Letting it run to a
+/// reset the provider no longer honours would leave two windows claiming the
+/// same hours, and every call in them would be measured against the stale
+/// window's percentage.
+fn close_superseded(current: &mut Instance, next_started_at: f64, now: f64) {
+    current.closed = true;
+    let mut ended_at = if current.resets_at != 0.0 { current.resets_at } else { current.last_seen_at };
+    ended_at = ended_at.min(now);
+    if next_started_at > current.started_at {
+        ended_at = ended_at.min(next_started_at);
+    }
+    current.ended_at = Some(ended_at.max(current.started_at));
+}
+
 fn observe(meter: &mut Meter, reading: &Reading, now: f64) -> bool {
     let Some(utilization) = reading.utilization else { return false };
     let resets_at = reading.resets_at;
+
+    // Claude answers "no session open" as 0% with no reset time. That is not a
+    // window — recording it would open a phantom instance and split the real
+    // window that follows it — so it is skipped and the last real window
+    // simply keeps its own reset boundary.
+    if reading.provider == "claude" && resets_at == 0.0 && utilization == 0.0 {
+        return false;
+    }
 
     if let Some(current) = meter.instances.last_mut() {
         if !current.closed && is_same_instance(current, resets_at, utilization) {
@@ -455,18 +496,13 @@ fn observe(meter: &mut Meter, reading: &Reading, now: f64) -> bool {
             push_sample(current, now, utilization);
             return changed;
         }
-        if !current.closed {
-            current.closed = true;
-            // A window ends at its published reset time; without one, the last
-            // moment it was still observed is the honest boundary.
-            current.ended_at = Some(if current.resets_at != 0.0 {
-                current.resets_at
-            } else {
-                current.last_seen_at
-            });
-        }
     }
     let instance = start_instance(meter, resets_at, utilization, now);
+    if let Some(current) = meter.instances.last_mut() {
+        if !current.closed {
+            close_superseded(current, instance.started_at, now);
+        }
+    }
     meter.instances.push(instance);
     if meter.instances.len() > MAX_INSTANCES {
         let excess = meter.instances.len() - MAX_INSTANCES;
@@ -727,7 +763,84 @@ mod tests {
         assert_eq!(meters[0].window_minutes, 300.0);
         assert_eq!(meters[1].window_minutes, 7.0 * 24.0 * 60.0);
         assert_eq!(meters[2].utilization, Some(81.0));
-        assert_eq!(meters[2].label, "Claude weekly · Fable 5");
+        assert_eq!(meters[2].label, "Claude weekly · Fable");
+    }
+
+    #[test]
+    fn a_replaced_window_ends_where_its_successor_starts() {
+        // Seen in the field: the account published a 19:50–00:50 window, then
+        // a fresh 20:50–01:50 one an hour later, before the first had reset.
+        let mut ledger = Ledger::new();
+        ledger.record(&json!({ "claude": claude_snapshot(SnapOpts { session: 2.0, ..Default::default() }) }), T0 + 0.1 * HOUR);
+        let next = T0 + 6.0 * HOUR;
+        ledger.record(
+            &json!({ "claude": claude_snapshot(SnapOpts { session: 5.0, session_resets: next, ..Default::default() }) }),
+            T0 + 1.2 * HOUR,
+        );
+        ledger.record(
+            &json!({ "claude": claude_snapshot(SnapOpts { session: 89.0, session_resets: next, ..Default::default() }) }),
+            T0 + 4.0 * HOUR,
+        );
+        let meter = session_meter(&ledger.snapshot(T0 + 4.0 * HOUR));
+        let history = meter["history"].as_array().unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0]["startedAt"], json!(T0));
+        assert_eq!(history[0]["endedAt"], json!(T0 + HOUR), "cut back to the successor's start");
+        assert_eq!(history[0]["peakUtil"], json!(2.0));
+        assert_eq!(meter["current"]["startedAt"], json!(T0 + HOUR));
+        assert_eq!(meter["current"]["peakUtil"], json!(89.0));
+    }
+
+    #[test]
+    fn a_no_session_reading_neither_opens_nor_splits_a_window() {
+        let mut ledger = Ledger::new();
+        ledger.record(&json!({ "claude": claude_snapshot(SnapOpts { session: 2.0, ..Default::default() }) }), T0 + 0.1 * HOUR);
+        // "five_hour": { "utilization": 0, "resets_at": null }
+        ledger.record(
+            &json!({ "claude": { "ok": true, "fetchedAt": T0, "data": {
+                "five_hour": { "utilization": 0.0, "resets_at": null },
+                "seven_day": { "utilization": 56.0, "resets_at": iso(T0 + 5.0 * HOUR) },
+            }}}),
+            T0 + 0.5 * HOUR,
+        );
+        ledger.record(&json!({ "claude": claude_snapshot(SnapOpts { session: 7.0, ..Default::default() }) }), T0 + HOUR);
+        let meter = session_meter(&ledger.snapshot(T0 + HOUR));
+        assert_eq!(meter["history"].as_array().unwrap().len(), 0);
+        assert_eq!(meter["current"]["startedAt"], json!(T0));
+        assert_eq!(meter["current"]["peakUtil"], json!(7.0));
+    }
+
+    #[test]
+    fn overlapping_windows_from_older_builds_are_trimmed_on_load() {
+        let dir = std::env::temp_dir().join(format!("ember-ledger-overlap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mk = |started: f64, reset: f64, ended: Option<f64>, closed: bool| {
+            let mut v = json!({
+                "startedAt": started, "resetsAt": reset, "windowMinutes": 300,
+                "firstSeenAt": started, "lastSeenAt": started + HOUR,
+                "firstUtil": 1, "peakUtil": 1, "lastUtil": 1, "samples": [], "closed": closed
+            });
+            if let Some(e) = ended { v["endedAt"] = json!(e); }
+            v
+        };
+        std::fs::write(
+            dir.join("quota-ledger.json"),
+            serde_json::to_string(&json!({ "v": 1, "meters": [{
+                "id": "claude|session", "provider": "claude", "kind": "session",
+                "label": "x", "windowMinutes": 300,
+                "instances": [
+                    mk(T0, T0 + 5.0 * HOUR, Some(T0 + 5.0 * HOUR), true),
+                    mk(T0 + HOUR, T0 + 6.0 * HOUR, None, false),
+                ],
+            }]}))
+            .unwrap(),
+        )
+        .unwrap();
+        let ledger = Ledger::load(&dir);
+        let meter = session_meter(&ledger.snapshot(T0 + 2.0 * HOUR));
+        assert_eq!(meter["history"][0]["endedAt"], json!(T0 + HOUR));
+        assert_eq!(meter["current"]["startedAt"], json!(T0 + HOUR));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

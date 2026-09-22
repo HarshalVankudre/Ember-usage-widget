@@ -127,10 +127,13 @@
     const anchors = (opts.anchors || [])
       .filter((a) => Number.isFinite(a.startedAt) && a.endsAt > a.startedAt)
       .sort((a, b) => a.startedAt - b.startedAt);
+    // Newest first: when two observed windows overlap (the provider replaced
+    // one before it reset), the later one is the window the account is
+    // actually metering, so it owns the shared hours.
     const anchorAt = (ts) => {
-      for (const a of anchors) {
-        if (ts < a.startedAt) break;
-        if (ts < a.endsAt) return a;
+      for (let i = anchors.length - 1; i >= 0; i--) {
+        const a = anchors[i];
+        if (ts >= a.startedAt && ts < a.endsAt) return a;
       }
       return null;
     };
@@ -236,7 +239,12 @@
     for (const w of source) {
       const startedAt = Number(w.startedAt);
       if (!Number.isFinite(startedAt)) continue;
-      const endsAt = Number(w.resetsAt) || Number(w.endedAt) || now;
+      // A live window runs to its reset. A finished one ends where the ledger
+      // says it ended — which is earlier than the reset when the provider
+      // replaced it midstream.
+      const endsAt = w.live
+        ? (Number(w.resetsAt) || now)
+        : (Number(w.endedAt) || Number(w.resetsAt) || now);
       const totals = usageBetween(rows, startedAt, Math.min(endsAt, now));
       const percent = pctConsumed(w);
       out.push({
@@ -350,7 +358,11 @@
       block.observed = true;
       block.observedFrom = best.startedAt;
       block.observedTo = best.endsAt;
-      if (rows.length && (best.startedAt !== block.startedAt || best.endsAt !== block.endsAt)) {
+      // A block built on this window already has its boundaries — possibly cut
+      // short where a newer window took over — so only a rule-built block is
+      // re-measured over the provider's interval.
+      if (rows.length && !block.measured
+        && (best.startedAt !== block.startedAt || best.endsAt !== block.endsAt)) {
         block.totals = usageBetween(rows, best.startedAt, Math.min(best.endsAt, now));
       }
       block.rate = rateFor(block.totals, best.percent);

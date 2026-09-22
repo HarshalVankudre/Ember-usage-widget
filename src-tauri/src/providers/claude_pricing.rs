@@ -1,10 +1,13 @@
-//! USD per million tokens. The bundled table mirrors Anthropic's standard API
-//! table and is superseded by the daily official-doc refresh when available.
+//! USD per million tokens. Resolution order, first hit wins:
+//!   1. `pricing-overrides.json` in the app data dir (hand-edited, hot-reloaded)
+//!   2. the live official table (refreshed daily, sooner when a model is missing)
+//!   3. the bundled table below
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{OnceLock, RwLock};
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock, RwLock};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RateSet {
@@ -19,29 +22,28 @@ struct PriceRule {
     test: &'static str,
     rates: RateSet,
     family: &'static str,
-    intro_until: Option<&'static str>,
-    intro: Option<RateSet>,
 }
 
 const fn rates(input: f64, cache_w5m: f64, cache_w1h: f64, cache_read: f64, output: f64) -> RateSet {
     RateSet { input, cache_w5m, cache_w1h, cache_read, output }
 }
 
+// Order matters: the first matching rule wins, so point releases with their
+// own rates (Fable 5.1's cheaper cache reads) sit above the family catch-all.
 const PRICING_RULES: &[PriceRule] = &[
-    PriceRule { test: r"(?:fable-5|mythos-5)", rates: rates(10.0, 12.5, 20.0, 1.0, 50.0), family: "fable", intro_until: None, intro: None },
-    PriceRule { test: r"(?:opus-5|opus-4-[5-9])", rates: rates(5.0, 6.25, 10.0, 0.5, 25.0), family: "opus", intro_until: None, intro: None },
-    PriceRule { test: r"opus", rates: rates(15.0, 18.75, 30.0, 1.5, 75.0), family: "opus", intro_until: None, intro: None },
-    PriceRule {
-        test: r"sonnet-5",
-        rates: rates(3.0, 3.75, 6.0, 0.3, 15.0),
-        family: "sonnet",
-        intro_until: Some("2026-09-01"),
-        intro: Some(rates(2.0, 2.5, 4.0, 0.2, 10.0)),
-    },
-    PriceRule { test: r"sonnet", rates: rates(3.0, 3.75, 6.0, 0.3, 15.0), family: "sonnet", intro_until: None, intro: None },
-    PriceRule { test: r"haiku-4", rates: rates(1.0, 1.25, 2.0, 0.1, 5.0), family: "haiku", intro_until: None, intro: None },
-    PriceRule { test: r"(?:3-5-haiku|haiku-3-5)", rates: rates(0.8, 1.0, 1.6, 0.08, 4.0), family: "haiku", intro_until: None, intro: None },
-    PriceRule { test: r"haiku", rates: rates(0.25, 0.3, 0.5, 0.03, 1.25), family: "haiku", intro_until: None, intro: None },
+    PriceRule { test: r"(?:fable|mythos)-5-1", rates: rates(10.0, 12.5, 20.0, 0.25, 50.0), family: "fable" },
+    PriceRule { test: r"(?:fable|mythos)-5", rates: rates(10.0, 12.5, 20.0, 1.0, 50.0), family: "fable" },
+    // Opus 5.5 reads cache at 0.05x input rather than the usual 0.1x.
+    PriceRule { test: r"^opus-5-5$", rates: rates(4.0, 5.0, 8.0, 0.2, 20.0), family: "opus" },
+    PriceRule { test: r"^(?:opus-5|opus-4-[5-9])$", rates: rates(5.0, 6.25, 10.0, 0.5, 25.0), family: "opus" },
+    PriceRule { test: r"opus", rates: rates(15.0, 18.75, 30.0, 1.5, 75.0), family: "opus" },
+    // Sonnet 5 launched at $2 / $10 as an introductory rate; the official
+    // table now lists that as the standing price.
+    PriceRule { test: r"sonnet-5", rates: rates(2.0, 2.5, 4.0, 0.2, 10.0), family: "sonnet" },
+    PriceRule { test: r"sonnet", rates: rates(3.0, 3.75, 6.0, 0.3, 15.0), family: "sonnet" },
+    PriceRule { test: r"haiku-4", rates: rates(1.0, 1.25, 2.0, 0.1, 5.0), family: "haiku" },
+    PriceRule { test: r"(?:3-5-haiku|haiku-3-5)", rates: rates(0.8, 1.0, 1.6, 0.08, 4.0), family: "haiku" },
+    PriceRule { test: r"haiku", rates: rates(0.25, 0.3, 0.5, 0.03, 1.25), family: "haiku" },
 ];
 
 /// One row of the live official table (also the on-disk cache shape).
@@ -55,14 +57,49 @@ pub struct LivePrice {
     pub output: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub family: Option<String>,
+    /// Fast-mode input / output; the cache rates scale with input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast_input: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast_output: Option<f64>,
 }
 
 static LIVE_PRICES: RwLock<Option<HashMap<String, LivePrice>>> = RwLock::new(None);
+static OVERRIDES: RwLock<Option<HashMap<String, LivePrice>>> = RwLock::new(None);
+/// Claude models seen without an exact live row. A new release shows up here
+/// first, so the refresh loop fetches the official table early instead of
+/// waiting out the day. Each id triggers at most one early fetch; retired
+/// models the page no longer lists would otherwise refetch forever.
+#[derive(Default)]
+struct Misses {
+    pending: HashSet<String>,
+    checked: HashSet<String>,
+}
+static MISSES: OnceLock<Mutex<Misses>> = OnceLock::new();
+
+fn misses() -> &'static Mutex<Misses> {
+    MISSES.get_or_init(Default::default)
+}
 
 pub fn set_live_prices(map: HashMap<String, LivePrice>) {
     if !map.is_empty() {
         *LIVE_PRICES.write().unwrap() = Some(map);
     }
+}
+
+/// Keys may be any model id spelling; an empty map clears the overrides.
+pub fn set_overrides(map: HashMap<String, LivePrice>) {
+    let map = map.into_iter().map(|(k, v)| (canonical_model(&k), v)).collect::<HashMap<_, _>>();
+    *OVERRIDES.write().unwrap() = if map.is_empty() { None } else { Some(map) };
+}
+
+/// True when a model has gone unpriced by the live table since the last call.
+pub fn take_live_miss() -> bool {
+    let mut m = misses().lock().unwrap();
+    let pending = std::mem::take(&mut m.pending);
+    let any = !pending.is_empty();
+    m.checked.extend(pending);
+    any
 }
 
 fn compiled_rules() -> &'static Vec<(Regex, &'static PriceRule)> {
@@ -114,57 +151,77 @@ pub struct ResolvedPrice {
     pub rates: RateSet,
     pub family: String,
     pub source: &'static str,
+    pub fast: Option<(f64, f64)>,
+}
+
+fn from_row(row: &LivePrice, bundled: Option<&PriceRule>, canonical: &str, source: &'static str) -> ResolvedPrice {
+    let family = bundled
+        .map(|b| b.family.to_string())
+        .or_else(|| row.family.clone())
+        .unwrap_or_else(|| "other".to_string());
+    let fast = match (row.fast_input, row.fast_output) {
+        (Some(i), Some(o)) => Some((i, o)),
+        _ => bundled_fast_rates(canonical),
+    };
+    ResolvedPrice {
+        rates: rates(row.input, row.cache_w5m, row.cache_w1h, row.cache_read, row.output),
+        family,
+        source,
+        fast,
+    }
 }
 
 pub fn price_for(model: &str, usage_date: Option<&str>) -> Option<ResolvedPrice> {
     let canonical = canonical_model(model);
-    let date = usage_date
-        .map(str::to_string)
-        .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string());
+    let _ = usage_date; // every current row is date-independent
     let bundled = bundled_rule_for(&canonical);
 
-    let live_guard = LIVE_PRICES.read().unwrap();
-    let live = live_guard.as_ref().and_then(|prices| {
-        if canonical == "sonnet-5" {
-            let key = if date.as_str() < "2026-09-01" { "sonnet-5@intro" } else { "sonnet-5@standard" };
-            prices.get(key)
-        } else {
-            prices.get(&canonical)
-        }
-    });
+    if let Some(row) = OVERRIDES.read().unwrap().as_ref().and_then(|m| m.get(&canonical)) {
+        return Some(from_row(row, bundled, &canonical, "Price override (pricing-overrides.json)"));
+    }
 
-    if let Some(live) = live {
-        let family = bundled
-            .map(|b| b.family.to_string())
-            .or_else(|| live.family.clone())
-            .unwrap_or_else(|| "other".to_string());
-        return Some(ResolvedPrice {
-            rates: rates(live.input, live.cache_w5m, live.cache_w1h, live.cache_read, live.output),
-            family,
-            source: "Anthropic pricing (live)",
-        });
+    let live_guard = LIVE_PRICES.read().unwrap();
+    // Only an exact row counts. A dated variant left over from an older table
+    // ("sonnet-5@standard") must not outlive the page that published it.
+    if let Some(prices) = live_guard.as_ref() {
+        if let Some(row) = prices.get(&canonical) {
+            return Some(from_row(row, bundled, &canonical, "Anthropic pricing (live)"));
+        }
+        if claude_family(&canonical) {
+            let mut m = misses().lock().unwrap();
+            if !m.checked.contains(&canonical) {
+                m.pending.insert(canonical.clone());
+            }
+        }
     }
     drop(live_guard);
 
     let bundled = bundled?;
-    let use_intro = matches!(bundled.intro_until, Some(until) if date.as_str() < until);
     Some(ResolvedPrice {
-        rates: if use_intro { bundled.intro.unwrap() } else { bundled.rates },
+        rates: bundled.rates,
         family: bundled.family.to_string(),
         source: "Anthropic pricing (bundled)",
+        fast: bundled_fast_rates(&canonical),
     })
+}
+
+fn claude_family(canonical: &str) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^(?:fable|mythos|opus|sonnet|haiku)-\d").unwrap())
+        .is_match(canonical)
 }
 
 fn supports_us_geo(model: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
-        Regex::new(r"^(?:fable-5|mythos-5|opus-5|opus-4-[6-9]|sonnet-5|sonnet-4-[6-9])$").unwrap()
+        Regex::new(r"^(?:fable-5(?:-\d+)?|mythos-5(?:-\d+)?|opus-5(?:-\d+)?|opus-4-[6-9]|sonnet-5(?:-\d+)?|sonnet-4-[6-9])$").unwrap()
     });
     re.is_match(&canonical_model(model))
 }
 
-fn fast_rates(model: &str) -> Option<(f64, f64)> {
-    match canonical_model(model).as_str() {
+fn bundled_fast_rates(canonical: &str) -> Option<(f64, f64)> {
+    match canonical {
+        "opus-5-5" => Some((8.0, 40.0)),
         "opus-5" | "opus-4-8" => Some((10.0, 50.0)),
         "opus-4-7" => Some((30.0, 150.0)),
         _ => None,
@@ -215,8 +272,11 @@ pub fn cost_of(model: &str, usage: &ClaudeUsage) -> ClaudeCost {
     let speed = usage.speed.to_lowercase();
     let mut fast = false;
     if speed == "fast" {
-        if let Some((input, output)) = fast_rates(model) {
-            p = rates(input, input * 1.25, input * 2.0, input * 0.1, output);
+        if let Some((input, output)) = resolved.fast {
+            // Cache multipliers stack on the fast input rate, so they keep
+            // each model's own ratios (Opus 5.5 reads at 0.05x, not 0.1x).
+            let k = if p.input > 0.0 { input / p.input } else { 1.0 };
+            p = rates(input, p.cache_w5m * k, p.cache_w1h * k, p.cache_read * k, output);
             fast = true;
         }
         // Opus 4.6 reports fast in some logs but is explicitly billed standard.
@@ -277,17 +337,12 @@ mod tests {
     }
 
     #[test]
-    fn prices_claude_introductory_fast_regional_and_server_tool_usage() {
-        let intro = cost_of("claude-sonnet-5", &ClaudeUsage {
-            date: Some("2026-08-31"), input: 1_000_000.0, output: 1_000_000.0,
+    fn prices_claude_fast_regional_and_server_tool_usage() {
+        let sonnet = cost_of("claude-sonnet-5", &ClaudeUsage {
+            date: Some("2026-09-02"), input: 1_000_000.0, output: 1_000_000.0,
             ..Default::default()
         });
-        close(intro.total, 12.0);
-        let standard = cost_of("claude-sonnet-5", &ClaudeUsage {
-            date: Some("2026-09-01"), input: 1_000_000.0, output: 1_000_000.0,
-            ..Default::default()
-        });
-        close(standard.total, 18.0);
+        close(sonnet.total, 12.0);
 
         let fast_us = cost_of("claude-opus-4-8", &ClaudeUsage {
             input: 1_000_000.0, output: 1_000_000.0, cache_read: 100_000.0,
@@ -318,6 +373,22 @@ mod tests {
     }
 
     #[test]
+    fn opus_5_5_has_its_own_row_and_fast_rates() {
+        assert_eq!(canonical_model("claude-opus-5-5"), "opus-5-5");
+        let p = price_for("claude-opus-5-5", None).unwrap();
+        assert_eq!(p.rates, rates(4.0, 5.0, 8.0, 0.2, 20.0));
+        assert_eq!(p.family, "opus");
+        let c = cost_of("claude-opus-5-5", &ClaudeUsage {
+            input: 1_000_000.0, output: 1_000_000.0, cache_read: 1_000_000.0,
+            speed: "fast", inference_geo: "us",
+            ..Default::default()
+        });
+        assert!(c.fast);
+        assert!(c.us_region);
+        close(c.total, (8.0 + 40.0 + 0.4) * 1.1);
+    }
+
+    #[test]
     fn unknown_models_stay_unpriced() {
         let c = cost_of("mistral-large", &ClaudeUsage { input: 1e6, ..Default::default() });
         assert!(!c.known);
@@ -333,5 +404,51 @@ mod tests {
         assert_eq!(fable.rates.input, 10.0);
         assert_eq!(fable.rates.output, 50.0);
         assert_eq!(fable.family, "fable");
+    }
+
+    #[test]
+    fn fable_5_1_keeps_the_tier_rates_but_reads_cache_at_a_quarter() {
+        assert_eq!(canonical_model("claude-fable-5-1"), "fable-5-1");
+        let fable51 = price_for("claude-fable-5-1", None).unwrap();
+        let mythos51 = price_for("claude-mythos-5-1", None).unwrap();
+        assert_eq!(fable51.rates, mythos51.rates);
+        assert_eq!(fable51.rates, rates(10.0, 12.5, 20.0, 0.25, 50.0));
+        assert_eq!(fable51.family, "fable");
+        let c = cost_of("claude-fable-5-1", &ClaudeUsage {
+            input: 1_000_000.0, output: 1_000_000.0, cache_read: 1_000_000.0,
+            cache_w5m: 1_000_000.0, cache_w1h: 1_000_000.0,
+            ..Default::default()
+        });
+        close(c.total, 92.75);
+        close(c.cache_savings, 9.75);
+    }
+
+    #[test]
+    fn a_live_row_is_only_used_when_it_matches_exactly() {
+        set_live_prices(HashMap::from([(
+            "sonnet-5@standard".to_string(),
+            LivePrice { input: 3.0, cache_w5m: 3.75, cache_w1h: 6.0, cache_read: 0.3, output: 15.0, family: None, fast_input: None, fast_output: None },
+        )]));
+        let p = price_for("claude-sonnet-5", Some("2026-09-02")).unwrap();
+        assert_eq!(p.rates.input, 2.0);
+        assert_eq!(p.source, "Anthropic pricing (bundled)");
+        set_live_prices(HashMap::from([(
+            "sonnet-5".to_string(),
+            LivePrice { input: 2.0, cache_w5m: 2.5, cache_w1h: 4.0, cache_read: 0.2, output: 10.0, family: None, fast_input: None, fast_output: None },
+        )]));
+        assert_eq!(price_for("claude-sonnet-5", None).unwrap().source, "Anthropic pricing (live)");
+    }
+
+    #[test]
+    fn an_override_beats_live_and_bundled() {
+        set_overrides(HashMap::from([(
+            "claude-haiku-4-5".to_string(),
+            LivePrice { input: 9.0, cache_w5m: 9.0, cache_w1h: 9.0, cache_read: 9.0, output: 9.0, family: None, fast_input: None, fast_output: None },
+        )]));
+        let p = price_for("claude-haiku-4-5-20251001", None).unwrap();
+        assert_eq!(p.rates.input, 9.0);
+        assert_eq!(p.family, "haiku");
+        set_overrides(HashMap::new());
+        assert_eq!(price_for("claude-haiku-4-5", None).unwrap().rates.input, 1.0);
     }
 }

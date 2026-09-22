@@ -39,11 +39,16 @@ const fn with_write(pattern: &'static str, input: f64, cached: f64, write: f64, 
     PriceRule { pattern, raw: false, unpriced: false, input, cached, write: Some(write), output, long_context: false, family }
 }
 
+const fn tiered_with_write(pattern: &'static str, input: f64, cached: f64, write: f64, output: f64, family: &'static str) -> PriceRule {
+    PriceRule { pattern, raw: false, unpriced: false, input, cached, write: Some(write), output, long_context: true, family }
+}
+
 const PRICING_RULES: &[PriceRule] = &[
     PriceRule { pattern: r"^gpt-5\.3-codex-spark(?:-|$)", raw: true, unpriced: true, input: 0.0, cached: 0.0, write: None, output: 0.0, long_context: false, family: "codex" },
     rule(r"chatgpt-4o-latest", 5.0, 5.0, 15.0, "gpt4"),
     rule(r"chat-latest", 5.0, 0.5, 30.0, "gpt5"),
 
+    tiered_with_write(r"gpt-6-astra", 10.0, 1.0, 12.5, 50.0, "gpt5"),
     with_write(r"gpt-5\.6-terra", 2.5, 0.25, 3.125, 15.0, "gpt5"),
     with_write(r"gpt-5\.6-luna", 1.0, 0.1, 1.25, 6.0, "gpt5"),
     with_write(r"gpt-5\.6(?:-sol)?", 5.0, 0.5, 6.25, 30.0, "gpt5"),
@@ -367,5 +372,26 @@ mod tests {
         });
         close(measured.total, 0.525);
         assert!(!measured.estimated);
+    }
+
+    #[test]
+    fn gpt_6_astra_carries_both_a_cache_write_rate_and_a_context_tier() {
+        let p = price_for("gpt-6-astra").unwrap();
+        assert_eq!((p.input, p.cached, p.write, p.output), (10.0, 1.0, Some(12.5), 50.0));
+
+        let short = cost_of("gpt-6-astra", &CodexUsage {
+            input: 100_000.0, output: 10_000.0, cache_write: 20_000.0, cache_write_known: true,
+            ..Default::default()
+        });
+        close(short.total, 1.75);
+        assert!(!short.long_context);
+
+        // Past 272K the whole request reprices: 2x input, 1.5x output.
+        let long = cost_of("gpt-6-astra", &CodexUsage {
+            input: 272_001.0, output: 10_000.0, cache_write_known: true, total_input: 272_001.0,
+            ..Default::default()
+        });
+        close(long.total, 6.19002);
+        assert!(long.long_context);
     }
 }

@@ -16,8 +16,8 @@
   /* Ordered as the picker shows them: Ember's own first, then the schemes
      developers are most likely already running in their editor. */
   const THEMES = [
-    { id: 'classic', name: 'Ember Classic', swatch: ['#0d0806', '#4fd39c', '#f2b45c', '#ff6d3b'] },
-    { id: 'noir', name: 'Ember Noir', swatch: ['#0b0e14', '#35c6a8', '#f0b44f', '#ff7a45'] },
+    { id: 'classic', name: 'Ember Classic', swatch: ['#0d0806', '#46c194', '#f2b45c', '#ff6d3b'] },
+    { id: 'noir', name: 'Ember Noir', swatch: ['#0b0e14', '#2fb59c', '#f0b44f', '#ff7a45'] },
     { id: 'catppuccin', name: 'Catppuccin', swatch: ['#11111b', '#a6e3a1', '#f9e2af', '#fab387'] },
     { id: 'tokyonight', name: 'Tokyo Night', swatch: ['#16161e', '#73daca', '#e0af68', '#ff9e64'] },
     { id: 'rosepine', name: 'Rosé Pine', swatch: ['#191724', '#9ccfd8', '#f6c177', '#ebbcba'] },

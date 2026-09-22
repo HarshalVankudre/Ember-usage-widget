@@ -21,6 +21,9 @@ const state = {
   projectsExpanded: false,
   expandedProject: null,
   hiddenProjects: loadHiddenProjects(), // excluded from all totals, shown blurred
+  selectedProjects: new Set(), // ticked for export; follows what the filters show
+  archivedProjects: loadArchivedProjects(), // out of the list only — still in every total
+  archivedExpanded: false,
   settings: { alwaysOnTop: false, launchAtStartup: true },
   limits: null, // { claude, codex }
   worstLimit: 0,
@@ -39,7 +42,13 @@ const state = {
 const PROVIDERS = {
   claude: { label: 'Claude', color: '#d97757' },
   codex: { label: 'Codex', color: '#38c98b' },
+  zcode: { label: 'zcode', color: '#7c8cf8' },
 };
+
+// A provider the backend knows about but this build does not must degrade to a
+// labelled grey row, never take the whole widget down with it.
+const UNKNOWN_PROVIDER = { label: 'Other', color: '#8a8a8a' };
+const pmeta = (p) => PROVIDERS[p] || UNKNOWN_PROVIDER;
 
 const mkey = (b) => `${b.provider}|${b.model}`;
 
@@ -53,6 +62,20 @@ function loadHiddenProjects() {
 
 function saveHiddenProjects() {
   localStorage.setItem('hiddenProjects', JSON.stringify([...state.hiddenProjects]));
+}
+
+// Archiving is filing, not hiding: an archived project keeps feeding the hero,
+// the chart and the model table, it just stops crowding the project list.
+function loadArchivedProjects() {
+  try {
+    return new Set(JSON.parse(localStorage.getItem('archivedProjects') || '[]'));
+  } catch {
+    return new Set();
+  }
+}
+
+function saveArchivedProjects() {
+  localStorage.setItem('archivedProjects', JSON.stringify([...state.archivedProjects]));
 }
 
 const $ = (id) => document.getElementById(id);
@@ -269,8 +292,38 @@ function prettyCodexModel(m) {
   return out.join(' ');
 }
 
-function prettyModel(provider, model) {
-  return provider === 'codex' ? prettyCodexModel(model) : prettyClaudeModel(model);
+// zcode: "z-ai/glm-5.3-flash:makora" -> "GLM-5.3 Flash". The vendor prefix and
+// the routing suffix say where the request went, not which model ran, so both
+// are dropped — the coding plan's bare "GLM-5.3-Flash" then reads identically.
+function prettyZcodeModel(m, source) {
+  const raw = String(m);
+  const colon = raw.indexOf(':');
+  const base = colon === -1 ? raw : raw.slice(0, colon);
+  // OpenRouter appends a routing variant (`:nitro`, `:makora`) and prefixes a
+  // vendor. Both are separate rows with their own prices, so the label has to
+  // carry them — dropping them printed two identical "GLM-5.3 Flash" lines.
+  const variant = colon === -1 ? '' : raw.slice(colon + 1);
+  const vendor = base.includes('/') ? base.slice(0, base.indexOf('/')) : '';
+  const name = base.includes('/') ? base.slice(base.lastIndexOf('/') + 1) : base;
+  const pretty = name
+    .split('-')
+    .filter(Boolean)
+    .map((s) => (/^(glm|gpt|qwen|kimi)$/i.test(s) ? s.toUpperCase() : s.charAt(0).toUpperCase() + s.slice(1)))
+    .join(' ')
+    .replace(/^(GLM|GPT|QWEN|KIMI) (\d)/i, '$1-$2');
+  // The same GLM build is reachable through both imported providers, so the
+  // model name alone is ambiguous — say which one served it. `source` comes
+  // from zcode's own config; the slug shape is the fallback (only OpenRouter
+  // ids carry a vendor prefix).
+  const via = source || (vendor ? 'OpenRouter' : 'Z.ai coding plan');
+  const route = [vendor, variant].filter(Boolean).join(' ');
+  return route ? `${pretty} · ${via} (${route})` : `${pretty} · ${via}`;
+}
+
+function prettyModel(provider, model, source) {
+  if (provider === 'codex') return prettyCodexModel(model);
+  if (provider === 'zcode') return prettyZcodeModel(model, source);
+  return prettyClaudeModel(model);
 }
 
 /* Family palettes — checked in order, first substring match wins. The values
@@ -283,10 +336,20 @@ const CLAUDE_FAMILY_TOKEN = {
   haiku: 'haiku',
   other: 'other',
 };
+const ZCODE_FAMILY_TOKEN = {
+  flash: 'haiku',
+  air: 'haiku',
+  mini: 'haiku',
+  glm: 'sonnet',
+  qwen: 'gpt4',
+  kimi: 'opus',
+  other: 'other',
+};
 const CODEX_FAMILY_TOKEN = {
   pro: 'pro',
   mini: 'mini',
   nano: 'nano',
+  'gpt-6': 'gpt5',
   'gpt-5': 'gpt5',
   codex: 'gpt5',
   'gpt-4': 'gpt4',
@@ -299,7 +362,9 @@ const modelColorCache = new Map();
 function modelColor(provider, model) {
   const key = `${provider}|${model}`;
   if (modelColorCache.has(key)) return modelColorCache.get(key);
-  const palette = provider === 'codex' ? CODEX_FAMILY_TOKEN : CLAUDE_FAMILY_TOKEN;
+  const palette = provider === 'codex'
+    ? CODEX_FAMILY_TOKEN
+    : provider === 'zcode' ? ZCODE_FAMILY_TOKEN : CLAUDE_FAMILY_TOKEN;
   const lower = model.toLowerCase();
   let fam = 'other';
   for (const f of Object.keys(palette)) if (f !== 'other' && lower.includes(f)) { fam = f; break; }
@@ -444,7 +509,7 @@ function addModelBucket(byModel, b) {
   const mk = mkey(b);
   let m = byModel.get(mk);
   if (!m) {
-    m = { provider: b.provider, model: b.model,
+    m = { provider: b.provider, model: b.model, source: b.source,
       input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0, costMin: 0, costMax: 0,
       estimated: false, pricedCalls: 0, unpricedCalls: 0, priced: b.priced };
     byModel.set(mk, m);
@@ -554,7 +619,7 @@ function render({ animate = false } = {}) {
     p.estimated = p.estimated || !!b.estimated;
     let pm = p.models.get(mk);
     if (!pm) {
-      pm = { provider: b.provider, model: b.model,
+      pm = { provider: b.provider, model: b.model, source: b.source, source: b.source,
         input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, cost: 0, msgs: 0,
         costMin: 0, costMax: 0,
         cIn: 0, cOut: 0, cCr: 0, cCw: 0, cRs: 0, cTool: 0,
@@ -682,7 +747,10 @@ function render({ animate = false } = {}) {
     sectionRenderKeys.modelTable = detailKey;
   }
 
-  const projectsKey = `${detailKey}|${state.projectsExpanded}|${state.expandedProject}`;
+  const projectsKey = [
+    detailKey, state.projectsExpanded, state.expandedProject,
+    setKey(state.selectedProjects), setKey(state.archivedProjects), state.archivedExpanded,
+  ].join('|');
   if (sectionRenderKeys.projects !== projectsKey) {
     renderProjects(byProject);
     sectionRenderKeys.projects = projectsKey;
@@ -826,19 +894,19 @@ function renderProviderChips() {
   const wrap = $('providerChips');
   wrap.innerHTML = '';
   if (present.length < 2) return; // nothing to filter with a single provider
-  for (const pv of ['claude', 'codex']) {
+  for (const pv of ['claude', 'codex', 'zcode']) {
     if (!present.includes(pv)) continue;
     const btn = document.createElement('button');
     btn.className = 'chip model-chip provider-chip';
     const active = state.selectedProviders.size === 0 || state.selectedProviders.has(pv);
     if (active) btn.classList.add('active');
     btn.setAttribute('aria-pressed', String(active));
-    btn.title = `Filter to ${PROVIDERS[pv].label}`;
-    btn.style.setProperty('--c', PROVIDERS[pv].color);
+    btn.title = `Filter to ${pmeta(pv).label}`;
+    btn.style.setProperty('--c', pmeta(pv).color);
     const swatch = document.createElement('span');
     swatch.className = 'swatch';
     swatch.setAttribute('aria-hidden', 'true');
-    btn.append(swatch, document.createTextNode(PROVIDERS[pv].label));
+    btn.append(swatch, document.createTextNode(pmeta(pv).label));
     btn.onclick = () => {
       if (state.selectedProviders.size === 0) {
         // everything was implicitly selected -> isolate this provider
@@ -861,24 +929,24 @@ function renderModelChips() {
   const seen = new Map(); // mkey -> { provider, model }
   for (const b of state.buckets) {
     if (state.selectedProviders.size > 0 && !state.selectedProviders.has(b.provider)) continue;
-    if (!seen.has(mkey(b))) seen.set(mkey(b), { provider: b.provider, model: b.model });
+    if (!seen.has(mkey(b))) seen.set(mkey(b), { provider: b.provider, model: b.model, source: b.source });
   }
   const models = [...seen.entries()].sort((a, b) =>
     a[1].provider.localeCompare(b[1].provider) || a[1].model.localeCompare(b[1].model));
   const wrap = $('modelChips');
   wrap.innerHTML = '';
-  for (const [key, { provider, model }] of models) {
+  for (const [key, { provider, model, source }] of models) {
     const btn = document.createElement('button');
     btn.className = 'chip model-chip';
     const active = state.selectedModels.size === 0 || state.selectedModels.has(key);
     if (active) btn.classList.add('active');
     btn.setAttribute('aria-pressed', String(active));
     btn.style.setProperty('--c', modelColor(provider, model));
-    btn.title = `${PROVIDERS[provider].label} · ${model}`;
+    btn.title = `${pmeta(provider).label} · ${model}`;
     const swatch = document.createElement('span');
     swatch.className = 'swatch';
     swatch.setAttribute('aria-hidden', 'true');
-    btn.append(swatch, document.createTextNode(prettyModel(provider, model)));
+    btn.append(swatch, document.createTextNode(prettyModel(provider, model, source)));
     btn.onclick = () => {
       if (state.selectedModels.size === 0) {
         // everything was implicitly selected -> isolate this model
@@ -921,20 +989,20 @@ function renderModelTable(byModel) {
     tr.dataset.modelKey = key;
     tr.tabIndex = 0;
     tr.setAttribute('aria-selected', String(selected));
-    tr.setAttribute('aria-label', `${prettyModel(m.provider, m.model)}. ${selected ? 'Selected model filter; activate to clear.' : 'Activate to show only this model.'}`);
+    tr.setAttribute('aria-label', `${prettyModel(m.provider, m.model, m.source)}. ${selected ? 'Selected model filter; activate to clear.' : 'Activate to show only this model.'}`);
     if (selected) tr.classList.add('is-selected');
     else if (hasModelFilter) tr.classList.add('is-filtered-out');
-    tr.title = selected ? 'Click again to clear the model filter' : `Show only ${prettyModel(m.provider, m.model)} usage`;
+    tr.title = selected ? 'Click again to clear the model filter' : `Show only ${prettyModel(m.provider, m.model, m.source)} usage`;
     const modelCell = document.createElement('td');
     const name = document.createElement('span');
     name.className = 'mname';
-    name.title = `${PROVIDERS[m.provider].label} · ${m.model}`;
+    name.title = `${pmeta(m.provider).label} · ${m.model}`;
     const swatch = document.createElement('span');
     swatch.className = 'swatch';
     swatch.style.background = modelColor(m.provider, m.model);
     const label = document.createElement('span');
     label.className = 'model-label';
-    label.textContent = prettyModel(m.provider, m.model);
+    label.textContent = prettyModel(m.provider, m.model, m.source);
     name.append(swatch, label);
     modelCell.appendChild(name);
     tr.appendChild(modelCell);
@@ -1067,7 +1135,7 @@ function appendProjectModels(table, p) {
         g.appendChild(projTableRow('Write premium (est.)', 'unreported', money(m.cCw, priced, true),
           { title: 'Conservative cache-write premium; native Codex logs do not expose write-token counts' }));
       }
-    } else if (provider === 'claude') {
+    } else if (provider === 'claude' || provider === 'zcode') {
       if (m.reasoning > 0) {
         g.appendChild(projTableRow('Reasoning', fmtTok(m.reasoning), money(m.cRs, priced),
           { sub: true, title: 'Billed inside output — already counted in the total' }));
@@ -1083,8 +1151,8 @@ function appendProjectModels(table, p) {
   table.appendChild(projTableRow('', 'tokens', 'cost', { cols: true }));
   for (const m of entries) {
     addGroup(
-      projTableRow(prettyModel(m.provider, m.model), `${m.msgs.toLocaleString()} calls`, money(m.cost, m.priced, m.estimated),
-        { head: true, dot: modelColor(m.provider, m.model), title: `${PROVIDERS[m.provider].label} · ${m.model}` }),
+      projTableRow(prettyModel(m.provider, m.model, m.source), `${m.msgs.toLocaleString()} calls`, money(m.cost, m.priced, m.estimated),
+        { head: true, dot: modelColor(m.provider, m.model), title: `${pmeta(m.provider).label} · ${m.model}` }),
       m, m.priced, m.provider);
   }
   if (entries.length > 1) {
@@ -1094,7 +1162,92 @@ function appendProjectModels(table, p) {
   }
 }
 
-function buildProjectItem(wrap, name, p, max) {
+// Export selection. A tick lives beside each row rather than behind a mode
+// switch: one click to pick a project, shift-click to take a run of them.
+let selectionAnchor = null;
+
+function toggleProjectSelection(name, extend, visibleNames) {
+  const sel = state.selectedProjects;
+  const anchor = selectionAnchor;
+  const spans = extend && anchor && anchor !== name
+    && visibleNames.includes(anchor) && visibleNames.includes(name);
+  if (spans) {
+    const a = visibleNames.indexOf(anchor);
+    const b = visibleNames.indexOf(name);
+    for (const n of visibleNames.slice(Math.min(a, b), Math.max(a, b) + 1)) {
+      if (!state.hiddenProjects.has(n)) sel.add(n);
+    }
+  } else if (sel.has(name)) {
+    sel.delete(name);
+  } else {
+    sel.add(name);
+  }
+  selectionAnchor = name;
+  render();
+}
+
+function buildProjectCheck(name, visibleNames) {
+  const selected = state.selectedProjects.has(name);
+  const check = document.createElement('button');
+  check.type = 'button';
+  check.className = 'proj-check' + (selected ? ' on' : '');
+  check.setAttribute('role', 'checkbox');
+  check.setAttribute('aria-checked', String(selected));
+  check.setAttribute('aria-label', `Select ${name} for export`);
+  check.title = selected ? 'Selected for export' : 'Select for export — shift-click for a range';
+  check.innerHTML = `<span class="box"><svg viewBox="0 0 12 12" aria-hidden="true"><path d="m2.6 6.2 2.3 2.3 4.5-4.6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></span>`;
+  check.addEventListener('click', (e) => {
+    e.stopPropagation();
+    toggleProjectSelection(name, e.shiftKey, visibleNames);
+  });
+  return check;
+}
+
+function archiveProjects(names) {
+  if (!names.length) return;
+  for (const n of names) {
+    state.archivedProjects.add(n);
+    state.selectedProjects.delete(n);
+    if (state.expandedProject === n) state.expandedProject = null;
+  }
+  saveArchivedProjects();
+  selectionAnchor = null;
+  render();
+  toast(names.length === 1
+    ? `Archived ${names[0]}`
+    : `Archived ${names.length} projects — still counted in every total`);
+}
+
+function toggleProjectArchive(name) {
+  if (state.archivedProjects.has(name)) {
+    state.archivedProjects.delete(name);
+  } else {
+    state.archivedProjects.add(name);
+    state.selectedProjects.delete(name);
+    if (state.expandedProject === name) state.expandedProject = null;
+  }
+  saveArchivedProjects();
+  render();
+}
+
+function buildProjectArchive(name) {
+  const archived = state.archivedProjects.has(name);
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'proj-archive' + (archived ? ' on' : '');
+  btn.title = archived ? 'Unarchive — put it back in the list' : 'Archive — file it away, totals keep counting it';
+  btn.setAttribute('aria-label', `${archived ? 'Unarchive' : 'Archive'} ${name}`);
+  btn.innerHTML = archived
+    ? `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.6 5.4h10.8M3.6 5.4v7.2h8.8V5.4M2.6 3.4h10.8v2H2.6zM8 11V7.4m0 0L6.4 9M8 7.4 9.6 9" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>`
+    : `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.6 5.4h10.8M3.6 5.4v7.2h8.8V5.4M2.6 3.4h10.8v2H2.6zM6.4 7.8h3.2" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    toggleProjectArchive(name);
+  });
+  return btn;
+}
+
+function buildProjectItem(wrap, name, p, max, visibleNames = []) {
   const isHidden = state.hiddenProjects.has(name);
   const item = document.createElement('div');
   item.className = 'proj';
@@ -1158,34 +1311,181 @@ function buildProjectItem(wrap, name, p, max) {
     render(); // totals change, so everything re-renders
   });
 
-  item.append(summary, details);
+  const isArchived = state.archivedProjects.has(name);
+  if (isArchived) item.classList.add('is-archived');
+
+  const head = document.createElement('div');
+  head.className = 'proj-head';
+  // Hidden and archived rows are not part of the visible list, so they cannot
+  // be ticked for export either.
+  if (!isHidden && !isArchived) head.appendChild(buildProjectCheck(name, visibleNames));
+  else head.appendChild(document.createElement('span'));
+  head.appendChild(summary);
+  head.appendChild(buildProjectArchive(name));
+
+  item.append(head, details);
   wrap.appendChild(item);
   if (state.expandedProject === name && !isHidden) setProjectOpen(item, summary, details, true);
+}
+
+function buildSelectionBar(wrap, entries) {
+  const chosen = entries.filter(([n]) => state.selectedProjects.has(n));
+  if (!chosen.length) return;
+
+  const bar = document.createElement('div');
+  bar.className = 'proj-selbar';
+  const cost = chosen.reduce((s, [, p]) => s + p.cost, 0);
+  const tokens = chosen.reduce((s, [, p]) => s + p.input + p.output + p.cacheRead + p.cacheWrite, 0);
+  const calls = chosen.reduce((s, [, p]) => s + p.msgs, 0);
+  const unpriced = chosen.some(([, p]) => p.unpricedCalls > 0);
+  const estimated = chosen.some(([, p]) => p.estimated);
+
+  const info = document.createElement('span');
+  info.className = 'proj-selinfo';
+  info.textContent = `${chosen.length} selected · ${unpriced ? '' : estimated ? '≈' : ''}${fmtCost(cost)}${unpriced ? ' + unpriced' : ''} · ${fmtTok(tokens)} tokens · ${calls.toLocaleString()} calls`;
+
+  const actions = document.createElement('div');
+  actions.className = 'proj-selactions';
+  const addBtn = (label, title, onClick, primary = false) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'proj-selbtn' + (primary ? ' primary' : '');
+    b.textContent = label;
+    b.title = title;
+    b.onclick = onClick;
+    actions.appendChild(b);
+  };
+  addBtn('CSV', 'Save the selected projects as CSV — one row per project and model', () => runExport('projects-csv'), true);
+  addBtn('JSON', 'Save the selected projects as JSON — full token and cost breakdown', () => runExport('projects-json'), true);
+  addBtn('Copy', 'Copy a Markdown table of the selected projects', () => runExport('projects-summary'));
+  const selectable = entries.filter(([n]) => !state.hiddenProjects.has(n));
+  if (chosen.length < selectable.length) {
+    addBtn('All', 'Select every project in this view', () => {
+      for (const [n] of selectable) state.selectedProjects.add(n);
+      render();
+    });
+  }
+  addBtn('Archive', 'Archive the selected projects — they leave the list, totals keep counting them', () => {
+    archiveProjects(chosen.map(([n]) => n));
+  });
+  addBtn('Clear', 'Clear the selection', () => {
+    state.selectedProjects.clear();
+    selectionAnchor = null;
+    render();
+  });
+
+  bar.append(info, actions);
+  wrap.appendChild(bar);
+}
+
+// Quick archive. With a model filter on, the project list already *is* "every
+// project that used this model in this range" — so one button files the whole
+// list away without ticking anything.
+function buildModelArchiveBar(wrap, entries) {
+  if (!state.selectedModels.size || !entries.length) return;
+  const names = entries.map(([n]) => n);
+  const labels = [...state.selectedModels].map((key) => {
+    const [provider, ...rest] = key.split('|');
+    const model = rest.join('|');
+    const seen = state.buckets.find((b) => b.provider === provider && b.model === model);
+    return prettyModel(provider, model, seen && seen.source);
+  });
+  const label = labels.length === 1 ? labels[0] : `${labels.length} models`;
+
+  const bar = document.createElement('div');
+  bar.className = 'proj-selbar proj-modelbar';
+  const info = document.createElement('span');
+  info.className = 'proj-selinfo';
+  info.textContent = `${label} · ${names.length} project${names.length === 1 ? '' : 's'} in this range`;
+  const actions = document.createElement('div');
+  actions.className = 'proj-selactions';
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'proj-selbtn';
+  btn.textContent = `Archive all ${names.length}`;
+  btn.title = `Archive every project that used ${label} in this range — totals keep counting them`;
+  btn.onclick = () => archiveProjects(names);
+  // The bar reads as a prompt, so it needs a way out that does not archive
+  // anything: clearing the model filter puts the full list back.
+  const cancel = document.createElement('button');
+  cancel.type = 'button';
+  cancel.className = 'proj-selbtn';
+  cancel.textContent = 'Cancel';
+  cancel.title = 'Clear the model filter and show every project again';
+  cancel.onclick = () => {
+    state.selectedModels = new Set();
+    render();
+  };
+  actions.append(btn, cancel);
+  bar.append(info, actions);
+  wrap.appendChild(bar);
+}
+
+// The export menu mirrors the selection so the footer stays the one place
+// that answers "how do I get this out?".
+function syncProjectExportItems() {
+  const count = state.selectedProjects.size;
+  for (const item of document.querySelectorAll('[data-export^="projects-"]')) {
+    item.hidden = count === 0;
+    const small = item.querySelector('small');
+    if (small && count) {
+      small.textContent = `${count} selected project${count === 1 ? '' : 's'}, model by model`;
+    }
+  }
 }
 
 function renderProjects(byProject) {
   const wrap = $('projectList');
   wrap.innerHTML = '';
-  const entries = [...byProject.entries()].filter(([, p]) => p.live).sort((a, b) =>
+  const allEntries = [...byProject.entries()].filter(([, p]) => p.live).sort((a, b) =>
     b[1].cost - a[1].cost || a[0].localeCompare(b[0], undefined, { sensitivity: 'base' }));
+  // Archived projects still count everywhere else; they simply step out of
+  // the list so the rest is readable.
+  const entries = allEntries.filter(([n]) => !state.archivedProjects.has(n));
+  const archivedEntries = allEntries.filter(([n]) => state.archivedProjects.has(n));
+  // A project that left the current view cannot be exported from it, so the
+  // selection is trimmed to what is actually on screen.
+  const inView = new Set(entries.filter(([n]) => !state.hiddenProjects.has(n)).map(([n]) => n));
+  for (const n of [...state.selectedProjects]) {
+    if (!inView.has(n)) state.selectedProjects.delete(n);
+  }
+  syncProjectExportItems();
+
   const note = $('projNote');
   if (note) {
     const hiddenCount = entries.filter(([n]) => state.hiddenProjects.has(n)).length;
-    note.textContent = hiddenCount
-      ? `sorted by cost · ${hiddenCount} hidden`
-      : 'sorted by cost · right-click to hide';
+    const selectedCount = state.selectedProjects.size;
+    const marks = [];
+    if (hiddenCount) marks.push(`${hiddenCount} hidden`);
+    if (archivedEntries.length) marks.push(`${archivedEntries.length} archived`);
+    note.textContent = selectedCount
+      ? `${selectedCount} selected for export`
+      : marks.length
+        ? `sorted by cost · ${marks.join(' · ')}`
+        : 'sorted by cost · tick to export · right-click to hide';
   }
-  if (!entries.length) {
+  if (!entries.length && !archivedEntries.length) {
     state.expandedProject = null;
     wrap.innerHTML = `<div class="empty">no usage in this range</div>`;
     return;
   }
 
+  buildModelArchiveBar(wrap, entries);
+  buildSelectionBar(wrap, entries);
+
   if (!byProject.has(state.expandedProject)) state.expandedProject = null;
-  const max = entries[0][1].cost || 1;
+  const max = (entries[0] || archivedEntries[0])[1].cost || 1;
 
   const visibleEntries = state.projectsExpanded ? entries : entries.slice(0, PROJECT_PREVIEW_COUNT);
-  for (const [name, p] of visibleEntries) buildProjectItem(wrap, name, p, max);
+  const visibleNames = visibleEntries.map(([name]) => name);
+  for (const [name, p] of visibleEntries) buildProjectItem(wrap, name, p, max, visibleNames);
+
+  if (!entries.length) {
+    const none = document.createElement('div');
+    none.className = 'empty';
+    none.textContent = 'every project in this range is archived';
+    wrap.appendChild(none);
+  }
 
   if (entries.length > PROJECT_PREVIEW_COUNT) {
     const toggle = document.createElement('button');
@@ -1206,6 +1506,40 @@ function renderProjects(byProject) {
     wrap.appendChild(toggle);
   }
 
+  buildArchivedDrawer(wrap, byProject, archivedEntries, max);
+}
+
+// Archived projects live behind one collapsed row. Opening it shows them with
+// their real numbers — nothing was thrown away — and the same button puts a
+// project back.
+function buildArchivedDrawer(wrap, byProject, archivedEntries, max) {
+  if (!archivedEntries.length) return;
+  const cost = archivedEntries.reduce((s, [, p]) => s + p.cost, 0);
+
+  const toggle = document.createElement('button');
+  toggle.type = 'button';
+  toggle.className = 'project-expand archived-toggle';
+  toggle.setAttribute('aria-expanded', String(state.archivedExpanded));
+  const label = document.createElement('span');
+  label.textContent = `Archived · ${archivedEntries.length} · ${fmtCost(cost)} still counted`;
+  toggle.appendChild(label);
+  toggle.insertAdjacentHTML('beforeend',
+    `<svg viewBox="0 0 12 12" aria-hidden="true"><path d="m2.5 4.5 3.5 3 3.5-3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`);
+  toggle.addEventListener('click', () => {
+    state.archivedExpanded = !state.archivedExpanded;
+    if (!state.archivedExpanded && state.archivedProjects.has(state.expandedProject)) {
+      state.expandedProject = null;
+    }
+    renderProjects(byProject);
+    wrap.querySelector('.archived-toggle')?.focus({ preventScroll: true });
+  });
+  wrap.appendChild(toggle);
+
+  if (!state.archivedExpanded) return;
+  const box = document.createElement('div');
+  box.className = 'archived-list';
+  for (const [name, p] of archivedEntries) buildProjectItem(box, name, p, max);
+  wrap.appendChild(box);
 }
 
 /* ───────────────────────── chart ───────────────────────── */
@@ -1588,7 +1922,7 @@ function buildQuotaScopes() {
       mode,
       meter,
       windowMs,
-      label: both ? `${PROVIDERS[provider].label} · ${short}` : short,
+      label: both ? `${pmeta(provider).label} · ${short}` : short,
       title,
     });
   };
@@ -1746,9 +2080,18 @@ function renderQuotaMetrics(rows, metric) {
   }
 }
 
+// The newest open block is the one being metered; an older block can still
+// read as open when the provider replaced its window before the reset.
+function liveQuotaRow(rows) {
+  for (let i = rows.length - 1; i >= 0; i--) {
+    if (rows[i].active) return rows[i];
+  }
+  return null;
+}
+
 function renderQuotaLive(rows, scope, animate) {
   const card = $('quotaLive');
-  const live = rows.find((r) => r.active);
+  const live = liveQuotaRow(rows);
   if (!live) {
     card.hidden = true;
     return;
@@ -1843,7 +2186,7 @@ function renderQuotaChart(rows, scope, metric, hoverIdx = -1) {
       const h = scaleY(values[i]);
       const top = H - padB - h;
       const lead = [...row.totals.models.values()].sort((a, b) => b.cost - a.cost)[0];
-      ctx.fillStyle = lead ? modelColor(lead.provider, lead.model) : PROVIDERS[scope.provider].color;
+      ctx.fillStyle = lead ? modelColor(lead.provider, lead.model) : pmeta(scope.provider).color;
       if (h >= 0.5) {
         roundRectPath(ctx, x, top, barW, h, Math.min(2.5, barW / 2));
         ctx.fill();
@@ -1964,7 +2307,7 @@ function setupQuotaHover() {
     }
     const top = [...row.totals.models.values()].sort((a, b) => b.cost - a.cost).slice(0, 3);
     for (const m of top) {
-      addRow(prettyModel(m.provider, m.model), metric === 'tokens' ? fmtTok(m.tokens) : fmtCost(m.cost),
+      addRow(prettyModel(m.provider, m.model, m.source), metric === 'tokens' ? fmtTok(m.tokens) : fmtCost(m.cost),
         modelColor(m.provider, m.model));
     }
     tip.hidden = false;
@@ -2037,7 +2380,7 @@ function renderQuota(animate = false) {
 // Only the countdown moves between renders; recomputing the panel every
 // second for it would be wasteful.
 function tickQuotaClock() {
-  const live = quotaCache.rows.find((r) => r.active);
+  const live = quotaCache.liveQuotaRow(rows);
   if (state.settings.miniMode) {
     const kind = quotaCache.scope && quotaCache.scope.mode === 'period' ? 'week' : 'session';
     $('miniWhen').textContent = live
@@ -2083,8 +2426,8 @@ function claudeRows(l) {
   for (const [key, label] of [
     ['seven_day_opus', 'Weekly · Opus'],
     ['seven_day_sonnet', 'Weekly · Sonnet'],
-    ['seven_day_fable', 'Weekly · Fable 5'],
-    ['seven_day_fable_5', 'Weekly · Fable 5'],
+    ['seven_day_fable', 'Weekly · Fable'],
+    ['seven_day_fable_5', 'Weekly · Fable'],
   ]) {
     const v = d[key];
     const showAtZero = key.startsWith('seven_day_fable');
@@ -2095,14 +2438,14 @@ function claudeRows(l) {
   }
 
   // Newer account API payloads put model-specific quotas in a generic limits
-  // array instead of a named seven_day_* field. Fable currently arrives with
-  // display_name "Fable", while the product-facing model name is Fable 5.
+  // array instead of a named seven_day_* field. Fable arrives with the display
+  // name "Fable" (sometimes "Fable 5"); one meter covers every Fable release.
   for (const v of Array.isArray(d.limits) ? d.limits : []) {
     const displayName = v && v.scope && v.scope.model && v.scope.model.display_name;
-    if (v && v.kind === 'weekly_scoped' && /^fable(?:\s*5)?$/i.test(displayName || '')
-      && v.percent != null && !modelRows.has('Weekly · Fable 5')) {
-      rows.push({ name: 'Weekly · Fable 5', sub: () => fmtResetDay(v.resets_at), u: v.percent });
-      modelRows.add('Weekly · Fable 5');
+    if (v && v.kind === 'weekly_scoped' && /^fable(?:\s*5(?:\.\d+)?)?$/i.test(displayName || '')
+      && v.percent != null && !modelRows.has('Weekly · Fable')) {
+      rows.push({ name: 'Weekly · Fable', sub: () => fmtResetDay(v.resets_at), u: v.percent });
+      modelRows.add('Weekly · Fable');
     }
   }
   return rows;
@@ -2148,7 +2491,7 @@ function renderLimits() {
     head.className = 'limit-group-head';
     const badge = l.plan && l.plan.label
       ? `<span class="plan-badge ${provider}">${l.plan.label}</span>` : '';
-    head.innerHTML = `<span class="pdot" style="background:${PROVIDERS[provider].color}"></span>${PROVIDERS[provider].label}${badge}`;
+    head.innerHTML = `<span class="pdot" style="background:${pmeta(provider).color}"></span>${pmeta(provider).label}${badge}`;
     wrap.appendChild(head);
 
     if (!l.ok) {
@@ -2388,7 +2731,7 @@ function renderMini() {
   const scopes = quotaScopeList();
   const scope = activeQuotaScope(scopes);
   const rows = scope ? quotaRowsFor(scope) : [];
-  const live = rows.find((r) => r.active);
+  const live = liveQuotaRow(rows);
   const view = state.lastView;
 
   $('miniCost').innerHTML = moneyHTML(live ? live.totals.cost : 0);
@@ -2444,7 +2787,7 @@ function round(value, places = 4) {
 
 function topModelOf(totals) {
   const lead = [...totals.models.values()].sort((a, b) => b.cost - a.cost)[0];
-  return lead ? prettyModel(lead.provider, lead.model) : '';
+  return lead ? prettyModel(lead.provider, lead.model, lead.source) : '';
 }
 
 function currentQuotaContext() {
@@ -2489,7 +2832,7 @@ function buildViewCsv() {
     let row = byKey.get(key);
     if (!row) {
       row = {
-        date: b.date, provider: b.provider, model: b.model,
+        date: b.date, provider: b.provider, model: b.model, source: b.source,
         msgs: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0,
         cost: 0, unpricedCalls: 0,
       };
@@ -2510,7 +2853,7 @@ function buildViewCsv() {
   ]];
   for (const row of [...byKey.values()].sort((a, b) => a.date.localeCompare(b.date) || b.cost - a.cost)) {
     out.push([
-      row.date, row.provider, prettyModel(row.provider, row.model), row.msgs,
+      row.date, row.provider, prettyModel(row.provider, row.model, row.source), row.msgs,
       row.input, row.output, row.cacheRead, row.cacheWrite, row.reasoning,
       round(row.cost, 4), row.unpricedCalls,
     ]);
@@ -2555,7 +2898,7 @@ function buildViewJson() {
       today: { valueUsd: round(view.todayCost, 4) },
     },
     models: [...view.byModel.values()].sort((a, b) => b.cost - a.cost).map((m) => ({
-      provider: m.provider, model: m.model, name: prettyModel(m.provider, m.model),
+      provider: m.provider, model: m.model, name: prettyModel(m.provider, m.model, m.source),
       calls: m.pricedCalls + m.unpricedCalls, input: m.input, output: m.output,
       cacheRead: m.cacheRead, cacheWrite: m.cacheWrite, reasoning: m.reasoning,
       valueUsd: round(m.cost, 4), priced: !!m.priced,
@@ -2626,8 +2969,155 @@ function buildSummary() {
   return lines.join('\n');
 }
 
+/* ─── selected projects ───
+   Same numbers the expanded project row shows, written out for every ticked
+   project at once, one row or object per model. Project-level totals live in
+   the JSON export only. */
+
+function selectedProjectEntries() {
+  const view = state.lastView;
+  if (!view) return [];
+  return [...view.byProject.entries()]
+    .filter(([name, p]) => p.live && state.selectedProjects.has(name))
+    .sort((a, b) => b[1].cost - a[1].cost
+      || a[0].localeCompare(b[0], undefined, { sensitivity: 'base' }));
+}
+
+function projectRangeMeta() {
+  const [from, to] = rangeForPreset();
+  return {
+    range: state.preset,
+    from: state.preset === 'all' ? null : from,
+    to: state.preset === 'all' ? null : to,
+    selectedDay: state.selectedDay,
+    providers: [...state.selectedProviders],
+    models: [...state.selectedModels],
+  };
+}
+
+const PROJECT_CSV_HEADER = [
+  'project', 'provider', 'model', 'calls', 'priced_calls', 'unpriced_calls',
+  'input', 'output', 'reasoning_in_output', 'cache_read', 'cache_write', 'total_tokens',
+  'input_usd', 'output_usd', 'reasoning_usd', 'cache_read_usd', 'cache_write_usd',
+  'server_tools_usd', 'value_usd', 'value_lower_usd', 'value_upper_usd', 'estimated',
+];
+
+function projectCsvRow(name, provider, model, t) {
+  return [
+    name, provider, model,
+    t.msgs, t.pricedCalls, t.unpricedCalls,
+    t.input, t.output, t.reasoning || 0, t.cacheRead, t.cacheWrite,
+    t.input + t.output + t.cacheRead + t.cacheWrite,
+    round(t.cIn || 0, 4), round(t.cOut || 0, 4), round(t.cRs || 0, 4),
+    round(t.cCr || 0, 4), round(t.cCw || 0, 4), round(t.cTool || 0, 4),
+    round(t.cost, 4), round(t.costMin || 0, 4), round(t.costMax || t.cost, 4),
+    t.estimated ? 'yes' : 'no',
+  ];
+}
+
+function buildProjectsCsv() {
+  const entries = selectedProjectEntries();
+  if (!entries.length) return null;
+  const out = [PROJECT_CSV_HEADER];
+  for (const [name, p] of entries) {
+    const models = [...p.models.values()].sort((a, b) =>
+      b.cost - a.cost || a.model.localeCompare(b.model, undefined, { sensitivity: 'base' }));
+    for (const m of models) out.push(projectCsvRow(name, m.provider, m.model, m));
+  }
+  return toCsv(out);
+}
+
+function buildProjectsJson() {
+  const entries = selectedProjectEntries();
+  if (!entries.length) return null;
+  const tokens = (t) => ({
+    input: t.input,
+    output: t.output,
+    reasoning: t.reasoning || 0,
+    cacheRead: t.cacheRead,
+    cacheWrite: t.cacheWrite,
+    total: t.input + t.output + t.cacheRead + t.cacheWrite,
+  });
+  const costs = (t) => ({
+    inputUsd: round(t.cIn || 0, 4),
+    outputUsd: round(t.cOut || 0, 4),
+    reasoningUsd: round(t.cRs || 0, 4),
+    cacheReadUsd: round(t.cCr || 0, 4),
+    cacheWriteUsd: round(t.cCw || 0, 4),
+    serverToolsUsd: round(t.cTool || 0, 4),
+    valueUsd: round(t.cost, 4),
+    lowerBoundUsd: round(t.costMin || 0, 4),
+    upperBoundUsd: round(t.costMax || t.cost, 4),
+    estimated: !!t.estimated,
+  });
+  const calls = (t) => ({ total: t.msgs, priced: t.pricedCalls, unpriced: t.unpricedCalls });
+
+  return JSON.stringify({
+    generatedAt: new Date().toISOString(),
+    app: { name: 'Ember', version: APP_VERSION, note: 'API-equivalent value of subscription usage, not an invoice. Reasoning tokens are billed inside output and are already counted in it.' },
+    view: projectRangeMeta(),
+    selection: { projects: entries.map(([name]) => name) },
+    totals: (() => {
+      const sum = entries.reduce((acc, [, p]) => {
+        for (const k of ['cost', 'costMin', 'costMax', 'input', 'output', 'reasoning',
+          'cacheRead', 'cacheWrite', 'msgs', 'pricedCalls', 'unpricedCalls',
+          'cIn', 'cOut', 'cCr', 'cCw', 'cRs', 'cTool']) {
+          acc[k] = (acc[k] || 0) + (p[k] || 0);
+        }
+        acc.estimated = acc.estimated || !!p.estimated;
+        return acc;
+      }, {});
+      return { calls: calls(sum), tokens: tokens(sum), cost: costs(sum) };
+    })(),
+    projects: entries.map(([name, p]) => ({
+      name,
+      calls: calls(p),
+      tokens: tokens(p),
+      cost: costs(p),
+      models: [...p.models.values()]
+        .sort((a, b) => b.cost - a.cost || a.model.localeCompare(b.model, undefined, { sensitivity: 'base' }))
+        .map((m) => ({
+          provider: m.provider,
+          model: m.model,
+          name: prettyModel(m.provider, m.model, m.source),
+          priced: !!m.priced,
+          calls: calls(m),
+          tokens: tokens(m),
+          cost: costs(m),
+        })),
+    })),
+  }, null, 2);
+}
+
+function buildProjectsSummary() {
+  const entries = selectedProjectEntries();
+  if (!entries.length) return null;
+  const label = state.selectedDay ? prettyDay(state.selectedDay) : RANGE_LABELS[state.preset];
+  const lines = [];
+  lines.push(`**Ember — API-equivalent usage by project · ${label}**`);
+  lines.push('');
+  lines.push('| Project | Calls | Input | Output | Cache read | Cache write | Value |');
+  lines.push('|---|---:|---:|---:|---:|---:|---:|');
+  const sum = { msgs: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, unpricedCalls: 0 };
+  for (const [name, p] of entries) {
+    lines.push(`| ${name} | ${p.msgs.toLocaleString()} | ${fmtTok(p.input)} | ${fmtTok(p.output)} | ${fmtTok(p.cacheRead)} | ${fmtTok(p.cacheWrite)} | ${p.estimated ? '≈' : ''}${fmtCost(p.cost)} |`);
+    for (const k of Object.keys(sum)) sum[k] += p[k] || 0;
+  }
+  lines.push(`| **Total (${entries.length})** | ${sum.msgs.toLocaleString()} | ${fmtTok(sum.input)} | ${fmtTok(sum.output)} | ${fmtTok(sum.cacheRead)} | ${fmtTok(sum.cacheWrite)} | **${fmtCost(sum.cost)}** |`);
+  if (sum.unpricedCalls) {
+    lines.push('');
+    lines.push(`_${sum.unpricedCalls.toLocaleString()} calls have no published official price and are excluded from the value._`);
+  }
+  lines.push('');
+  lines.push(`_Ember ${APP_VERSION} · reconstructed from local Claude Code and Codex logs at official API rates. Not a provider invoice._`);
+  return lines.join('\n');
+}
+
 const EXPORTS = {
   summary: { kind: 'copy', build: buildSummary, done: 'Summary copied to the clipboard' },
+  'projects-csv': { kind: 'file', format: 'csv', name: 'ember-projects', build: buildProjectsCsv },
+  'projects-json': { kind: 'file', format: 'json', name: 'ember-projects', build: buildProjectsJson },
+  'projects-summary': { kind: 'copy', build: buildProjectsSummary, done: 'Selected projects copied to the clipboard' },
   'windows-csv': { kind: 'file', format: 'csv', name: 'ember-session-windows', build: buildWindowsCsv },
   'view-csv': { kind: 'file', format: 'csv', name: 'ember-usage', build: buildViewCsv },
   'view-json': { kind: 'file', format: 'json', name: 'ember-usage', build: buildViewJson },
