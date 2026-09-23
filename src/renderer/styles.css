@@ -503,7 +503,6 @@ input:focus-visible,
 
 .hero {
   position: relative;
-  flex: 0 0 auto;
   display: grid;
   grid-template-columns: minmax(0, 1fr) 7.6rem;
   align-items: center;
@@ -691,9 +690,6 @@ input:focus-visible,
 /* ═══════════════════ plan headroom ═══════════════════ */
 
 .limits {
-  flex: 0 0 auto;
-  max-height: 22rem;
-  overflow-y: auto;
   padding: 1.1rem var(--gutter-r) 1.2rem var(--gutter);
   border-bottom: 1px solid var(--line-soft);
   border-image: var(--rule) 1;
@@ -754,17 +750,19 @@ input:focus-visible,
 /* ═══════════════════ rolling windows ═══════════════════ */
 
 .windows {
-  flex: 0 0 auto;
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
+/* Label, reading, detail — stacked. Side by side, the figure took the right
+   edge of a third of the window and the detail line was left a sliver to
+   ellipsize into, so "28.16M tokens · 41 calls" read as "28.16M tokens ·…". */
 .window-metric {
   position: relative;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: .15rem .6rem;
+  display: flex;
+  flex-direction: column;
+  gap: .2rem;
   min-width: 0;
-  padding: 1rem 1.2rem .95rem var(--gutter);
+  padding: 1rem 1rem 1rem var(--gutter);
 }
 .window-metric + .window-metric { padding-left: 1.3rem; }
 /* Inset and fading at both ends: a divider between two readings, not a wall
@@ -784,36 +782,45 @@ input:focus-visible,
   font-size: .85rem;
   letter-spacing: .06em;
   text-transform: uppercase;
+  white-space: nowrap;
 }
 .window-metric strong {
-  grid-row: span 2;
-  align-self: center;
   font-family: var(--font-data);
-  font-size: 1.5rem;
+  font-size: 1.85rem;
   font-weight: 600;
+  line-height: 1.15;
+  letter-spacing: -.01em;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
-.window-metric strong .cur { margin-right: 1px; color: var(--ember); font-size: .7em; }
-.window-metric strong .dec { color: var(--muted); font-size: .76em; }
+.window-metric strong .cur { position: relative; top: -.32em; margin-right: 1px; color: var(--ember); font-size: .6em; }
+.window-metric strong .dec { color: var(--muted); font-size: .7em; }
 .window-metric small {
-  overflow: hidden;
+  white-space: pre-line;
   color: var(--faint);
   font-family: var(--font-mono);
   font-size: .82rem;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.35;
+  font-variant-numeric: tabular-nums;
 }
 
 /* ═══════════════════ filters ═══════════════════ */
 
 .filters {
-  flex: 0 0 auto;
+  position: sticky;
+  top: 0;
+  z-index: 6;
   padding: .85rem var(--gutter-r) .8rem var(--gutter);
   background: var(--surface);
   /* The surface step is the edge; a hairline along its top just makes the
      step legible as deliberate. */
   box-shadow: inset 0 1px 0 var(--hairline);
+  transition: box-shadow var(--med) linear;
+}
+/* Once it has caught on the titlebar, the bar is floating over the panels
+   scrolling beneath it, and says so with a drop edge instead of a top one. */
+.filters.is-stuck {
+  box-shadow: inset 0 -1px 0 var(--line-soft), 0 10px 18px -12px rgba(0, 0, 0, .7);
 }
 .chip-row { position: relative; display: flex; align-items: center; gap: 3px; }
 .date-chips {
@@ -898,8 +905,14 @@ input:focus-visible,
 .chip.apply:disabled { border-color: var(--line); color: var(--faint); background: transparent; cursor: not-allowed; opacity: .58; }
 .range-error { width: 100%; margin: .6rem 0 0; color: var(--red); font-size: 1rem; line-height: 1.35; }
 
-.filter-scroller { overflow-x: auto; scrollbar-width: none; }
+.filter-scroller { overflow-x: auto; scrollbar-width: none; --fade-s: 0rem; --fade-e: 0rem; }
 .filter-scroller::-webkit-scrollbar { display: none; }
+.filter-scroller.fade-start { --fade-s: 2.4rem; }
+.filter-scroller.fade-end { --fade-e: 3.2rem; }
+.filter-scroller:is(.fade-start, .fade-end) {
+  -webkit-mask-image: linear-gradient(90deg, transparent, #000 var(--fade-s), #000 calc(100% - var(--fade-e)), transparent);
+  mask-image: linear-gradient(90deg, transparent, #000 var(--fade-s), #000 calc(100% - var(--fade-e)), transparent);
+}
 .chip-row.models { width: max-content; min-width: 100%; margin-top: .55rem; gap: .4rem; }
 .model-chip {
   display: inline-flex;
@@ -933,16 +946,19 @@ input:focus-visible,
 /* ═══════════════════ panels ═══════════════════ */
 
 .scroll-area {
+  position: relative;
   flex: 1 1 auto;
   min-height: 0;
   overflow-x: hidden;
   overflow-y: auto;
-  padding: 1rem var(--card-inset) 1.3rem;
+  overscroll-behavior: contain;
   scrollbar-color: var(--line) transparent;
   scrollbar-width: thin;
 }
-.scroll-area::-webkit-scrollbar, .limits::-webkit-scrollbar { width: 6px; }
-.scroll-area::-webkit-scrollbar-thumb, .limits::-webkit-scrollbar-thumb { border-radius: 6px; background: var(--line); }
+.scroll-area:focus-visible { outline: none; }
+.scroll-area::-webkit-scrollbar { width: 6px; }
+.scroll-area::-webkit-scrollbar-thumb { border-radius: 6px; background: var(--line); }
+.panels { padding: 1rem var(--card-inset) 1.3rem; }
 
 .panel {
   contain: layout;
@@ -958,7 +974,7 @@ input:focus-visible,
      of slightly different paint. */
   box-shadow: var(--shadow-panel), inset 0 1px 0 var(--hairline);
 }
-.scroll-area > :last-child { margin-bottom: 0; }
+.panels > :last-child { margin-bottom: 0; }
 
 .panel-head { display: flex; align-items: baseline; gap: 1rem; margin-bottom: 1.1rem; }
 .panel-head::before {
@@ -1060,10 +1076,14 @@ input:focus-visible,
 /* ═══════════════════ models table ═══════════════════ */
 
 .table-scroll { overflow-x: auto; }
-/* The floor is what the six columns genuinely need, not a round number: set
-   too high it forced a scroll in an ordinary window, and a horizontally
-   scrolled table hides its rightmost column — here, the cost. */
-.model-table { width: 100%; min-width: 33rem; border-collapse: collapse; font-size: 1rem; font-variant-numeric: tabular-nums; }
+/* Fixed layout: the four token columns and the cost get the widths their
+   figures need, and the model name takes whatever is left and ellipsizes.
+   Sized by content instead, one long gateway name ("GLM-5.3 Flash ·
+   OpenRouter (z-ai …)") widened the first column until the cost — the one
+   number this panel is for — was scrolled off the right edge. */
+.model-table { width: 100%; table-layout: fixed; border-collapse: collapse; font-size: 1rem; font-variant-numeric: tabular-nums; }
+.model-table col.c-tok { width: 5.2rem; }
+.model-table col.c-cost { width: 6.6rem; }
 .model-table th {
   padding: 0 .6rem .8rem;
   color: var(--faint);
@@ -1074,7 +1094,7 @@ input:focus-visible,
   text-transform: uppercase;
   letter-spacing: .07em;
 }
-.model-table th:first-child, .model-table td:first-child { padding-left: 0; text-align: left; width: 100%; }
+.model-table th:first-child, .model-table td:first-child { overflow: hidden; padding-left: 0; text-align: left; }
 .model-table th:last-child, .model-table td:last-child { padding-right: 0; }
 .model-table td { padding: .8rem .45rem; border-top: 1px solid var(--line-soft); color: var(--muted); font-family: var(--font-mono); text-align: right; }
 /* A measurement that breaks across two lines has been misread, not wrapped:
@@ -1092,7 +1112,7 @@ input:focus-visible,
    compositing layer per row and is the most expensive thing a table can do. */
 .model-filter-row.is-filtered-out td { opacity: .3; }
 .model-filter-row.is-filtered-out:hover td { opacity: .5; }
-.mname { display: inline-flex; align-items: center; gap: .6rem; max-width: 18rem; color: var(--text-2); font-family: var(--font-ui); font-weight: 600; }
+.mname { display: flex; align-items: center; gap: .6rem; min-width: 0; max-width: 100%; color: var(--text-2); font-family: var(--font-ui); font-weight: 600; }
 .mname .swatch { width: .65rem; height: .65rem; }
 .mname .model-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cost-est { color: var(--amber); }
@@ -1324,6 +1344,11 @@ body.mini .app { border-radius: 10px; }
   box-shadow: var(--shadow-pop);
 }
 .settings-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 1.2rem; margin-bottom: 1.2rem; }
+/* Sits inside the kicker so the engraved rule runs on past it; the version is
+   the first thing a bug report needs and was previously nowhere on screen. */
+.settings-version { margin-left: -.55rem; color: var(--faint); letter-spacing: .04em; text-transform: none; }
+.settings-version:empty { display: none; }
+.settings-version::before { content: "· "; }
 .settings-head h2 { margin: .3rem 0 0; font-family: var(--font-display); font-size: 1.9rem; letter-spacing: -.02em; }
 .setting-row { display: flex; align-items: center; justify-content: space-between; gap: 1.5rem; min-height: 5.2rem; border-top: 1px solid var(--line-soft); cursor: pointer; }
 .setting-row > span { display: grid; gap: .2rem; }
@@ -1363,7 +1388,12 @@ body.mini .app { border-radius: 10px; }
 .theme-row > span { display: grid; gap: .2rem; margin-bottom: .9rem; }
 .theme-row strong { color: var(--text-2); font-size: 1.2rem; font-weight: 600; }
 .theme-row small { color: var(--faint); font-size: 1rem; }
-.theme-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr)); gap: .6rem; }
+/* Ember's own two palettes on the first row, the three borrowed editor
+   schemes on the second — the grouping is the order theme.js lists them in,
+   and it replaces an auto-fit grid that left Rosé Pine stranded alone. */
+.theme-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: .6rem; }
+.theme-grid > * { grid-column: span 2; }
+.theme-grid > :nth-child(-n + 2) { grid-column: span 3; }
 .theme-swatch {
   display: grid;
   gap: .55rem;
@@ -1387,6 +1417,36 @@ body.mini .app { border-radius: 10px; }
 .accuracy-note p, .pricing-status { margin: .6rem 0 0; color: var(--muted); font-size: 1rem; line-height: 1.5; }
 .pricing-status { padding-top: 1rem; border-top: 1px solid var(--line-soft); }
 
+/* ═══════════════════ first paint ═══════════════════
+   Until the first usage payload lands (app.js sets body[data-ready]), every
+   reading is a placeholder slab rather than a zero. "$0.00" and "0 tokens"
+   are real, plausible readings — shown during a cold parse they claim the
+   ledger is empty, which is the one thing it certainly is not. Only opacity
+   pulses, so the wait costs a composite per frame and nothing else. */
+
+body:not([data-ready]) :is(.hero-cost, .hero-sub, .window-metric strong, .window-metric small, .pet b) {
+  width: var(--skel-w, 6rem);
+  max-width: 100%;
+  border-radius: .45rem;
+  background: var(--surface-3);
+  color: transparent;
+  animation: skel 1.1s ease-in-out infinite alternate;
+}
+body:not([data-ready]) :is(.hero-cost, .hero-sub, .window-metric strong, .window-metric small) * { visibility: hidden; }
+body:not([data-ready]) .hero-cost { --skel-w: 14rem; min-height: 0; height: 4.6rem; margin-top: .8rem; }
+body:not([data-ready]) .hero-sub { --skel-w: 16rem; height: 1.2rem; }
+body:not([data-ready]) .window-metric strong { --skel-w: 6.5rem; height: 1.8rem; }
+body:not([data-ready]) .window-metric small { --skel-w: 9rem; height: .9rem; animation-delay: .15s; }
+body:not([data-ready]) .pet b { --skel-w: 3.4rem; }
+body:not([data-ready]) .panel::after {
+  content: "";
+  display: block;
+  height: 9rem;
+  border-radius: .8rem;
+  background: var(--surface-2);
+  animation: skel 1.1s ease-in-out infinite alternate;
+}
+
 /* ═══════════════════ motion ═══════════════════ */
 
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -1397,6 +1457,7 @@ body.mini .app { border-radius: 10px; }
 }
 @keyframes flameJump { 0%, 100% { transform: translateY(0) scale(1); } 42% { transform: translateY(-7px) scale(.96, 1.05); } }
 @keyframes flamePulse { from { transform: scale(.98); } to { transform: scale(1.04); } }
+@keyframes skel { from { opacity: .45; } to { opacity: 1; } }
 
 @media (max-width: 420px) {
   /* The rail moves in and everything that sits on it follows; the only
@@ -1410,12 +1471,16 @@ body.mini .app { border-radius: 10px; }
   .custom-chip span { display: none; }
   .range-pair { flex-basis: 100%; }
   .range-end-mode { flex: 1 1 auto; }
-  .scroll-area { padding-top: .9rem; padding-bottom: 1.2rem; }
+  .panels { padding-top: .9rem; padding-bottom: 1.2rem; }
   .window-metric { padding-right: .8rem; }
   .window-metric + .window-metric { padding-left: 1rem; }
   .window-metric > span { font-size: .78rem; letter-spacing: .03em; }
   .hero-delta { display: none; }
   .proj-trow { grid-template-columns: minmax(0, 1fr) 6.4rem 6.4rem; }
+  /* Cache writes are the least-read figure in the table; below this width
+     they cost the model name its last few legible characters. */
+  .model-table col.c-write { width: 0; }
+  .model-table :is(th, td):nth-child(5) { padding: 0; font-size: 0; }
 }
 
 @media (max-height: 700px) {
@@ -1426,7 +1491,7 @@ body.mini .app { border-radius: 10px; }
   .pricing-confidence { margin-top: .7rem; }
   .pet { width: 5.8rem; padding-top: .1rem; }
   .pet-logo { width: 4rem; height: 4rem; }
-  .limits { max-height: 12.5rem; padding-top: .8rem; padding-bottom: .8rem; }
+  .limits { padding-top: .8rem; padding-bottom: .8rem; }
   .limits > .section-kicker { margin-bottom: .5rem; }
   .limit-group-head { margin-top: .4rem; }
   .limit-row { min-height: 2.3rem; }

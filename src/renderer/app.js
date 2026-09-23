@@ -707,9 +707,11 @@ function render({ animate = false } = {}) {
     }
   }
   updateValue($('w5hCost'), w5.cost, paintMoney, animate);
-  $('w5hTok').textContent = w5.msgs ? `${fmtTok(w5.tok)} tokens · ${w5.msgs.toLocaleString()} calls` : 'no activity';
+  // Two lines, broken on purpose (the cell is white-space: pre-line): left to
+  // wrap on its own, a third of the window orphans the word "calls".
+  $('w5hTok').textContent = w5.msgs ? `${fmtTok(w5.tok)} tokens\n${w5.msgs.toLocaleString()} calls` : 'no activity';
   updateValue($('wkCost'), wk.cost, paintMoney, animate);
-  $('wkTok').textContent = wk.msgs ? `${fmtTok(wk.tok)} tokens · ${wk.msgs.toLocaleString()} calls` : 'no activity';
+  $('wkTok').textContent = wk.msgs ? `${fmtTok(wk.tok)} tokens\n${wk.msgs.toLocaleString()} calls` : 'no activity';
   renderMonthProjection(animate);
 
   // hero: only officially priced usage contributes to the number. Unknown
@@ -733,6 +735,7 @@ function render({ animate = false } = {}) {
   if (sectionRenderKeys.models !== modelsKey) {
     renderModelChips();
     sectionRenderKeys.models = modelsKey;
+    syncScrollerFades();
   }
 
   const hiddenKey = setKey(state.hiddenProjects);
@@ -869,7 +872,7 @@ function renderMonthProjection(animate) {
   // breakfast does not read the morning as a whole day of work.
   const elapsed = now.getDate() - 1 + (now.getHours() * 60 + now.getMinutes()) / 1440;
   const projected = elapsed > 0.2 ? (cost / elapsed) * daysInMonth : null;
-  el.textContent = projected ? `≈${fmtCost(projected)} by month end` : `${calls.toLocaleString()} calls`;
+  el.textContent = projected ? `≈${fmtCost(projected)}\nby month end` : `${calls.toLocaleString()} calls`;
   el.title = projected
     ? `At the pace set over the first ${elapsed.toFixed(1)} days of the month`
     : '';
@@ -2624,6 +2627,25 @@ function avatarMood(worstUtilization) {
   document.documentElement.style.setProperty('--heat', heat.toFixed(3));
 }
 
+/* ───────────────────────── scroll affordances ───────────────────────── */
+
+// A chip row that runs past the edge fades on that side, so a clipped
+// "Sonnet" reads as "there is more this way" rather than as a rendering bug.
+function syncScrollerFades() {
+  for (const el of document.querySelectorAll('.filter-scroller')) {
+    const max = el.scrollWidth - el.clientWidth;
+    el.classList.toggle('fade-start', max > 1 && el.scrollLeft > 1);
+    el.classList.toggle('fade-end', max > 1 && el.scrollLeft < max - 1);
+  }
+}
+
+// The filter bar is sticky; once it has caught on the titlebar it floats over
+// the panels scrolling beneath it and gets a drop edge to say so.
+function syncStuckFilters() {
+  const filters = $('filters');
+  filters.classList.toggle('is-stuck', $('scrollArea').scrollTop > filters.offsetTop - 1);
+}
+
 /* ───────────────────────── segmented control thumb ───────────────────────── */
 
 function moveSegThumb() {
@@ -3346,8 +3368,15 @@ function setupEvents() {
       if (state.lastByDay) renderChart(state.lastByDay);
       if (quotaGeom) renderQuotaChart(quotaCache.rows, quotaGeom.scope, quotaGeom.metric, -1);
       moveSegThumb();
+      syncScrollerFades();
+      syncStuckFilters();
     });
   });
+
+  $('scrollArea').addEventListener('scroll', syncStuckFilters, { passive: true });
+  for (const el of document.querySelectorAll('.filter-scroller')) {
+    el.addEventListener('scroll', syncScrollerFades, { passive: true });
+  }
 
   // position the thumb once layout and webfonts have settled
   moveSegThumb();
@@ -3374,6 +3403,7 @@ async function init() {
 
   state.settings = await window.api.getSettings();
   APP_VERSION = await window.api.getVersion();
+  $('settingsVersion').textContent = APP_VERSION ? `v${APP_VERSION}` : '';
   updatePinButton();
   applyMiniMode();
 
