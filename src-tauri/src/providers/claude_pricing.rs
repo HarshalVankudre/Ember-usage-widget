@@ -39,15 +39,19 @@ const PRICING_RULES: &[PriceRule] = &[
     PriceRule { test: r"opus", rates: rates(15.0, 18.75, 30.0, 1.5, 75.0), family: "opus" },
     // Sonnet 5 launched at $2 / $10 as an introductory rate; the official
     // table now lists that as the standing price.
+    // Sonnet 5.5 reads cache at 0.05x input, like Opus 5.5.
+    PriceRule { test: r"^sonnet-5-5$", rates: rates(2.0, 2.5, 4.0, 0.1, 10.0), family: "sonnet" },
     PriceRule { test: r"sonnet-5", rates: rates(2.0, 2.5, 4.0, 0.2, 10.0), family: "sonnet" },
     PriceRule { test: r"sonnet", rates: rates(3.0, 3.75, 6.0, 0.3, 15.0), family: "sonnet" },
+    // Haiku 5.5's short-prompt rates; see bundled_long_rates for the rest.
+    PriceRule { test: r"^haiku-5-5$", rates: rates(0.1, 0.125, 0.2, 0.01, 0.5), family: "haiku" },
     PriceRule { test: r"haiku-4", rates: rates(1.0, 1.25, 2.0, 0.1, 5.0), family: "haiku" },
     PriceRule { test: r"(?:3-5-haiku|haiku-3-5)", rates: rates(0.8, 1.0, 1.6, 0.08, 4.0), family: "haiku" },
     PriceRule { test: r"haiku", rates: rates(0.25, 0.3, 0.5, 0.03, 1.25), family: "haiku" },
 ];
 
 /// One row of the live official table (also the on-disk cache shape).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LivePrice {
     pub input: f64,
@@ -62,6 +66,21 @@ pub struct LivePrice {
     pub fast_input: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fast_output: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub long_context: Option<LongTier>,
+}
+
+/// Rates for a request whose prompt (input plus every cache read and write)
+/// is over `threshold` tokens. The whole request pays them, cache hits too.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LongTier {
+    pub threshold: f64,
+    pub input: f64,
+    pub cache_w5m: f64,
+    pub cache_w1h: f64,
+    pub cache_read: f64,
+    pub output: f64,
 }
 
 static LIVE_PRICES: RwLock<Option<HashMap<String, LivePrice>>> = RwLock::new(None);
@@ -152,6 +171,8 @@ pub struct ResolvedPrice {
     pub family: String,
     pub source: &'static str,
     pub fast: Option<(f64, f64)>,
+    /// (prompt-token threshold, rates above it)
+    pub long: Option<(f64, RateSet)>,
 }
 
 fn from_row(row: &LivePrice, bundled: Option<&PriceRule>, canonical: &str, source: &'static str) -> ResolvedPrice {
@@ -163,11 +184,16 @@ fn from_row(row: &LivePrice, bundled: Option<&PriceRule>, canonical: &str, sourc
         (Some(i), Some(o)) => Some((i, o)),
         _ => bundled_fast_rates(canonical),
     };
+    let long = match row.long_context {
+        Some(t) => Some((t.threshold, rates(t.input, t.cache_w5m, t.cache_w1h, t.cache_read, t.output))),
+        None => bundled_long_rates(canonical),
+    };
     ResolvedPrice {
         rates: rates(row.input, row.cache_w5m, row.cache_w1h, row.cache_read, row.output),
         family,
         source,
         fast,
+        long,
     }
 }
 
@@ -202,6 +228,7 @@ pub fn price_for(model: &str, usage_date: Option<&str>) -> Option<ResolvedPrice>
         family: bundled.family.to_string(),
         source: "Anthropic pricing (bundled)",
         fast: bundled_fast_rates(&canonical),
+        long: bundled_long_rates(&canonical),
     })
 }
 
@@ -214,7 +241,7 @@ fn claude_family(canonical: &str) -> bool {
 fn supports_us_geo(model: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
-        Regex::new(r"^(?:fable-5(?:-\d+)?|mythos-5(?:-\d+)?|opus-5(?:-\d+)?|opus-4-[6-9]|sonnet-5(?:-\d+)?|sonnet-4-[6-9])$").unwrap()
+        Regex::new(r"^(?:fable-5(?:-\d+)?|mythos-5(?:-\d+)?|opus-5(?:-\d+)?|opus-4-[6-9]|sonnet-5(?:-\d+)?|sonnet-4-[6-9]|haiku-5(?:-\d+)?)$").unwrap()
     });
     re.is_match(&canonical_model(model))
 }
@@ -224,6 +251,15 @@ fn bundled_fast_rates(canonical: &str) -> Option<(f64, f64)> {
         "opus-5-5" => Some((8.0, 40.0)),
         "opus-5" | "opus-4-8" => Some((10.0, 50.0)),
         "opus-4-7" => Some((30.0, 150.0)),
+        _ => None,
+    }
+}
+
+/// Haiku 5.5 is the one model priced by prompt length; the rest carry the
+/// full context window at standard rates.
+fn bundled_long_rates(canonical: &str) -> Option<(f64, RateSet)> {
+    match canonical {
+        "haiku-5-5" => Some((100_000.0, rates(0.5, 0.625, 1.0, 0.05, 2.5))),
         _ => None,
     }
 }
@@ -256,6 +292,7 @@ pub struct ClaudeCost {
     pub estimated: bool,
     pub fast: bool,
     pub us_region: bool,
+    pub long_context: bool,
     pub source: String,
 }
 
@@ -268,6 +305,17 @@ pub fn cost_of(model: &str, usage: &ClaudeUsage) -> ClaudeCost {
         };
     };
     let mut p = resolved.rates;
+    let nn = |v: f64| v.max(0.0);
+
+    // Each request is priced on its own prompt length, cache hits included.
+    let prompt = nn(usage.input) + nn(usage.cache_read) + nn(usage.cache_w5m) + nn(usage.cache_w1h);
+    let mut long_context = false;
+    if let Some((threshold, long)) = resolved.long {
+        if prompt > threshold {
+            p = long;
+            long_context = true;
+        }
+    }
 
     let speed = usage.speed.to_lowercase();
     let mut fast = false;
@@ -285,8 +333,7 @@ pub fn cost_of(model: &str, usage: &ClaudeUsage) -> ClaudeCost {
     let geo = usage.inference_geo.to_lowercase();
     let geo_multiplier = if geo == "us" && supports_us_geo(model) { 1.1 } else { 1.0 };
     const M: f64 = 1e6;
-    let nn = |v: f64| v.max(0.0);
-    let input = (nn(usage.input) / M) * p.input * geo_multiplier;
+    let input =(nn(usage.input) / M) * p.input * geo_multiplier;
     let output = (nn(usage.output) / M) * p.output * geo_multiplier;
     let cache_read = (nn(usage.cache_read) / M) * p.cache_read * geo_multiplier;
     let cache_write = (nn(usage.cache_w5m) / M) * p.cache_w5m * geo_multiplier
@@ -309,6 +356,7 @@ pub fn cost_of(model: &str, usage: &ClaudeUsage) -> ClaudeCost {
         estimated: false,
         fast,
         us_region: geo_multiplier > 1.0,
+        long_context,
         source: resolved.source.to_string(),
     }
 }
@@ -389,6 +437,38 @@ mod tests {
     }
 
     #[test]
+    fn sonnet_5_5_reads_cache_at_a_twentieth() {
+        assert_eq!(canonical_model("claude-sonnet-5-5"), "sonnet-5-5");
+        let p = price_for("claude-sonnet-5-5", None).unwrap();
+        assert_eq!(p.rates, rates(2.0, 2.5, 4.0, 0.1, 10.0));
+        assert_eq!(p.family, "sonnet");
+        assert_eq!(price_for("claude-sonnet-5", None).unwrap().rates.cache_read, 0.2);
+    }
+
+    #[test]
+    fn haiku_5_5_reprices_the_whole_request_past_100k_prompt_tokens() {
+        let p = price_for("claude-haiku-5-5", None).unwrap();
+        assert_eq!(p.rates, rates(0.1, 0.125, 0.2, 0.01, 0.5));
+        assert_eq!(p.family, "haiku");
+
+        let at = cost_of("claude-haiku-5-5", &ClaudeUsage {
+            input: 10_000.0, cache_read: 90_000.0, output: 1_000_000.0,
+            ..Default::default()
+        });
+        assert!(!at.long_context);
+        close(at.total, 0.001 + 0.0009 + 0.5);
+
+        // Cache hits count toward the prompt length and pay the higher rate too.
+        let over = cost_of("claude-haiku-5-5", &ClaudeUsage {
+            input: 10_001.0, cache_read: 90_000.0, output: 1_000_000.0, inference_geo: "us",
+            ..Default::default()
+        });
+        assert!(over.long_context);
+        assert!(over.us_region);
+        close(over.total, (10_001.0 * 0.5 / 1e6 + 0.0045 + 2.5) * 1.1);
+    }
+
+    #[test]
     fn unknown_models_stay_unpriced() {
         let c = cost_of("mistral-large", &ClaudeUsage { input: 1e6, ..Default::default() });
         assert!(!c.known);
@@ -427,14 +507,14 @@ mod tests {
     fn a_live_row_is_only_used_when_it_matches_exactly() {
         set_live_prices(HashMap::from([(
             "sonnet-5@standard".to_string(),
-            LivePrice { input: 3.0, cache_w5m: 3.75, cache_w1h: 6.0, cache_read: 0.3, output: 15.0, family: None, fast_input: None, fast_output: None },
+            LivePrice { input: 3.0, cache_w5m: 3.75, cache_w1h: 6.0, cache_read: 0.3, output: 15.0, ..Default::default() },
         )]));
         let p = price_for("claude-sonnet-5", Some("2026-09-02")).unwrap();
         assert_eq!(p.rates.input, 2.0);
         assert_eq!(p.source, "Anthropic pricing (bundled)");
         set_live_prices(HashMap::from([(
             "sonnet-5".to_string(),
-            LivePrice { input: 2.0, cache_w5m: 2.5, cache_w1h: 4.0, cache_read: 0.2, output: 10.0, family: None, fast_input: None, fast_output: None },
+            LivePrice { input: 2.0, cache_w5m: 2.5, cache_w1h: 4.0, cache_read: 0.2, output: 10.0, ..Default::default() },
         )]));
         assert_eq!(price_for("claude-sonnet-5", None).unwrap().source, "Anthropic pricing (live)");
     }
@@ -443,7 +523,7 @@ mod tests {
     fn an_override_beats_live_and_bundled() {
         set_overrides(HashMap::from([(
             "claude-haiku-4-5".to_string(),
-            LivePrice { input: 9.0, cache_w5m: 9.0, cache_w1h: 9.0, cache_read: 9.0, output: 9.0, family: None, fast_input: None, fast_output: None },
+            LivePrice { input: 9.0, cache_w5m: 9.0, cache_w1h: 9.0, cache_read: 9.0, output: 9.0, ..Default::default() },
         )]));
         let p = price_for("claude-haiku-4-5-20251001", None).unwrap();
         assert_eq!(p.rates.input, 9.0);

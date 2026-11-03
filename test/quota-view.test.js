@@ -272,6 +272,30 @@ test('a neighbouring window never lends its percentage to a block it only half c
   assert.equal(block.rate, null);
 });
 
+test('a meter restarted mid-week measures the week from the restart only', () => {
+  const reset = at('2026-10-03', 6, 0);
+  const restart = at('2026-09-30', 21, 34);
+  const rows = Q.timeline([
+    bucket('2026-09-28', 10, 0, { cost: 30 }),  // before the plan change
+    bucket('2026-09-30', 22, 0, { cost: 2 }),
+  ], 'claude');
+  const now = at('2026-10-01', 2, 0);
+  const meter = {
+    provider: 'claude',
+    current: { startedAt: restart, resetsAt: reset, peakUtil: 4, restarted: true },
+    history: [],
+  };
+  const windows = Q.quotaWindows(null, meter, { rows, now });
+  const periods = Q.fixedPeriods(null, { rows, periodMs: 7 * 24 * HOUR, anchorMs: reset, now });
+  Q.attachObserved(periods, windows, { rows, now });
+
+  const live = periods[periods.length - 1];
+  assert.equal(live.percent, 4);
+  assert.equal(live.startedAt, restart);
+  assert.equal(live.totals.cost, 2, 'usage before the restart is not divided by the new percent');
+  assert.equal(live.rate.costPerPct, 2 / 4);
+});
+
 test('an exactly matching window supplies both the percentage and the rate', () => {
   const window = { startedAt: at('2026-07-25', 1, 0), endsAt: at('2026-07-25', 6, 0), percent: 20 };
   const rows = Q.timeline([bucket('2026-07-25', 1, 0, { cost: 4 })], 'claude');

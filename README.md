@@ -46,6 +46,7 @@ Ember turns those invisible meters into one calm, always-available desktop view.
 - **Provider and model filters** for instant isolation of any slice
 - **Interactive burn history** with daily drill-downs and custom date-and-time ranges
 - **Model and project breakdowns** with screen-share privacy controls
+- **Agent working time per project and model**: every finished Claude Code and Codex turn, from the prompt to the agent's final reply
 - **Compact mode**, tray residency, always-on-top, autostart, and Windows 11 acrylic
 - **Export** to CSV or JSON, and a copy-ready Markdown summary
 
@@ -141,6 +142,8 @@ plan meters ──────► quota ledger (every window Ember watched)─�
 | Updates | Debounced filesystem watcher plus periodic reconciliation | Debounced filesystem watcher plus periodic reconciliation |
 
 A write to a log reaches the screen in about a tenth of a second, and reconciliation sweeps every few seconds behind it. An unchanged sweep costs a parallel `stat` pass rather than a full re-price, so the cadence stays cheap. When new usage lands, Ember schedules one catch-up read of the plan meters so headroom tracks the burn without hammering an endpoint that rate-limits hard.
+
+Working time is recorded per turn. For Claude Code, a turn runs from the prompt to the final reply; Claude Code's own `turn_duration` is used whenever the log has one. For Codex, a turn runs from `task_started` to `task_complete`. Each turn counts toward the project, model and day it finished on, so per-model times add up to the project's total. Subagent work is already inside the turn that called it. A turn that's still running adds nothing until it finishes. A session closed mid-turn counts up to its last call once its log has been quiet for 30 minutes. Oh My Pi, OpenCode and ZCode record requests but not turns, so they add no time.
 
 Parsed records live in Ember's own local cache, so cleaning up old session logs does not erase your history. Projects whose source logs are gone stay out of the project list, and visible projects can be blurred and excluded from totals before a screen share.
 

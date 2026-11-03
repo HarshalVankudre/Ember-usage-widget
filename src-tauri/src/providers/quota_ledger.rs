@@ -24,6 +24,9 @@ const MAX_INSTANCES: usize = 260; // per meter — roughly two months of session
 const MAX_SAMPLES: usize = 90; // per instance, after thinning
 const SAMPLE_MIN_GAP_MS: f64 = 60.0 * 1000.0;
 const RESET_MATCH_TOLERANCE_MS: f64 = 90.0 * 1000.0;
+// A reading this far below the previous one is not noise: the provider
+// restarted the meter (a plan change does this) without moving the reset.
+const RESTART_DROP: f64 = 5.0;
 
 // Anthropic publishes these window lengths; the meters themselves do not carry
 // them. Codex reports its own window length in the rollout snapshot.
@@ -44,6 +47,8 @@ pub struct Instance {
     pub samples: Vec<(f64, f64)>,
     pub closed: bool,
     pub ended_at: Option<f64>,
+    /// The provider zeroed the meter mid-window; `started_at` is that moment.
+    pub restarted: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -113,6 +118,7 @@ fn instance_from_value(v: &Value) -> Option<Instance> {
         samples,
         closed: v.get("closed").and_then(|b| b.as_bool()).unwrap_or(false),
         ended_at: get_f64(v, "endedAt"),
+        restarted: v.get("restarted").and_then(|b| b.as_bool()).unwrap_or(false),
     })
 }
 
@@ -130,6 +136,7 @@ fn instance_to_value(i: &Instance) -> Value {
         "joinedLate": i.joined_late,
         "samples": samples,
         "closed": i.closed,
+        "restarted": i.restarted,
     });
     if let Some(ended_at) = i.ended_at {
         out["endedAt"] = json!(ended_at);
@@ -160,6 +167,24 @@ fn normalize_stored_meter(v: &Value) -> Option<Meter> {
         .unwrap_or_default();
     if instances.len() > MAX_INSTANCES {
         instances.drain(0..instances.len() - MAX_INSTANCES);
+    }
+    // Earlier builds kept a restarted meter's pre-restart peak; the samples
+    // still show the drop, so the window is rebased where it happened.
+    for instance in &mut instances {
+        let drop = (1..instance.samples.len())
+            .rev()
+            .find(|&j| instance.samples[j].1 + RESTART_DROP < instance.samples[j - 1].1);
+        if let Some(j) = drop {
+            let (ts, util) = instance.samples[j];
+            let tail = instance.samples.split_off(j);
+            instance.peak_util = tail.iter().map(|s| s.1).fold(util, f64::max);
+            instance.samples = tail;
+            instance.started_at = ts;
+            instance.first_seen_at = ts;
+            instance.first_util = util;
+            instance.joined_late = false;
+            instance.restarted = true;
+        }
     }
     // Earlier builds let a superseded window run on to its published reset,
     // so a stored history can hold two windows over the same hours. Trim each
@@ -453,7 +478,21 @@ fn start_instance(meter: &Meter, resets_at: f64, utilization: f64, now: f64) -> 
         samples: vec![(now, utilization)],
         closed: false,
         ended_at: None,
+        restarted: false,
     }
+}
+
+/// The provider zeroed the meter but kept the reset time, so the percentage
+/// now covers only the time since this reading. Everything the window held
+/// before belongs to an allowance that no longer applies.
+fn restart_instance(instance: &mut Instance, utilization: f64, now: f64) {
+    instance.started_at = now;
+    instance.first_seen_at = now;
+    instance.first_util = utilization;
+    instance.peak_util = utilization;
+    instance.joined_late = false;
+    instance.samples = vec![(now, utilization)];
+    instance.restarted = true;
 }
 
 /// Close a window that a newer one has replaced. It ends at its published
@@ -488,6 +527,12 @@ fn observe(meter: &mut Meter, reading: &Reading, now: f64) -> bool {
     if let Some(current) = meter.instances.last_mut() {
         if !current.closed && is_same_instance(current, resets_at, utilization) {
             let changed = utilization != current.last_util;
+            if utilization + RESTART_DROP < current.last_util {
+                restart_instance(current, utilization, now);
+                current.last_seen_at = now;
+                current.last_util = utilization;
+                return true;
+            }
             current.last_seen_at = now;
             current.last_util = utilization;
             if utilization > current.peak_util {
@@ -618,6 +663,7 @@ impl Ledger {
                         "peakUtil": i.peak_util,
                         "firstUtil": i.first_util,
                         "joinedLate": i.joined_late,
+                        "restarted": i.restarted,
                         "observedFor": (i.last_seen_at - i.first_seen_at).max(0.0),
                     })
                 })
@@ -633,6 +679,7 @@ impl Ledger {
                     "peakUtil": last.peak_util,
                     "firstUtil": last.first_util,
                     "joinedLate": last.joined_late,
+                    "restarted": last.restarted,
                     "samples": samples,
                 })
             } else {
@@ -892,6 +939,48 @@ mod tests {
         assert_eq!(meter["history"].as_array().unwrap().len(), 0);
         assert_eq!(meter["current"]["peakUtil"], json!(61.0), "the peak survives a lower later reading");
         assert!(meter["current"]["samples"].as_array().unwrap().len() >= 3);
+    }
+
+    #[test]
+    fn a_sharp_drop_under_the_same_reset_restarts_the_window() {
+        // Seen in the field after a plan change: 6% fell to 0% mid-week while
+        // the published reset stayed put.
+        let mut ledger = Ledger::new();
+        ledger.record(&json!({ "claude": claude_snapshot(SnapOpts { session: 6.0, ..Default::default() }) }), T0 + HOUR);
+        ledger.record(&json!({ "claude": claude_snapshot(SnapOpts { session: 0.0, ..Default::default() }) }), T0 + 2.0 * HOUR);
+        ledger.record(&json!({ "claude": claude_snapshot(SnapOpts { session: 3.0, ..Default::default() }) }), T0 + 3.0 * HOUR);
+        let meter = session_meter(&ledger.snapshot(T0 + 3.0 * HOUR));
+        assert_eq!(meter["history"].as_array().unwrap().len(), 0);
+        assert_eq!(meter["current"]["peakUtil"], json!(3.0), "the pre-restart peak no longer applies");
+        assert_eq!(meter["current"]["startedAt"], json!(T0 + 2.0 * HOUR));
+        assert_eq!(meter["current"]["restarted"], json!(true));
+    }
+
+    #[test]
+    fn a_stored_window_with_a_restart_is_rebased_on_load() {
+        let dir = std::env::temp_dir().join(format!("ember-ledger-restart-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("quota-ledger.json"),
+            serde_json::to_string(&json!({ "v": 1, "meters": [{
+                "id": "claude|session", "provider": "claude", "kind": "session",
+                "label": "x", "windowMinutes": 300,
+                "instances": [{
+                    "startedAt": T0, "resetsAt": T0 + 5.0 * HOUR, "windowMinutes": 300,
+                    "firstSeenAt": T0, "lastSeenAt": T0 + 3.0 * HOUR,
+                    "firstUtil": 0, "peakUtil": 6, "lastUtil": 4, "closed": false,
+                    "samples": [[T0, 0], [T0 + HOUR, 6], [T0 + 2.0 * HOUR, 0], [T0 + 3.0 * HOUR, 4]],
+                }],
+            }]}))
+            .unwrap(),
+        )
+        .unwrap();
+        let ledger = Ledger::load(&dir);
+        let meter = session_meter(&ledger.snapshot(T0 + 3.0 * HOUR));
+        assert_eq!(meter["current"]["startedAt"], json!(T0 + 2.0 * HOUR));
+        assert_eq!(meter["current"]["peakUtil"], json!(4.0));
+        assert_eq!(meter["current"]["restarted"], json!(true));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

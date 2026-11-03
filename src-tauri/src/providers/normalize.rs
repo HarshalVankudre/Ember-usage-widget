@@ -1,6 +1,6 @@
 //! Both providers' buckets are normalized to one shape so the renderer can
 //! merge them freely:
-//!   { provider, date, hour, minute, model, project, session, msgs,
+//!   { provider, date, hour, minute, model, project, session, msgs, activeMs,
 //!     input, output, cacheRead, cacheWrite, reasoning,   <- token counts
 //!     cost, cIn, cOut, cCr, cCw, cRs, cacheSavings, priced }
 //! Claude: cacheRead/cacheWrite are real log counts (5m+1h writes merged).
@@ -21,7 +21,7 @@ pub fn normalize_claude(b: &claude_usage::Bucket) -> Value {
             "provider": "codex",
             "date": b.date, "hour": b.hour, "minute": b.minute,
             "model": b.model, "project": b.project, "session": b.session,
-            "msgs": b.msgs,
+            "msgs": b.msgs, "activeMs": b.active_ms,
             "input": b.input, "output": b.output,
             "cacheRead": b.cache_read, "cacheWrite": b.cache_w5m + b.cache_w1h, "reasoning": b.reasoning,
             "cost": b.cost, "costMin": b.cost_min, "costMax": b.cost_max,
@@ -38,7 +38,7 @@ pub fn normalize_claude(b: &claude_usage::Bucket) -> Value {
         "provider": "claude",
         "date": b.date, "hour": b.hour, "minute": b.minute,
         "model": b.model, "project": b.project, "session": b.session,
-        "msgs": b.msgs,
+        "msgs": b.msgs, "activeMs": b.active_ms,
         "input": b.input, "output": b.output,
         "cacheRead": b.cache_read, "cacheWrite": b.cache_w5m + b.cache_w1h, "reasoning": b.reasoning,
         "cost": b.cost, "costMin": b.cost_min, "costMax": b.cost_max,
@@ -56,7 +56,7 @@ pub fn normalize_codex(b: &codex_usage::Bucket) -> Value {
         "provider": "codex",
         "date": b.date, "hour": b.hour, "minute": b.minute,
         "model": b.model, "project": b.project, "session": b.session,
-        "msgs": b.msgs,
+        "msgs": b.msgs, "activeMs": b.active_ms,
         "input": b.input, "output": b.output,
         "cacheRead": b.cached, "cacheWrite": b.cache_write, "reasoning": b.reasoning,
         "cost": b.cost, "costMin": b.cost_min, "costMax": b.cost_max,

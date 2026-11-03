@@ -4,6 +4,7 @@
 
 use super::codex_pricing::{cost_of, CodexUsage};
 use super::model_attribution::is_openai_model;
+use super::turn_clock::{abandoned_turn, TurnClock};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
@@ -13,11 +14,15 @@ use std::sync::{Arc, Mutex};
 // v5: account limits exclude model-specific quotas such as Codex Spark. Live
 // files are reparsed once when upgrading so a cached Spark tail cannot mask an
 // earlier account-wide reading in the same rollout.
-const CACHE_VERSION: u32 = 5;
+// v6: turn time appended; older rollouts are reparsed once to backfill it.
+// v7: per-call service tier appended; backfill Fast/Priority from live logs.
+const CACHE_VERSION: u32 = 7;
 const LEGACY_ENTRY_LENGTH: usize = 11;
+const V5_ENTRY_LENGTH: usize = 12;
+const V6_ENTRY_LENGTH: usize = 13;
 
 /// entry: [dedupKey, date, hour, model, input, output, cached, reasoning,
-///         cacheWrite, cacheWriteKnown, totalInput, minute]
+///         cacheWrite, cacheWriteKnown, totalInput, minute, turnMs, serviceTier]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Entry(
     pub String,      // dedup key
@@ -32,6 +37,8 @@ pub struct Entry(
     pub bool,        // cache write known
     pub f64,         // total input
     pub Option<u32>, // minute
+    pub f64,         // turn ms: work time of the turn this call ended, else 0
+    pub String,      // service tier for this call, never inferred from today's config
 );
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -51,6 +58,9 @@ pub struct FileRec {
     pub project: String,
     #[serde(default)]
     pub limits: Option<LimitsSnap>,
+    /// The turn still running when the file was read: (entry, ms so far).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_turn: Option<(usize, f64)>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub gone: bool,
 }
@@ -88,6 +98,8 @@ pub struct Bucket {
     pub cache_write: f64,
     pub total_input: f64,
     pub msgs: u64,
+    /// Work time of the finished turns that ended in this bucket.
+    pub active_ms: f64,
     pub cost: f64,
     pub cost_min: f64,
     pub cost_max: f64,
@@ -119,6 +131,8 @@ struct State {
     file_cache: BTreeMap<String, FileRec>,
     cache_needs_reparse: bool,
     memo: Option<Arc<Aggregate>>,
+    /// When an open turn in a quiet log will count as abandoned.
+    memo_expires_ms: f64,
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
@@ -126,6 +140,7 @@ static STATE: Mutex<State> = Mutex::new(State {
     file_cache: BTreeMap::new(),
     cache_needs_reparse: false,
     memo: None,
+    memo_expires_ms: f64::INFINITY,
 });
 
 pub fn session_dirs() -> Vec<PathBuf> {
@@ -152,7 +167,7 @@ pub fn is_account_rate_limits(rate_limits: &Value) -> bool {
     }
 }
 
-fn upgrade_v3_files(files: BTreeMap<String, Value>) -> BTreeMap<String, FileRec> {
+fn upgrade_old_files(files: BTreeMap<String, Value>) -> BTreeMap<String, FileRec> {
     let mut upgraded = BTreeMap::new();
     for (file, mut rec) in files {
         if let Some(entries) = rec.get_mut("entries").and_then(|e| e.as_array_mut()) {
@@ -160,6 +175,12 @@ fn upgrade_v3_files(files: BTreeMap<String, Value>) -> BTreeMap<String, FileRec>
                 if let Some(arr) = entry.as_array_mut() {
                     if arr.len() == LEGACY_ENTRY_LENGTH {
                         arr.push(Value::Null);
+                    }
+                    if arr.len() == V5_ENTRY_LENGTH {
+                        arr.push(serde_json::json!(0.0));
+                    }
+                    if arr.len() == V6_ENTRY_LENGTH {
+                        arr.push(serde_json::json!("standard"));
                     }
                 }
             }
@@ -206,19 +227,10 @@ pub fn init(user_data: &Path) {
                 }
             }
         }
-        Some(4) => {
-            if let Some(files) = parsed.get("files") {
-                if let Ok(mut files) = serde_json::from_value::<BTreeMap<String, FileRec>>(files.clone()) {
-                    strip_model_specific_limits(&mut files);
-                    state.file_cache = files;
-                    state.cache_needs_reparse = true;
-                }
-            }
-        }
-        Some(3) => {
+        Some(3..=6) => {
             if let Some(files) = parsed.get("files") {
                 if let Ok(files) = serde_json::from_value::<BTreeMap<String, Value>>(files.clone()) {
-                    let mut files = upgrade_v3_files(files);
+                    let mut files = upgrade_old_files(files);
                     strip_model_specific_limits(&mut files);
                     state.file_cache = files;
                     state.cache_needs_reparse = true;
@@ -299,11 +311,14 @@ pub struct ParsedFile {
     pub entries: Vec<Entry>,
     pub project: String,
     pub limits: Option<LimitsSnap>,
+    pub open_turn: Option<(usize, f64)>,
 }
 
 pub fn parse_content(text: &str) -> ParsedFile {
-    let mut entries = Vec::new();
+    let mut entries: Vec<Entry> = Vec::new();
+    let mut turn = TurnClock::default();
     let mut model = "unknown".to_string();
+    let mut service_tier = "standard".to_string();
     let mut project = "unknown".to_string();
     let mut session_id: Option<String> = None;
     let mut limits: Option<LimitsSnap> = None;
@@ -314,7 +329,10 @@ pub fn parse_content(text: &str) -> ParsedFile {
         let is_meta = line.contains("\"session_meta\"");
         let is_turn = line.contains("\"turn_context\"");
         let is_count = line.contains("\"token_count\"");
-        if !is_meta && !is_turn && !is_count {
+        let is_task = line.contains("\"task_started\"")
+            || line.contains("\"task_complete\"")
+            || line.contains("\"turn_aborted\"");
+        if !is_meta && !is_turn && !is_count && !is_task {
             continue;
         }
         let Ok(obj) = serde_json::from_str::<Value>(line) else { continue };
@@ -338,13 +356,29 @@ pub fn parse_content(text: &str) -> ParsedFile {
             if let Some(m) = p.get("model").and_then(|m| m.as_str()).filter(|m| !m.is_empty()) {
                 model = m.to_string();
             }
+            // Each context describes a new request. Missing/null tiers mean
+            // standard, including when Fast was enabled on an earlier turn.
+            service_tier = p.get("service_tier").and_then(Value::as_str)
+                .filter(|s| !s.is_empty()).unwrap_or("standard").to_string();
             continue;
         }
-        if obj_type != "event_msg" || p.get("type").and_then(|t| t.as_str()) != Some("token_count") {
+        if obj_type != "event_msg" {
+            continue;
+        }
+        let timestamp = obj.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
+        let event = p.get("type").and_then(|t| t.as_str());
+        if matches!(event, Some("task_started" | "task_complete" | "turn_aborted")) {
+            let Some(at) = crate::parse_ts_ms(timestamp) else { continue };
+            let closed = if event == Some("task_started") { turn.prompt(at) } else { turn.finish(at) };
+            if let Some((index, ms)) = closed {
+                entries[index].12 = ms;
+            }
+            continue;
+        }
+        if event != Some("token_count") {
             continue;
         }
 
-        let timestamp = obj.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
         if let Some(rl) = p.get("rate_limits").filter(|rl| is_account_rate_limits(rl)) {
             let has_data = rl.get("primary").is_some_and(crate::js_truthy)
                 || rl.get("secondary").is_some_and(crate::js_truthy)
@@ -419,6 +453,11 @@ pub fn parse_content(text: &str) -> ParsedFile {
             0.0
         };
         let input = (total_input - cached - cache_write).max(0.0);
+        // A returned tier wins over the requested tier: Fast can fall back to
+        // Standard, in which case OpenAI charges the returned Standard rate.
+        let call_tier = [u.get("service_tier"), info.and_then(|i| i.get("service_tier")), p.get("service_tier")]
+            .into_iter().flatten().filter_map(Value::as_str).find(|s| !s.is_empty())
+            .unwrap_or(&service_tier);
         entries.push(Entry(
             key,
             parts.date,
@@ -432,10 +471,16 @@ pub fn parse_content(text: &str) -> ParsedFile {
             cache_write_known,
             total_input,
             Some(parts.minute),
+            0.0,
+            call_tier.to_string(),
         ));
+        if let Some(at) = crate::parse_ts_ms(timestamp) {
+            turn.call(entries.len() - 1, at);
+        }
     }
     // stamp the project on each entry via the cache record instead of per-entry
-    ParsedFile { entries, project, limits }
+    let open_turn = turn.pending();
+    ParsedFile { entries, project, limits, open_turn }
 }
 
 pub fn aggregate() -> Arc<Aggregate> {
@@ -484,6 +529,7 @@ pub fn aggregate() -> Arc<Aggregate> {
                     entries: p.entries,
                     project: p.project,
                     limits: p.limits,
+                    open_turn: p.open_turn,
                     gone: false,
                 });
             }
@@ -501,6 +547,7 @@ pub fn aggregate() -> Arc<Aggregate> {
                         entries: Vec::new(),
                         project: "unknown".to_string(),
                         limits: None,
+                        open_turn: None,
                         gone: false,
                     });
                 }
@@ -533,7 +580,9 @@ pub fn aggregate() -> Arc<Aggregate> {
                 save_cache(path, &file_cache);
             }
         } else if let Some(memo) = &state.memo {
-            return memo.clone();
+            if crate::now_ms() < state.memo_expires_ms {
+                return memo.clone();
+            }
         }
     }
 
@@ -543,6 +592,30 @@ pub fn aggregate() -> Arc<Aggregate> {
     let mut order: Vec<String> = Vec::new();
     let mut project_live: HashMap<String, bool> = HashMap::new();
     let mut newest_limits: Option<LimitsSnap> = None;
+    // Turn time rides on the call that ended the turn; a replayed copy of that
+    // call hands it to the bucket that kept the first copy, once.
+    let now = crate::now_ms();
+    let mut memo_expires_ms = f64::INFINITY;
+    let abandoned: HashMap<&str, (usize, f64)> = file_cache
+        .iter()
+        .filter_map(|(file, rec)| {
+            let turn = abandoned_turn(rec.open_turn, rec.mtime_ms, now);
+            if turn.is_none() && rec.open_turn.is_some() {
+                memo_expires_ms = memo_expires_ms.min(rec.mtime_ms + super::turn_clock::ABANDONED_AFTER_MS);
+            }
+            turn.map(|t| (file.as_str(), t))
+        })
+        .collect();
+    let timed_keys: std::collections::HashSet<&str> = file_cache
+        .iter()
+        .flat_map(|(file, rec)| {
+            let quiet = abandoned.get(file.as_str()).map(|(i, _)| *i);
+            rec.entries.iter().enumerate().filter(move |(i, e)| e.12 > 0.0 || quiet == Some(*i))
+        })
+        .map(|(_, e)| e.0.as_str())
+        .collect();
+    let mut timed_bucket: HashMap<String, String> = HashMap::new();
+    let mut timed_done: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (file, rec) in &file_cache {
         if let Some(limits) = &rec.limits {
             if newest_limits.as_ref().is_none_or(|n| limits.ts >= n.ts) {
@@ -555,19 +628,33 @@ pub fn aggregate() -> Arc<Aggregate> {
             continue;
         }
         let session = session_of(file);
-        for entry in &rec.entries {
-            let Entry(key, date, hour, model, inp, out, cached, reasoning, cache_write, cache_write_known, total_input, minute) = entry;
+        let quiet = abandoned.get(file.as_str()).copied();
+        for (index, entry) in rec.entries.iter().enumerate() {
+            let Entry(key, date, hour, model, inp, out, cached, reasoning, cache_write, cache_write_known, total_input, minute, turn_ms, service_tier) = entry;
+            let turn_ms = &match quiet {
+                Some((i, ms)) if i == index => ms,
+                _ => *turn_ms,
+            };
             // Do not let an early replay event with no turn_context poison the
             // dedup key and hide the later copy that has a real model attached.
             if !is_openai_model(model) {
                 continue;
             }
             if seen.contains(key) {
+                if *turn_ms > 0.0 && !timed_done.contains(key) {
+                    if let Some(b) = timed_bucket.get(key).and_then(|bk| buckets.get_mut(bk)) {
+                        b.active_ms += turn_ms;
+                        timed_done.insert(key.clone());
+                    }
+                }
                 continue;
             }
             seen.insert(key.clone());
             let minute_str = minute.map(|m| m.to_string()).unwrap_or_else(|| "null".into());
             let bk = format!("{date}|{hour}|{minute_str}|{model}|{}|{session}", rec.project);
+            if timed_keys.contains(key.as_str()) {
+                timed_bucket.insert(key.clone(), bk.clone());
+            }
             let bucket = buckets.entry(bk.clone()).or_insert_with(|| {
                 order.push(bk.clone());
                 Bucket {
@@ -578,7 +665,7 @@ pub fn aggregate() -> Arc<Aggregate> {
                     project: rec.project.clone(),
                     session: session.clone(),
                     input: 0.0, output: 0.0, cached: 0.0, reasoning: 0.0, cache_write: 0.0,
-                    total_input: 0.0, msgs: 0,
+                    total_input: 0.0, msgs: 0, active_ms: 0.0,
                     cost: 0.0, cost_min: 0.0, cost_max: 0.0,
                     c_in: 0.0, c_out: 0.0, c_cached: 0.0, c_reasoning: 0.0, c_write: 0.0,
                     cache_savings: 0.0,
@@ -588,6 +675,10 @@ pub fn aggregate() -> Arc<Aggregate> {
                     project_deleted: false,
                 }
             });
+            if *turn_ms > 0.0 {
+                bucket.active_ms += turn_ms;
+                timed_done.insert(key.clone());
+            }
             bucket.input += inp;
             bucket.output += out;
             bucket.cached += cached;
@@ -604,6 +695,7 @@ pub fn aggregate() -> Arc<Aggregate> {
                 cache_write: *cache_write,
                 cache_write_known: *cache_write_known,
                 total_input: *total_input,
+                service_tier,
             });
             bucket.cost += c.total;
             bucket.cost_min += c.cost_min;
@@ -632,7 +724,11 @@ pub fn aggregate() -> Arc<Aggregate> {
     }
 
     let memo = Arc::new(Aggregate { buckets: list, file_count: files.len(), limits: newest_limits });
-    STATE.lock().unwrap().memo = Some(memo.clone());
+    {
+        let mut state = STATE.lock().unwrap();
+        state.memo = Some(memo.clone());
+        state.memo_expires_ms = memo_expires_ms;
+    }
     memo
 }
 
@@ -640,6 +736,49 @@ pub fn aggregate() -> Arc<Aggregate> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn count(ts: &str, total: u64) -> serde_json::Value {
+        json!({
+            "type": "event_msg", "timestamp": ts,
+            "payload": { "type": "token_count", "info": {
+                "total_token_usage": { "total_tokens": total },
+                "last_token_usage": { "input_tokens": 10, "output_tokens": 1, "total_tokens": 11 }
+            }}
+        })
+    }
+
+    fn task(ts: &str, kind: &str) -> serde_json::Value {
+        json!({ "type": "event_msg", "timestamp": ts, "payload": { "type": kind, "turn_id": "t1" } })
+    }
+
+    #[test]
+    fn a_completed_task_is_timed_on_its_last_call() {
+        let lines = [
+            json!({ "type": "session_meta", "payload": { "id": "s", "cwd": "C:\\Users\\dev\\work" } }),
+            json!({ "type": "turn_context", "payload": { "model": "gpt-5.6-sol" } }),
+            task("2026-09-29T10:00:00Z", "task_started"),
+            count("2026-09-29T10:00:20Z", 11),
+            count("2026-09-29T10:05:00Z", 22),
+            task("2026-09-29T10:05:10Z", "task_complete"),
+        ]
+        .map(|v| v.to_string())
+        .join("\n");
+        let entries = parse_content(&lines).entries;
+        assert_eq!(entries[0].12, 0.0);
+        assert_eq!(entries[1].12, 310_000.0);
+    }
+
+    #[test]
+    fn a_running_task_books_no_time() {
+        let lines = [
+            json!({ "type": "turn_context", "payload": { "model": "gpt-5.6-sol" } }),
+            task("2026-09-29T10:00:00Z", "task_started"),
+            count("2026-09-29T10:00:20Z", 11),
+        ]
+        .map(|v| v.to_string())
+        .join("\n");
+        assert_eq!(parse_content(&lines).entries[0].12, 0.0);
+    }
 
     #[test]
     fn parses_cached_input_as_a_subset_without_double_counting() {

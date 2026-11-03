@@ -1,8 +1,9 @@
 //! Daily refresh of OpenAI's official published pricing doc.
-//! v3 cache records whether a row is priced in context tiers, so the surcharge
-//! comes from the official table instead of a bundled assumption.
+//! The cache records whether a row is priced in context tiers, so the surcharge
+//! comes from the official table instead of a bundled assumption. v5: retain
+//! separate Standard and Fast/Priority rows, including specialized Codex rows.
 
-use super::codex_pricing::{set_live_prices, LivePrice};
+use super::codex_pricing::{set_live_prices, FastPrice, LivePrice};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -14,7 +15,7 @@ use std::time::Duration;
 pub const SOURCE_URL: &str = "https://developers.openai.com/api/docs/pricing.md";
 pub const REFRESH: Duration = Duration::from_secs(24 * 3600);
 pub const RETRY: Duration = Duration::from_secs(3600);
-const CACHE_VERSION: u32 = 3;
+const CACHE_VERSION: u32 = 5;
 
 #[derive(Clone, Copy, Default)]
 struct LiveState {
@@ -40,54 +41,102 @@ fn clean_model_name(name: &str) -> String {
     re.replacen(&name.to_lowercase(), 1, "").trim().to_string()
 }
 
-/// The official MDX contains several arrays (standard, batch, flex). Standard
-/// appears first, so first occurrence wins. A row is either
-/// [model,input,cached,output] or [model,input,cached,cacheWrite,output].
+/// "$1.25" -> 1.25; "-" (not offered) -> None.
+fn dollars(cell: &str) -> Option<f64> {
+    cell.trim().strip_prefix('$')?.replace(',', "").trim().parse().ok()
+}
+
+/// Read speed sections explicitly so Batch, Flex and Ultrafast can never
+/// overwrite Standard or Fast. Column names also handle the specialized Codex
+/// table, which prefixes its model column with a Category column.
 pub fn build_map(markdown: &str) -> HashMap<String, LivePrice> {
-    static ROW: OnceLock<Regex> = OnceLock::new();
     static TIER: OnceLock<Regex> = OnceLock::new();
     static ID: OnceLock<Regex> = OnceLock::new();
-    let row_re = ROW.get_or_init(|| Regex::new(r#"(\["[^"]+"\s*,[^\]]+\])"#).unwrap());
     let tier_re = TIER.get_or_init(|| Regex::new(r"(?i)<\s*272k context length").unwrap());
     let id_re = ID.get_or_init(|| Regex::new(r"^(?:gpt|chatgpt|chat-|codex|o\d)").unwrap());
 
-    let numeric = |v: Option<&serde_json::Value>| v.and_then(|v| v.as_f64());
-
     let mut map = HashMap::new();
+    let mut fast_rows = HashMap::new();
+    let mut speed = "standard";
+    let mut header: Option<Vec<String>> = None;
     for line in markdown.lines() {
-        let Some(hit) = row_re.captures(line) else { continue };
-        let Ok(row) = serde_json::from_str::<Vec<serde_json::Value>>(&hit[1]) else { continue };
-        if row.len() != 4 && row.len() != 5 {
+        let line = line.trim();
+        if !line.starts_with('|') {
+            header = None;
+            let label = line.trim_start_matches('#').trim().to_ascii_lowercase();
+            match label.as_str() {
+                "standard" | "standard pricing data" => speed = "standard",
+                "fast" | "priority" | "fast pricing data" | "priority pricing data" => speed = "fast",
+                "batch" | "flex" | "ultrafast" | "batch pricing data" | "flex pricing data" | "ultrafast pricing data" => speed = "skip",
+                _ => {}
+            }
             continue;
         }
-        let Some(name) = row[0].as_str() else { continue };
-        // OpenAI labels the context-tiered rows "(<272K context length)". That
-        // marker is the only statement that a model carries a long-context
-        // surcharge, so it is recorded rather than inferred from the family.
-        let long_context = tier_re.is_match(name);
+        let cells: Vec<&str> = line.trim_matches('|').split('|').map(str::trim).collect();
+        if cells[0].eq_ignore_ascii_case("model") || cells[0].eq_ignore_ascii_case("category") {
+            header = Some(cells.iter().map(|c| c.to_lowercase()).collect());
+            continue;
+        }
+        let Some(cols) = header.as_ref() else { continue };
+        // Only the text-token tables put Input straight after Model. The rest
+        // (fine-tuning "Training", realtime "Modality", transcription "Use
+        // case") price something else, and fine-tuning reuses dated snapshot
+        // ids like gpt-4.1-2025-04-14 at a different rate.
+        let Some(model_col) = cols.iter().position(|c| c == "model") else { continue };
+        let text_table = matches!(cols.get(model_col + 1).map(String::as_str), Some("input" | "short context input"));
+        if speed == "skip" || !text_table || cells.len() != cols.len() {
+            continue;
+        }
+        let col = |names: &[&str]| {
+            names
+                .iter()
+                .find_map(|n| cols.iter().position(|c| c == n))
+                .and_then(|i| dollars(cells[i]))
+        };
+        let name = cells[model_col];
         let id = clean_model_name(name);
-        if !id_re.is_match(&id) || map.contains_key(&id) {
+        if !id_re.is_match(&id) {
             continue;
         }
-        let input = numeric(row.get(1));
-        let cached = numeric(row.get(2));
-        let write = if row.len() == 5 { numeric(row.get(3)) } else { None };
-        let output = numeric(row.last());
-        let (Some(input), Some(output)) = (input, output) else { continue };
-        map.insert(id, LivePrice {
+        let (Some(input), Some(output)) = (
+            col(&["short context input", "input"]),
+            col(&["short context output", "output"]),
+        ) else {
+            continue;
+        };
+        // A published long-context price (or the older "(<272K context
+        // length)" label) is the only statement that a model is tiered, so it
+        // is recorded rather than inferred from the family.
+        let long_context = col(&["long context input"]).is_some();
+        let cached = col(&["short context cached input", "cached input"]).unwrap_or(input);
+        let write = col(&["short context 30m write", "30m write"]);
+        if speed == "fast" {
+            fast_rows.entry(id).or_insert(FastPrice {
+                input, cached, write, output, long_context,
+                short_context_only: !long_context && (tier_re.is_match(name) || cols.iter().any(|c| c == "short context input")),
+            });
+            continue;
+        }
+        map.entry(id).or_insert(LivePrice {
             input,
-            cached: cached.unwrap_or(input),
+            cached,
             write,
             output,
-            long_context: Some(long_context),
+            long_context: Some(long_context || tier_re.is_match(name)),
+            fast: None,
         });
+    }
+    for (id, rates) in fast_rows {
+        if let Some(price) = map.get_mut(&id) {
+            price.fast = Some(rates);
+        }
     }
     map
 }
 
 fn apply(prices: HashMap<String, LivePrice>, fetched_at: f64) -> bool {
     let models = prices.len();
-    if models == 0 {
+    if models == 0 || !prices.values().any(|p| p.fast.is_some()) {
         return false;
     }
     set_live_prices(prices);
@@ -168,19 +217,70 @@ mod tests {
     use super::*;
 
     #[test]
+    fn official_snapshot_keeps_fast_separate_and_prices_specialized_codex() {
+        let map = build_map(include_str!("fixtures/openai-pricing-2026-11-01.md"));
+        let sol = &map["gpt-6.1-sol"];
+        assert_eq!((sol.input, sol.cached, sol.write, sol.output), (2.0, 0.1, Some(2.5), 10.0));
+        let fast = sol.fast.as_ref().unwrap();
+        assert_eq!((fast.input, fast.cached, fast.write, fast.output), (4.0, 0.2, Some(5.0), 20.0));
+        assert!(fast.long_context);
+        assert!(!fast.short_context_only);
+        assert_eq!(map["gpt-5.5"].fast.as_ref().unwrap().input, 12.5);
+        assert!(map["gpt-5.5"].fast.as_ref().unwrap().short_context_only);
+        assert!(!map["gpt-5.5"].fast.as_ref().unwrap().long_context);
+        assert_eq!(map["gpt-5-mini"].fast.as_ref().unwrap().input, 0.45);
+        assert_eq!(map["gpt-4o"].fast.as_ref().unwrap().cached, 2.125);
+        assert_eq!(map["gpt-5.3-codex"].input, 1.75);
+        assert_eq!(map["gpt-5.3-codex"].fast.as_ref().unwrap().output, 28.0);
+        assert!(map["gpt-5-pro"].fast.is_none());
+        assert_eq!(map.values().filter(|p| p.fast.is_some()).count(), 24);
+    }
+
+    const HEAD: &str = "| Model | Short context input | Short context output | Short context cached input | Short context 30m write | Short context 12h write | Long context input | Long context output | Long context cached input | Long context 30m write | Long context 12h write |\n\
+                        | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n";
+
+    #[test]
     fn parses_first_official_openai_standard_price_rows() {
-        let map = build_map(
-            "    [\"gpt-5.6-sol\", 5, 0.5, 6.25, 30],\n\
-                 [\"gpt-5.5 (<272K context length)\", 5, 0.5, \"-\", 30],\n\
-                 [\"chatgpt-4o-latest\", 5, \"-\", 15],\n\
-                 [\"gpt-5.6-sol\", 2.5, 0.25, 15],",
+        let doc = format!(
+            "### Standard pricing data\n\n{HEAD}\
+             | gpt-6.1-sol | $2.00 | $10.00 | $0.10 | $2.50 | $5.00 | $4.00 | $15.00 | $0.20 | $5.00 | $10.00 |\n\
+             | gpt-5.5 (<272K context length) | $5.00 | $30.00 | $0.50 | - | - | $10.00 | $45.00 | $1.00 | - | - |\n\
+             | gpt-5.5-pro (<272K context length) | $30.00 | $180.00 | - | - | - | $60.00 | $270.00 | - | - | - |\n\
+             \n\
+             | Model | Input | Output | Cached input |\n\
+             | --- | --- | --- | --- |\n\
+             | gpt-5.4-mini | $0.75 | $4.50 | $0.075 |\n\
+             | gpt-5-pro | $15.00 | $120.00 | - |\n\
+             \n\
+             ### Batch pricing data\n\n{HEAD}\
+             | gpt-6.1-sol | $1.00 | $5.00 | $0.05 | $1.25 | $2.50 | $2.00 | $7.50 | $0.10 | $2.50 | $5.00 |\n\
+             \n\
+             ### Standard pricing data\n\n{HEAD}\
+             | gpt-5.6-cyber | $12.50 | $75.00 | $1.25 | $15.625 | $31.25 | - | - | - | - | - |\n\
+             \n\
+             | Model | Modality | Input | Output / cost | Cached input |\n\
+             | --- | --- | --- | --- | --- |\n\
+             | gpt-realtime-2.1 | Audio | $32.00 | $64.00 | $0.40 |\n\
+             \n\
+             | Model | Training | Input | Output | Cached input |\n\
+             | --- | --- | --- | --- | --- |\n\
+             | gpt-4.1-2025-04-14 | $25.00 | $3.00 | $12.00 | $0.75 |\n"
         );
-        let sol = &map["gpt-5.6-sol"];
-        assert_eq!((sol.input, sol.cached, sol.write, sol.output), (5.0, 0.5, Some(6.25), 30.0));
-        assert_eq!(sol.long_context, Some(false));
+        let map = build_map(&doc);
+        let sol = &map["gpt-6.1-sol"];
+        assert_eq!((sol.input, sol.cached, sol.write, sol.output), (2.0, 0.1, Some(2.5), 10.0));
+        assert_eq!(sol.long_context, Some(true));
         let g55 = &map["gpt-5.5"];
         assert_eq!((g55.input, g55.cached, g55.write, g55.output), (5.0, 0.5, None, 30.0));
         assert_eq!(g55.long_context, Some(true));
-        assert_eq!(map["chatgpt-4o-latest"].cached, 5.0);
+        assert_eq!(map["gpt-5.5-pro"].cached, 30.0);
+        let mini = &map["gpt-5.4-mini"];
+        assert_eq!((mini.input, mini.cached, mini.output), (0.75, 0.075, 4.5));
+        assert_eq!(mini.long_context, Some(false));
+        assert_eq!(map["gpt-5-pro"].cached, 15.0);
+        let cyber = &map["gpt-5.6-cyber"];
+        assert_eq!((cyber.write, cyber.long_context), (Some(15.625), Some(false)));
+        assert!(!map.contains_key("gpt-realtime-2.1"));
+        assert!(!map.contains_key("gpt-4.1-2025-04-14"));
     }
 }

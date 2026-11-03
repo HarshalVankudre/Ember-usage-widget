@@ -252,6 +252,7 @@
         endsAt,
         live: !!w.live,
         joinedLate: !!w.joinedLate,
+        restarted: !!w.restarted,
         percent,
         totals,
         rate: rateFor(totals, percent),
@@ -298,7 +299,9 @@
         aligned.set(key, {
           ...instance,
           resetsAt: reset,
-          startedAt: reset - periodMs,
+          // A restarted meter began counting mid-period; keep that start.
+          startedAt: instance.restarted && Number(instance.startedAt) > reset - periodMs
+            ? Number(instance.startedAt) : reset - periodMs,
           peakUtil: Number(instance.peakUtil) || 0,
         });
         continue;
@@ -348,7 +351,11 @@
       // Blocks are already anchored to the windows Ember watched, so a real
       // pair overlaps almost exactly. Anything less is a neighbouring window,
       // and borrowing its percentage would invent a rate that was never real.
-      if (!best || bestOverlap < span * 0.9) {
+      // The exception is a meter the provider restarted mid-period (a plan
+      // change): it sits wholly inside its block and is the only reading of it.
+      const restartedInside = !!best && best.restarted
+        && best.startedAt >= block.startedAt && best.endsAt <= block.endsAt;
+      if (!best || (bestOverlap < span * 0.9 && !restartedInside)) {
         block.percent = null;
         block.observed = false;
         block.rate = null;
@@ -365,6 +372,8 @@
         && (best.startedAt !== block.startedAt || best.endsAt !== block.endsAt)) {
         block.totals = usageBetween(rows, best.startedAt, Math.min(best.endsAt, now));
       }
+      // The percentage only covers usage since the restart, so the block does too.
+      if (restartedInside) block.startedAt = best.startedAt;
       block.rate = rateFor(block.totals, best.percent);
     }
     return blocks;

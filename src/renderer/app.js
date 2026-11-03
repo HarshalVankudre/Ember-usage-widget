@@ -412,7 +412,11 @@ function passesProviderFilter(b) {
 }
 
 function visibleModelKeys() {
-  return new Set(state.buckets.filter(passesProviderFilter).map(mkey));
+  return new Set(state.buckets.filter((b) => passesProviderFilter(b) && !isArchivedModel(b.model)).map(mkey));
+}
+
+function isArchivedModel(model) {
+  return window.EmberFilterState.isArchivedModel(model);
 }
 
 function reconcileVisibleModelSelection() {
@@ -593,7 +597,8 @@ function render({ animate = false } = {}) {
     if (!p) {
       p = { cost: 0, costMin: 0, costMax: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, msgs: 0,
         pricedCalls: 0, unpricedCalls: 0, estimated: false,
-        cIn: 0, cOut: 0, cCr: 0, cCw: 0, cRs: 0, cTool: 0, live: false, models: new Map() };
+        cIn: 0, cOut: 0, cCr: 0, cCw: 0, cRs: 0, cTool: 0, live: false, models: new Map(),
+        activeMs: 0, sessions: new Set(), days: new Set() };
       byProject.set(b.project, p);
     }
     // a project counts as deleted only when every source log is gone
@@ -617,13 +622,16 @@ function render({ animate = false } = {}) {
     p.pricedCalls += b.pricedCalls ?? (b.priced ? b.msgs : 0);
     p.unpricedCalls += b.unpricedCalls ?? (b.priced ? 0 : b.msgs);
     p.estimated = p.estimated || !!b.estimated;
+    p.activeMs += b.activeMs || 0;
+    p.sessions.add(`${b.provider}|${b.session}`);
+    p.days.add(b.date);
     let pm = p.models.get(mk);
     if (!pm) {
       pm = { provider: b.provider, model: b.model, source: b.source, source: b.source,
         input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, cost: 0, msgs: 0,
         costMin: 0, costMax: 0,
         cIn: 0, cOut: 0, cCr: 0, cCw: 0, cRs: 0, cTool: 0,
-        pricedCalls: 0, unpricedCalls: 0, estimated: false, priced: true };
+        pricedCalls: 0, unpricedCalls: 0, estimated: false, priced: true, activeMs: 0 };
       p.models.set(mk, pm);
     }
     pm.input += b.input;
@@ -644,6 +652,7 @@ function render({ animate = false } = {}) {
     pm.pricedCalls += b.pricedCalls ?? (b.priced ? b.msgs : 0);
     pm.unpricedCalls += b.unpricedCalls ?? (b.priced ? 0 : b.msgs);
     pm.estimated = pm.estimated || !!b.estimated;
+    pm.activeMs += b.activeMs || 0;
     if (!b.priced) pm.priced = false;
 
     // hidden projects still render (blurred) but count toward nothing else
@@ -731,7 +740,8 @@ function render({ animate = false } = {}) {
     sectionRenderKeys.providers = providersKey;
   }
 
-  const modelsKey = `${providersKey}|${setKey(state.selectedModels)}`;
+  const archiveKey = window.EmberFilterState.archiveCutoff();
+  const modelsKey = `${providersKey}|${setKey(state.selectedModels)}|${archiveKey}`;
   if (sectionRenderKeys.models !== modelsKey) {
     renderModelChips();
     sectionRenderKeys.models = modelsKey;
@@ -743,7 +753,7 @@ function render({ animate = false } = {}) {
     state.dataRevision, state.preset, state.customFrom, state.customFromTime,
     state.customTo, state.customToTime, state.customEndMode,
     state.selectedDay, setKey(state.selectedProviders),
-    setKey(state.selectedModels), hiddenKey,
+    setKey(state.selectedModels), hiddenKey, archiveKey,
   ].join('|');
   if (sectionRenderKeys.modelTable !== detailKey) {
     renderModelTable(modelTableData);
@@ -931,6 +941,7 @@ function renderProviderChips() {
 function renderModelChips() {
   const seen = new Map(); // mkey -> { provider, model }
   for (const b of state.buckets) {
+    if (isArchivedModel(b.model)) continue;
     if (state.selectedProviders.size > 0 && !state.selectedProviders.has(b.provider)) continue;
     if (!seen.has(mkey(b))) seen.set(mkey(b), { provider: b.provider, model: b.model, source: b.source });
   }
@@ -970,8 +981,25 @@ function renderModelChips() {
 function renderModelTable(byModel) {
   const tbody = $('modelTable').querySelector('tbody');
   tbody.innerHTML = '';
-  const entries = [...byModel.values()].sort((a, b) => b.cost - a.cost);
+  const allEntries = [...byModel.values()];
+  const entries = allEntries.filter((m) => !isArchivedModel(m.model)).sort((a, b) => b.cost - a.cost);
+  const archived = allEntries.filter((m) => isArchivedModel(m.model));
+  if (archived.length) {
+    const tr = document.createElement('tr');
+    const label = document.createElement('td');
+    label.colSpan = 5;
+    label.textContent = `Archived models · ${archived.length} · included in totals`;
+    const cost = document.createElement('td');
+    cost.className = 'r';
+    const value = archived.reduce((sum, m) => sum + m.cost, 0);
+    const partial = archived.some((m) => !m.priced);
+    cost.textContent = `${archived.some((m) => m.estimated) ? '≈' : ''}${fmtCost(value)}${partial ? ' + unpriced' : ''}`;
+    tr.title = 'Models released more than two months ago. Projects and usage history are retained.';
+    tr.append(label, cost);
+    tbody.appendChild(tr);
+  }
   if (!entries.length) {
+    if (archived.length) return;
     const tr = document.createElement('tr');
     const td = document.createElement('td');
     td.colSpan = 6;
@@ -1165,6 +1193,34 @@ function appendProjectModels(table, p) {
   }
 }
 
+// Working time per model: each finished turn counts for the model that ran it,
+// so the rows add up to the project's total. A model that only served as a
+// subagent books no turns of its own — its work sits inside its parent's.
+function appendProjectTime(table, p) {
+  const total = p.activeMs;
+  const { fmtDuration } = window.EmberActiveTime;
+  const entries = [...p.models.values()].sort((a, b) =>
+    b.activeMs - a.activeMs || b.cost - a.cost
+    || a.model.localeCompare(b.model, undefined, { sensitivity: 'base' }));
+  table.appendChild(projTableRow('', 'worked', 'share', { cols: true }));
+  for (const m of entries) {
+    const share = total ? Math.min(100, Math.round((m.activeMs / total) * 100)) : 0;
+    const color = modelColor(m.provider, m.model);
+    const row = projTableRow(prettyModel(m.provider, m.model, m.source), fmtDuration(m.activeMs), m.activeMs ? `${share}%` : '—',
+      { dot: color, title: `${pmeta(m.provider).label} · ${m.model}` });
+    row.classList.add('timed');
+    const bar = document.createElement('span');
+    bar.className = 'proj-tbar';
+    bar.setAttribute('aria-hidden', 'true');
+    const fill = document.createElement('i');
+    fill.style.setProperty('--w', `${share}%`);
+    fill.style.background = color;
+    bar.appendChild(fill);
+    row.appendChild(bar);
+    table.appendChild(row);
+  }
+}
+
 // Export selection. A tick lives beside each row rather than behind a mode
 // switch: one click to pick a project, shift-click to take a run of them.
 let selectionAnchor = null;
@@ -1266,11 +1322,16 @@ function buildProjectItem(wrap, name, p, max, visibleNames = []) {
       <svg viewBox="0 0 12 12"><path d="M4.5 2.5 8 6 4.5 9.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
     </span>
     <span class="proj-name"></span>
+    <span class="proj-time"></span>
     <span class="proj-cost"></span>
     <span class="proj-bar" aria-hidden="true"><i style="--w:${((p.cost / max) * 100).toFixed(1)}%"></i></span>`;
   const nameEl = summary.querySelector('.proj-name');
   nameEl.textContent = name;
   nameEl.title = name;
+  const { fmtDuration, NOTE: TIME_NOTE } = window.EmberActiveTime;
+  const timeEl = summary.querySelector('.proj-time');
+  timeEl.textContent = p.activeMs ? fmtDuration(p.activeMs) : '';
+  timeEl.title = TIME_NOTE;
   const costEl = summary.querySelector('.proj-cost');
   costEl.textContent = projectCost;
   if (p.unpricedCalls > 0) costEl.title = `Dollar value omitted for ${p.unpricedCalls.toLocaleString()} calls because no official price is published`;
@@ -1283,13 +1344,22 @@ function buildProjectItem(wrap, name, p, max, visibleNames = []) {
   details.className = 'proj-details';
   details.hidden = true;
   const totalTokens = p.input + p.output + p.cacheRead + p.cacheWrite;
+  const plural = (n, word) => `${n.toLocaleString()} ${word}${n === 1 ? '' : 's'}`;
   details.innerHTML = `
+    <div class="proj-detail-head">
+      <span>Time breakdown</span>
+      <span><span class="dur">${fmtDuration(p.activeMs)}</span> worked · ${plural(p.sessions.size, 'session')} · ${plural(p.days.size, 'day')}</span>
+    </div>
+    <div class="proj-table proj-time-table"></div>
     <div class="proj-detail-head">
       <span>Token breakdown</span>
       <span>${fmtTok(totalTokens)} total · ${p.msgs.toLocaleString()} calls</span>
     </div>
-    <div class="proj-table"></div>`;
-  appendProjectModels(details.querySelector('.proj-table'), p);
+    <div class="proj-table proj-token-table"></div>`;
+  const timeTable = details.querySelector('.proj-time-table');
+  timeTable.title = `${TIME_NOTE} Subagent work is inside the turn of the model that called it.`;
+  appendProjectTime(timeTable, p);
+  appendProjectModels(details.querySelector('.proj-token-table'), p);
 
   summary.addEventListener('click', () => {
     if (isHidden) return; // blurred rows don't expand — right-click unhides
@@ -1342,10 +1412,12 @@ function buildSelectionBar(wrap, entries) {
   const calls = chosen.reduce((s, [, p]) => s + p.msgs, 0);
   const unpriced = chosen.some(([, p]) => p.unpricedCalls > 0);
   const estimated = chosen.some(([, p]) => p.estimated);
+  const activeMs = chosen.reduce((sum, [, p]) => sum + p.activeMs, 0);
 
   const info = document.createElement('span');
   info.className = 'proj-selinfo';
-  info.textContent = `${chosen.length} selected · ${unpriced ? '' : estimated ? '≈' : ''}${fmtCost(cost)}${unpriced ? ' + unpriced' : ''} · ${fmtTok(tokens)} tokens · ${calls.toLocaleString()} calls`;
+  info.textContent = `${chosen.length} selected · ${unpriced ? '' : estimated ? '≈' : ''}${fmtCost(cost)}${unpriced ? ' + unpriced' : ''} · ${fmtTok(tokens)} tokens · ${calls.toLocaleString()} calls${activeMs ? ` · ${window.EmberActiveTime.fmtDuration(activeMs)} worked` : ''}`;
+  info.title = window.EmberActiveTime.NOTE;
 
   const actions = document.createElement('div');
   actions.className = 'proj-selactions';
@@ -3022,6 +3094,7 @@ const PROJECT_CSV_HEADER = [
   'input', 'output', 'reasoning_in_output', 'cache_read', 'cache_write', 'total_tokens',
   'input_usd', 'output_usd', 'reasoning_usd', 'cache_read_usd', 'cache_write_usd',
   'server_tools_usd', 'value_usd', 'value_lower_usd', 'value_upper_usd', 'estimated',
+  'worked_seconds',
 ];
 
 function projectCsvRow(name, provider, model, t) {
@@ -3034,6 +3107,7 @@ function projectCsvRow(name, provider, model, t) {
     round(t.cCr || 0, 4), round(t.cCw || 0, 4), round(t.cTool || 0, 4),
     round(t.cost, 4), round(t.costMin || 0, 4), round(t.costMax || t.cost, 4),
     t.estimated ? 'yes' : 'no',
+    Math.round((t.activeMs || 0) / 1000),
   ];
 }
 
@@ -3073,10 +3147,11 @@ function buildProjectsJson() {
     estimated: !!t.estimated,
   });
   const calls = (t) => ({ total: t.msgs, priced: t.pricedCalls, unpriced: t.unpricedCalls });
+  const seconds = (t) => Math.round((t.activeMs || 0) / 1000);
 
   return JSON.stringify({
     generatedAt: new Date().toISOString(),
-    app: { name: 'Ember', version: APP_VERSION, note: 'API-equivalent value of subscription usage, not an invoice. Reasoning tokens are billed inside output and are already counted in it.' },
+    app: { name: 'Ember', version: APP_VERSION, note: `API-equivalent value of subscription usage, not an invoice. Reasoning tokens are billed inside output and are already counted in it. ${window.EmberActiveTime.NOTE}` },
     view: projectRangeMeta(),
     selection: { projects: entries.map(([name]) => name) },
     totals: (() => {
@@ -3089,13 +3164,19 @@ function buildProjectsJson() {
         acc.estimated = acc.estimated || !!p.estimated;
         return acc;
       }, {});
-      return { calls: calls(sum), tokens: tokens(sum), cost: costs(sum) };
+      return {
+        calls: calls(sum), tokens: tokens(sum), cost: costs(sum),
+        workedSeconds: entries.reduce((n, [, p]) => n + seconds(p), 0),
+      };
     })(),
     projects: entries.map(([name, p]) => ({
       name,
       calls: calls(p),
       tokens: tokens(p),
       cost: costs(p),
+      workedSeconds: seconds(p),
+      sessions: p.sessions.size,
+      days: p.days.size,
       models: [...p.models.values()]
         .sort((a, b) => b.cost - a.cost || a.model.localeCompare(b.model, undefined, { sensitivity: 'base' }))
         .map((m) => ({
@@ -3106,6 +3187,7 @@ function buildProjectsJson() {
           calls: calls(m),
           tokens: tokens(m),
           cost: costs(m),
+          workedSeconds: seconds(m),
         })),
     })),
   }, null, 2);
@@ -3118,20 +3200,22 @@ function buildProjectsSummary() {
   const lines = [];
   lines.push(`**Ember — API-equivalent usage by project · ${label}**`);
   lines.push('');
-  lines.push('| Project | Calls | Input | Output | Cache read | Cache write | Value |');
-  lines.push('|---|---:|---:|---:|---:|---:|---:|');
+  const { fmtDuration } = window.EmberActiveTime;
+  lines.push('| Project | Worked | Calls | Input | Output | Cache read | Cache write | Value |');
+  lines.push('|---|---:|---:|---:|---:|---:|---:|---:|');
   const sum = { msgs: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, unpricedCalls: 0 };
   for (const [name, p] of entries) {
-    lines.push(`| ${name} | ${p.msgs.toLocaleString()} | ${fmtTok(p.input)} | ${fmtTok(p.output)} | ${fmtTok(p.cacheRead)} | ${fmtTok(p.cacheWrite)} | ${p.estimated ? '≈' : ''}${fmtCost(p.cost)} |`);
+    lines.push(`| ${name} | ${fmtDuration(p.activeMs)} | ${p.msgs.toLocaleString()} | ${fmtTok(p.input)} | ${fmtTok(p.output)} | ${fmtTok(p.cacheRead)} | ${fmtTok(p.cacheWrite)} | ${p.estimated ? '≈' : ''}${fmtCost(p.cost)} |`);
     for (const k of Object.keys(sum)) sum[k] += p[k] || 0;
   }
-  lines.push(`| **Total (${entries.length})** | ${sum.msgs.toLocaleString()} | ${fmtTok(sum.input)} | ${fmtTok(sum.output)} | ${fmtTok(sum.cacheRead)} | ${fmtTok(sum.cacheWrite)} | **${fmtCost(sum.cost)}** |`);
+  const allTime = fmtDuration(entries.reduce((n, [, p]) => n + p.activeMs, 0));
+  lines.push(`| **Total (${entries.length})** | ${allTime} | ${sum.msgs.toLocaleString()} | ${fmtTok(sum.input)} | ${fmtTok(sum.output)} | ${fmtTok(sum.cacheRead)} | ${fmtTok(sum.cacheWrite)} | **${fmtCost(sum.cost)}** |`);
   if (sum.unpricedCalls) {
     lines.push('');
     lines.push(`_${sum.unpricedCalls.toLocaleString()} calls have no published official price and are excluded from the value._`);
   }
   lines.push('');
-  lines.push(`_Ember ${APP_VERSION} · reconstructed from local Claude Code and Codex logs at official API rates. Not a provider invoice._`);
+  lines.push(`_Ember ${APP_VERSION} · reconstructed from local Claude Code and Codex logs at official API rates. Not a provider invoice. ${window.EmberActiveTime.NOTE}_`);
   return lines.join('\n');
 }
 

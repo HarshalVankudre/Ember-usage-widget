@@ -247,7 +247,9 @@ fn parse_rows<F: Fn(&str) -> bool>(
     let mut order: Vec<String> = Vec::new();
     for row in rows {
         let Some(source) = wanted.get(&row.provider_id) else { continue };
-        if row.model.is_empty() {
+        // GLM usage was removed from Ember, including historical projects.
+        // Exclude it before creating project/session entries or any totals.
+        if row.model.is_empty() || super::zcode_pricing::canonical_id(&row.model).starts_with("z-ai/glm-") {
             continue;
         }
         let Some(parts) = crate::local_parts_ms(row.started_at) else { continue };
@@ -406,7 +408,7 @@ mod tests {
     #[test]
     fn cached_input_is_split_out_and_reasoning_stays_inside_output() {
         let wanted = wanted_providers_from(&config());
-        let mut r = row("builtin:zai-coding-plan", "GLM-5.3-Flash");
+        let mut r = row("f4ef6d1e-1808-4c6d-8383-019efcc24c0c", "moonshotai/kimi-k3");
         r.input_total = 107_296.0;
         r.cache_read = 101_376.0;
         r.output = 197.0;
@@ -437,11 +439,11 @@ mod tests {
     fn openrouter_routing_variants_price_and_keep_their_own_model_label() {
         let wanted = wanted_providers_from(&config());
         let out = parse_rows(
-            &[row("f4ef6d1e-1808-4c6d-8383-019efcc24c0c", "z-ai/glm-5.3-flash:makora")],
+            &[row("f4ef6d1e-1808-4c6d-8383-019efcc24c0c", "moonshotai/kimi-k3:nitro")],
             &wanted,
             |_| true,
         );
-        assert_eq!(out[0]["model"], "z-ai/glm-5.3-flash:makora");
+        assert_eq!(out[0]["model"], "moonshotai/kimi-k3:nitro");
         assert!(out[0]["priced"].as_bool().unwrap());
     }
 
@@ -456,5 +458,23 @@ mod tests {
         assert!(!out[0]["priced"].as_bool().unwrap());
         assert_eq!(out[0]["cost"], json!(0.0));
         assert!(out[0]["input"].as_f64().unwrap() > 0.0, "tokens still count when the price does not");
+    }
+
+    #[test]
+    fn glm_history_is_excluded_before_projects_and_totals_are_created() {
+        let wanted = wanted_providers_from(&config());
+        let mut rows: Vec<DbRow> = [
+            "GLM-5.3-Flash", "z-ai/glm-5.3-flash:makora",
+            "zai-org/GLM-5.3", "zhipu/glm-4.7", "zhipuai/glm-5",
+        ].iter().flat_map(|model| [
+            row("builtin:zai-coding-plan", model),
+            row("f4ef6d1e-1808-4c6d-8383-019efcc24c0c", model),
+        ]).collect();
+        assert!(parse_rows(&rows, &wanted, |_| panic!("excluded GLM project inspected")).is_empty());
+        rows.push(row("f4ef6d1e-1808-4c6d-8383-019efcc24c0c", "moonshotai/kimi-k3"));
+        let out = parse_rows(&rows, &wanted, |_| true);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["model"], "moonshotai/kimi-k3");
+        assert_eq!(out[0]["msgs"], 1);
     }
 }

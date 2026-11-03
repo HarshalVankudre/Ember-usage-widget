@@ -161,7 +161,7 @@ pub fn parse_rows<F: Fn(&str) -> bool>(rows: &[Value], exists: F) -> Vec<Bucket>
                 project: project.clone(),
                 session: session.clone(),
                 input: 0.0, output: 0.0, cached: 0.0, reasoning: 0.0, cache_write: 0.0,
-                total_input: 0.0, msgs: 0,
+                total_input: 0.0, msgs: 0, active_ms: 0.0,
                 cost: 0.0, cost_min: 0.0, cost_max: 0.0,
                 c_in: 0.0, c_out: 0.0, c_cached: 0.0, c_reasoning: 0.0, c_write: 0.0,
                 cache_savings: 0.0,
@@ -187,6 +187,7 @@ pub fn parse_rows<F: Fn(&str) -> bool>(rows: &[Value], exists: F) -> Vec<Bucket>
             cache_write,
             cache_write_known: row.get("cache_write").is_some_and(|v| !v.is_null()),
             total_input: input + cached + cache_write,
+            service_tier: row.get("service_tier").and_then(Value::as_str).unwrap_or("standard"),
         });
         bucket.cost += c.total;
         bucket.cost_min += c.cost_min;

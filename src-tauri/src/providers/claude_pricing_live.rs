@@ -1,6 +1,6 @@
 //! Daily refresh of Anthropic's official published pricing table.
 
-use super::claude_pricing::{set_live_prices, LivePrice};
+use super::claude_pricing::{set_live_prices, LivePrice, LongTier};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -16,7 +16,8 @@ pub const RETRY: Duration = Duration::from_secs(3600);
 pub const TICK: Duration = Duration::from_secs(10 * 60);
 const EARLY_MIN_GAP: Duration = Duration::from_secs(30 * 60);
 // 2: rows carry fast-mode rates, and Opus 5.5 must not wait out a v1 cache.
-const CACHE_VERSION: u32 = 2;
+// 3: rows carry a prompt-length tier (Haiku 5.5).
+const CACHE_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Default)]
 struct LiveState {
@@ -56,9 +57,14 @@ pub fn build_map(markdown: &str) -> HashMap<String, LivePrice> {
     // price. An unqualified row is the price, whatever the model.
     let standard_re = STANDARD.get_or_init(|| Regex::new(r"(?i)\bstarting\b").unwrap());
     let intro_re = INTRO.get_or_init(|| Regex::new(r"(?i)\bthrough\b").unwrap());
+    // "Claude Haiku 5.5 (for prompts over 100,000 tokens)" is the upper tier
+    // of the row above it, not a model of its own.
+    static OVER: OnceLock<Regex> = OnceLock::new();
+    let over_re = OVER.get_or_init(|| Regex::new(r"(?i)\bover\s+([\d,]+)\s+tokens").unwrap());
 
     let mut map = HashMap::new();
     let mut fast = Vec::new();
+    let mut long = Vec::new();
     let mut section = "";
     for line in markdown.lines() {
         if line.starts_with('#') {
@@ -90,6 +96,18 @@ pub fn build_map(markdown: &str) -> HashMap<String, LivePrice> {
         let family = hit[1].to_lowercase();
         let version = hit[2].replacen('.', "-", 1);
         let mut key = format!("{family}-{version}");
+        if let Some(over) = over_re.captures(cells[0]) {
+            let vals: Vec<Option<f64>> = cells[1..6].iter().map(|c| dollars(c)).collect();
+            if let (Ok(threshold), [Some(input), Some(cache_w5m), Some(cache_w1h), Some(cache_read), Some(output)]) =
+                (over[1].replace(',', "").parse::<f64>(), &vals[..])
+            {
+                long.push((key, LongTier {
+                    threshold, input: *input, cache_w5m: *cache_w5m, cache_w1h: *cache_w1h,
+                    cache_read: *cache_read, output: *output,
+                }));
+            }
+            continue;
+        }
         if standard_re.is_match(cells[0]) {
             key.push_str("@standard");
         } else if intro_re.is_match(cells[0]) {
@@ -104,13 +122,18 @@ pub fn build_map(markdown: &str) -> HashMap<String, LivePrice> {
         };
         map.insert(key, LivePrice {
             input, cache_w5m, cache_w1h, cache_read, output,
-            family: Some(family), fast_input: None, fast_output: None,
+            family: Some(family), ..Default::default()
         });
     }
     for (key, input, output) in fast {
         if let Some(row) = map.get_mut(&key) {
             row.fast_input = Some(input);
             row.fast_output = Some(output);
+        }
+    }
+    for (key, tier) in long {
+        if let Some(row) = map.get_mut(&key) {
+            row.long_context.get_or_insert(tier);
         }
     }
     map
@@ -222,6 +245,9 @@ mod tests {
              | Claude Sonnet 5 starting September 1, 2026 | $3 / MTok | $3.75 / MTok | $6 / MTok | $0.30 / MTok | $15 / MTok |\n\
              | Claude Opus 5.5 | $4 / MTok | $5 / MTok | $8 / MTok | $0.20 / MTok<sup>2</sup> | $20 / MTok |\n\
              | Claude Opus 5 | $5 / MTok | $6.25 / MTok | $10 / MTok | $0.50 / MTok | $25 / MTok |\n\
+             | Claude Sonnet 5.5 | $2 / MTok | $2.50 / MTok | $4 / MTok | $0.10 / MTok<sup>2</sup> | $10 / MTok |\n\
+             | Claude Haiku 5.5 (for prompts up to 100,000 tokens) | $0.10 / MTok | $0.125 / MTok | $0.20 / MTok | $0.01 / MTok | $0.50 / MTok |\n\
+             | Claude Haiku 5.5 (for prompts over 100,000 tokens) | $0.50 / MTok | $0.625 / MTok | $1 / MTok | $0.05 / MTok | $2.50 / MTok |\n\
              ### Fast mode pricing\n\
              | Model | Input | Output |\n\
              | Claude Opus 5.5 | $8 / MTok | $40 / MTok |\n\
@@ -243,5 +269,11 @@ mod tests {
         assert_eq!(map["sonnet-4"].input, 3.0);
         assert_eq!(map["sonnet-5@intro"].input, 2.0);
         assert_eq!(map["sonnet-5@standard"].output, 15.0);
+        assert_eq!(map["sonnet-5-5"].cache_read, 0.1);
+        let haiku = &map["haiku-5-5"];
+        assert_eq!((haiku.input, haiku.output), (0.1, 0.5));
+        let tier = haiku.long_context.unwrap();
+        assert_eq!((tier.threshold, tier.input, tier.cache_read, tier.output), (100_000.0, 0.5, 0.05, 2.5));
+        assert!(map["opus-5-5"].long_context.is_none());
     }
 }

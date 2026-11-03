@@ -7,16 +7,21 @@ use super::claudex_paths;
 use super::codex_pricing::{cost_of as codex_cost_of, CodexUsage};
 use super::model_attribution::is_openai_model;
 use serde::{Deserialize, Serialize};
+use super::turn_clock::{abandoned_turn, TurnClock};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-const CACHE_VERSION: u32 = 5; // v5: reasoning (thinking) tokens appended to cached entries
+// v5: reasoning (thinking) tokens appended to cached entries
+// v6: turn time appended; older logs are reparsed once to backfill it
+const CACHE_VERSION: u32 = 6;
 const LEGACY_ENTRY_LENGTH: usize = 13;
 const V4_ENTRY_LENGTH: usize = 14;
+const V5_ENTRY_LENGTH: usize = 15;
 
 /// entry: [dedupKey, date, hour, model, input, output, cacheRead, cacheW5m,
-///         cacheW1h, speed, inferenceGeo, webSearches, serviceTier, minute]
+///         cacheW1h, speed, inferenceGeo, webSearches, serviceTier, minute,
+///         reasoning, turnMs]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Entry(
     pub String,      // dedup key
@@ -34,6 +39,7 @@ pub struct Entry(
     pub String,      // service tier
     pub Option<u32>, // minute
     pub f64,         // reasoning (thinking subset of output — informational)
+    pub f64,         // turn ms: work time of the turn this call ended, else 0
 );
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -42,6 +48,9 @@ pub struct FileRec {
     pub mtime_ms: f64,
     pub size: u64,
     pub entries: Vec<Entry>,
+    /// The turn still running when the file was read: (entry, ms so far).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_turn: Option<(usize, f64)>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub gone: bool,
 }
@@ -76,6 +85,8 @@ pub struct Bucket {
     pub reasoning: f64,
     pub web_searches: f64,
     pub msgs: u64,
+    /// Work time of the finished turns that ended in this bucket.
+    pub active_ms: f64,
     pub cost: f64,
     pub cost_min: f64,
     pub cost_max: f64,
@@ -109,6 +120,9 @@ struct State {
     file_cache: BTreeMap<String, FileRec>,
     cache_needs_reparse: bool,
     memo: Option<Arc<Aggregate>>,
+    /// When an open turn in a quiet log will count as abandoned — the memo
+    /// goes stale then even though no file changed.
+    memo_expires_ms: f64,
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
@@ -116,6 +130,7 @@ static STATE: Mutex<State> = Mutex::new(State {
     file_cache: BTreeMap::new(),
     cache_needs_reparse: false,
     memo: None,
+    memo_expires_ms: f64::INFINITY,
 });
 
 pub fn claude_projects_dir() -> PathBuf {
@@ -145,6 +160,9 @@ fn upgrade_old_files(files: BTreeMap<String, serde_json::Value>) -> BTreeMap<Str
                         arr.push(serde_json::Value::Null);
                     }
                     if arr.len() == V4_ENTRY_LENGTH {
+                        arr.push(serde_json::json!(0.0));
+                    }
+                    if arr.len() == V5_ENTRY_LENGTH {
                         arr.push(serde_json::json!(0.0));
                     }
                 }
@@ -180,7 +198,7 @@ pub fn init(user_data: &Path) {
                 }
             }
         }
-        Some(3) | Some(4) => {
+        Some(3..=5) => {
             if let Some(files) = parsed.get("files") {
                 if let Ok(files) =
                     serde_json::from_value::<BTreeMap<String, serde_json::Value>>(files.clone())
@@ -276,12 +294,52 @@ fn str_field(v: Option<&serde_json::Value>) -> Option<&str> {
 }
 
 pub fn parse_content(text: &str, source: &str) -> Vec<Entry> {
-    let mut entries = Vec::new();
+    parse_transcript(text, source).0
+}
+
+/// Entries, plus the turn still open at the end of the transcript.
+pub fn parse_transcript(text: &str, source: &str) -> (Vec<Entry>, Option<(usize, f64)>) {
+    let mut entries: Vec<Entry> = Vec::new();
+    let mut turn = TurnClock::default();
+    let book = |entries: &mut Vec<Entry>, closed: Option<(usize, f64)>| {
+        if let Some((index, ms)) = closed {
+            entries[index].15 = ms;
+        }
+    };
     for line in text.split('\n') {
-        if line.is_empty() || !line.contains("\"usage\"") {
+        if line.is_empty() {
+            continue;
+        }
+        let has_usage = line.contains("\"usage\"");
+        // Cheap text checks before any JSON parse: tool results are user
+        // lines too, and they are most of a transcript's bytes.
+        let maybe_prompt = !has_usage
+            && line.contains("\"type\":\"user\"")
+            && !line.contains("\"tool_result\"");
+        let maybe_duration = !has_usage && line.contains("\"turn_duration\"");
+        if !has_usage && !maybe_prompt && !maybe_duration {
             continue;
         }
         let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        // Subagents run inside their parent's turn, whose time already covers
+        // them; only the main thread's turns are timed.
+        let main_thread = !obj.get("isSidechain").and_then(|v| v.as_bool()).unwrap_or(false);
+        let at_ms = obj.get("timestamp").and_then(|t| t.as_str()).and_then(crate::parse_ts_ms);
+        if !has_usage {
+            if !main_thread {
+                continue;
+            }
+            if obj.get("subtype").and_then(|v| v.as_str()) == Some("turn_duration") {
+                if let Some(ms) = obj.get("durationMs").and_then(|v| v.as_f64()) {
+                    book(&mut entries, turn.reported(ms));
+                }
+            } else if is_prompt(&obj) {
+                if let Some(at) = at_ms {
+                    book(&mut entries, turn.prompt(at));
+                }
+            }
+            continue;
+        }
         let msg = obj.get("message");
         let usage = msg.and_then(|m| m.get("usage"));
         let (Some(msg), Some(u)) = (msg, usage) else { continue };
@@ -357,9 +415,42 @@ pub fn parse_content(text: &str, source: &str) -> Vec<Entry> {
             str_field(u.get("service_tier")).unwrap_or("standard").to_string(),
             Some(parts.minute),
             reasoning,
+            0.0,
         ));
+        if main_thread {
+            if let Some(at) = at_ms {
+                turn.call(entries.len() - 1, at);
+                let finished = matches!(
+                    msg.get("stop_reason").and_then(|v| v.as_str()),
+                    Some("end_turn" | "stop_sequence" | "max_tokens" | "refusal")
+                );
+                if finished {
+                    book(&mut entries, turn.finish(at));
+                }
+            }
+        }
     }
-    entries
+    let open_turn = turn.pending();
+    (entries, open_turn)
+}
+
+/// A prompt someone typed, as opposed to the tool results, command echoes and
+/// injected context that are also logged as user lines.
+fn is_prompt(obj: &serde_json::Value) -> bool {
+    if obj.get("type").and_then(|v| v.as_str()) != Some("user")
+        || obj.get("isMeta").and_then(|v| v.as_bool()).unwrap_or(false)
+        || obj.get("isCompactSummary").and_then(|v| v.as_bool()).unwrap_or(false)
+    {
+        return false;
+    }
+    match obj.get("message").and_then(|m| m.get("content")) {
+        Some(serde_json::Value::String(s)) => !s.is_empty(),
+        Some(serde_json::Value::Array(parts)) => {
+            parts.iter().any(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"))
+                && !parts.iter().any(|p| p.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+        }
+        _ => false,
+    }
 }
 
 pub fn aggregate() -> Arc<Aggregate> {
@@ -406,10 +497,10 @@ pub fn aggregate() -> Arc<Aggregate> {
             }
         }
         let source = if projects_root_of(&key, &roots) == roots[1] { "claudex" } else { "claude" };
-        let parsed = std::fs::read_to_string(file).ok().map(|text| parse_content(&text, source));
+        let parsed = std::fs::read_to_string(file).ok().map(|text| parse_transcript(&text, source));
         match parsed {
-            Some(entries) => {
-                live_cache.insert(key, FileRec { mtime_ms, size, entries, gone: false });
+            Some((entries, open_turn)) => {
+                live_cache.insert(key, FileRec { mtime_ms, size, entries, open_turn, gone: false });
             }
             None => match prev {
                 // preserve cached history at legacy precision if a file is unreadable
@@ -421,7 +512,7 @@ pub fn aggregate() -> Arc<Aggregate> {
                     live_cache.insert(key, rec);
                 }
                 None => {
-                    live_cache.insert(key, FileRec { mtime_ms, size, entries: Vec::new(), gone: false });
+                    live_cache.insert(key, FileRec { mtime_ms, size, entries: Vec::new(), open_turn: None, gone: false });
                 }
             },
         }
@@ -457,7 +548,9 @@ pub fn aggregate() -> Arc<Aggregate> {
         } else if let Some(memo) = &state.memo {
             // Nothing was reparsed, added or removed, so the records are
             // byte-identical to the pass that produced the memo.
-            return memo.clone();
+            if crate::now_ms() < state.memo_expires_ms {
+                return memo.clone();
+            }
         }
     }
 
@@ -467,6 +560,32 @@ pub fn aggregate() -> Arc<Aggregate> {
     let mut buckets: BTreeMap<String, Bucket> = BTreeMap::new();
     let mut order: Vec<String> = Vec::new();
     let mut project_live: HashMap<String, bool> = HashMap::new();
+    // Turn time rides on the call that ended the turn. When that call is a
+    // duplicate (a resumed session copies earlier messages, and one response
+    // spans several log lines), the time goes to the bucket that kept the
+    // call's first copy — once.
+    let now = crate::now_ms();
+    let mut memo_expires_ms = f64::INFINITY;
+    let abandoned: HashMap<&str, (usize, f64)> = file_cache
+        .iter()
+        .filter_map(|(file, rec)| {
+            let turn = abandoned_turn(rec.open_turn, rec.mtime_ms, now);
+            if turn.is_none() && rec.open_turn.is_some() {
+                memo_expires_ms = memo_expires_ms.min(rec.mtime_ms + super::turn_clock::ABANDONED_AFTER_MS);
+            }
+            turn.map(|t| (file.as_str(), t))
+        })
+        .collect();
+    let timed_keys: std::collections::HashSet<&str> = file_cache
+        .iter()
+        .flat_map(|(file, rec)| {
+            let quiet = abandoned.get(file.as_str()).map(|(i, _)| *i);
+            rec.entries.iter().enumerate().filter(move |(i, e)| e.15 > 0.0 || quiet == Some(*i))
+        })
+        .map(|(_, e)| e.0.as_str())
+        .collect();
+    let mut timed_bucket: HashMap<String, String> = HashMap::new();
+    let mut timed_done: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (file, rec) in &file_cache {
         let project = project_of(file, &roots);
         let live = project_live.entry(project.clone()).or_insert(false);
@@ -475,9 +594,20 @@ pub fn aggregate() -> Arc<Aggregate> {
             continue;
         }
         let session = session_of(file, &roots);
-        for entry in &rec.entries {
-            let Entry(key, date, hour, model, inp, out, cr, cw5, cw1, speed, geo, web_searches, service_tier, minute, reasoning) = entry;
+        let quiet = abandoned.get(file.as_str()).copied();
+        for (index, entry) in rec.entries.iter().enumerate() {
+            let Entry(key, date, hour, model, inp, out, cr, cw5, cw1, speed, geo, web_searches, service_tier, minute, reasoning, turn_ms) = entry;
+            let turn_ms = &match quiet {
+                Some((i, ms)) if i == index => ms,
+                _ => *turn_ms,
+            };
             if seen.contains(key) {
+                if *turn_ms > 0.0 && !timed_done.contains(key) {
+                    if let Some(b) = timed_bucket.get(key).and_then(|bk| buckets.get_mut(bk)) {
+                        b.active_ms += turn_ms;
+                        timed_done.insert(key.clone());
+                    }
+                }
                 continue;
             }
             seen.insert(key.clone());
@@ -494,7 +624,7 @@ pub fn aggregate() -> Arc<Aggregate> {
                     session: session.clone(),
                     input: 0.0, output: 0.0, cache_read: 0.0, cache_w5m: 0.0, cache_w1h: 0.0,
                     reasoning: 0.0,
-                    web_searches: 0.0, msgs: 0,
+                    web_searches: 0.0, msgs: 0, active_ms: 0.0,
                     cost: 0.0, cost_min: 0.0, cost_max: 0.0,
                     c_in: 0.0, c_out: 0.0, c_cr: 0.0, c_cw: 0.0, c_reasoning: 0.0, c_tool: 0.0, cache_savings: 0.0,
                     priced_calls: 0, unpriced_calls: 0, estimated: false,
@@ -512,6 +642,13 @@ pub fn aggregate() -> Arc<Aggregate> {
             bucket.reasoning += reasoning;
             bucket.web_searches += web_searches;
             bucket.msgs += 1;
+            if timed_keys.contains(key.as_str()) {
+                timed_bucket.insert(key.clone(), bk.clone());
+                if *turn_ms > 0.0 {
+                    bucket.active_ms += turn_ms;
+                    timed_done.insert(key.clone());
+                }
+            }
 
             let gateway = is_openai_model(model);
             if gateway {
@@ -523,6 +660,7 @@ pub fn aggregate() -> Arc<Aggregate> {
                     cache_write_known: true,
                     total_input: inp + cr + cw5 + cw1,
                     reasoning: *reasoning,
+                    service_tier,
                 });
                 bucket.cost += c.total;
                 bucket.cost_min += c.cost_min;
@@ -569,6 +707,7 @@ pub fn aggregate() -> Arc<Aggregate> {
                 bucket.estimated = bucket.estimated || c.estimated;
                 bucket.fast_calls += if c.fast { 1 } else { 0 };
                 bucket.us_region_calls += if c.us_region { 1 } else { 0 };
+                bucket.long_context_calls += if c.long_context { 1 } else { 0 };
                 if !c.source.is_empty() {
                     bucket.pricing_source = c.source.clone();
                 }
@@ -586,13 +725,93 @@ pub fn aggregate() -> Arc<Aggregate> {
     }
 
     let memo = Arc::new(Aggregate { buckets: list, file_count: files.len() });
-    STATE.lock().unwrap().memo = Some(memo.clone());
+    {
+        let mut state = STATE.lock().unwrap();
+        state.memo = Some(memo.clone());
+        state.memo_expires_ms = memo_expires_ms;
+    }
     memo
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn transcript(lines: &[serde_json::Value]) -> String {
+        lines.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n")
+    }
+
+    fn prompt(ts: &str, text: &str) -> serde_json::Value {
+        serde_json::json!({ "type": "user", "timestamp": ts, "message": { "role": "user", "content": text } })
+    }
+
+    fn reply(ts: &str, id: &str, stop: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "assistant", "timestamp": ts, "requestId": format!("req-{id}"),
+            "message": { "id": id, "model": "claude-opus-5-5", "stop_reason": stop,
+                "usage": { "input_tokens": 1, "output_tokens": 1 } }
+        })
+    }
+
+    fn tool_result(ts: &str) -> serde_json::Value {
+        serde_json::json!({ "type": "user", "timestamp": ts,
+            "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "t", "content": "ok" }] } })
+    }
+
+    #[test]
+    fn a_finished_turn_is_timed_from_prompt_to_final_reply_on_the_final_call() {
+        let lines = transcript(&[
+            prompt("2026-09-29T10:00:00Z", "fix the bug"),
+            reply("2026-09-29T10:00:05Z", "m1", "tool_use"),
+            tool_result("2026-09-29T10:03:00Z"),
+            reply("2026-09-29T10:07:25Z", "m2", "end_turn"),
+        ]);
+        let entries = parse_content(&lines, "claude");
+        assert_eq!(entries[0].15, 0.0);
+        assert_eq!(entries[1].15, 445_000.0); // 7m 25s
+    }
+
+    #[test]
+    fn a_turn_still_running_books_no_time() {
+        let lines = transcript(&[
+            prompt("2026-09-29T10:00:00Z", "build it"),
+            reply("2026-09-29T10:00:05Z", "m1", "tool_use"),
+            tool_result("2026-09-29T10:01:00Z"),
+            reply("2026-09-29T10:02:00Z", "m2", "tool_use"),
+        ]);
+        assert!(parse_content(&lines, "claude").iter().all(|e| e.15 == 0.0));
+    }
+
+    #[test]
+    fn claude_codes_own_turn_duration_wins_over_the_measured_span() {
+        let lines = transcript(&[
+            prompt("2026-09-29T10:00:00Z", "go"),
+            reply("2026-09-29T10:00:30Z", "m1", "end_turn"),
+            serde_json::json!({ "type": "system", "subtype": "turn_duration", "durationMs": 31_250,
+                "timestamp": "2026-09-29T10:00:31Z" }),
+        ]);
+        assert_eq!(parse_content(&lines, "claude")[0].15, 31_250.0);
+    }
+
+    #[test]
+    fn an_interrupted_turn_ends_at_its_last_call() {
+        let lines = transcript(&[
+            prompt("2026-09-29T10:00:00Z", "try this"),
+            reply("2026-09-29T10:01:00Z", "m1", "tool_use"),
+            prompt("2026-09-29T11:00:00Z", "actually, stop"),
+        ]);
+        assert_eq!(parse_content(&lines, "claude")[0].15, 60_000.0);
+    }
+
+    #[test]
+    fn subagent_turns_are_not_timed_twice() {
+        let mut sub_prompt = prompt("2026-09-29T10:00:00Z", "explore");
+        sub_prompt["isSidechain"] = serde_json::json!(true);
+        let mut sub_reply = reply("2026-09-29T10:02:00Z", "s1", "end_turn");
+        sub_reply["isSidechain"] = serde_json::json!(true);
+        let entries = parse_content(&transcript(&[sub_prompt, sub_reply]), "claude");
+        assert_eq!(entries[0].15, 0.0);
+    }
 
     #[test]
     fn parses_claude_cache_ttls_and_request_level_pricing_modifiers() {
