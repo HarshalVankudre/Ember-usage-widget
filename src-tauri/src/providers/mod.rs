@@ -13,6 +13,7 @@ pub mod omp_usage;
 pub mod opencode_usage;
 pub mod pricing_overrides;
 pub mod quota_ledger;
+pub mod remote_sync;
 pub mod turn_clock;
 pub mod zcode_pricing;
 pub mod zcode_usage;

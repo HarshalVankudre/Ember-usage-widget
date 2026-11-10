@@ -12,7 +12,7 @@ pub mod signature;
 use providers::{
     claude_limits, claude_pricing_live, claude_usage, codex_limits, codex_pricing_live,
     codex_usage, model_attribution::is_first_party_model, normalize, omp_usage, opencode_usage,
-    pricing_overrides, quota_ledger::Ledger, zcode_usage,
+    pricing_overrides, quota_ledger::Ledger, remote_sync, zcode_usage,
 };
 use serde_json::{json, Value};
 use settings::Settings;
@@ -980,6 +980,12 @@ fn usage_dirs() -> Vec<PathBuf> {
             dirs.push(dir);
         }
     }
+    // One watch covers every remote mirror, including ones added later.
+    if let Some(remote) = remote_sync::mirror_parent() {
+        if !dirs.contains(&remote) {
+            dirs.push(remote);
+        }
+    }
     let omp = omp_usage::data_dir();
     if !dirs.contains(&omp) {
         dirs.push(omp);
@@ -1286,6 +1292,7 @@ pub fn run() {
             claude_pricing_live::init(&user_data);
             codex_pricing_live::init(&user_data);
             pricing_overrides::init(&user_data);
+            remote_sync::init(&user_data);
             let ledger = Ledger::load(&user_data);
 
             // Cached limits keep the cards warm before the first live reading.
@@ -1415,6 +1422,22 @@ pub fn run() {
                             next_due = now_ms() + wait.as_millis() as f64;
                         }
                         tokio::time::sleep(claude_pricing_live::TICK).await;
+                    }
+                });
+            }
+            // Claude Code usage from other machines on the same plan, pulled
+            // over ssh into local mirrors. remote-sources.json is reread every
+            // round, so adding a server needs no restart.
+            {
+                let app = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    loop {
+                        let config = remote_sync::load_config();
+                        if remote_sync::sync_all(&config).await {
+                            request_update(&app.state::<EmberState>(), false);
+                        }
+                        tokio::time::sleep(config.interval()).await;
                     }
                 });
             }

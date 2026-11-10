@@ -154,6 +154,23 @@ pub fn projects_dirs() -> Vec<PathBuf> {
     vec![claude_projects_dir(), claudex_paths::projects_dir()]
 }
 
+/// The local roots plus one mirror per remote machine (see `remote_sync`).
+/// The first two keep their positions: index 1 is the ClaudeX root.
+fn all_roots() -> Vec<PathBuf> {
+    let mut roots = projects_dirs();
+    roots.extend(super::remote_sync::mirror_roots().into_iter().map(|(_, dir)| dir));
+    roots
+}
+
+/// The source name when `root` is a remote mirror, else `None`.
+fn remote_name_of_root(root: &str) -> Option<String> {
+    let parent = super::remote_sync::mirror_parent()?;
+    let root = Path::new(root);
+    (root.parent() == Some(parent.as_path()))
+        .then(|| root.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .flatten()
+}
+
 /// Prices can change without any log changing; drop the memo so the next pass
 /// rebuilds instead of serving costs from the old rate table.
 pub fn invalidate() {
@@ -281,6 +298,9 @@ fn project_of(file: &str, roots: &[String]) -> String {
     let rel = file.strip_prefix(root).unwrap_or(file);
     let rel = rel.trim_start_matches(std::path::MAIN_SEPARATOR);
     let slug = rel.split(std::path::MAIN_SEPARATOR).next().unwrap_or("unknown");
+    if let Some(remote) = remote_name_of_root(root) {
+        return super::remote_sync::project_label(&remote, slug);
+    }
     // "C--Users-you-Desktop-my-app" -> "Desktop/my/app" style readable name
     let name = users_re.replace(slug, "").replace('-', "/");
     if name.is_empty() { "~ (home)".to_string() } else { name }
@@ -534,12 +554,12 @@ pub fn aggregate() -> Arc<Aggregate> {
         (state.file_cache.clone(), state.cache_path.clone(), state.cache_needs_reparse)
     };
 
-    let roots: Vec<String> = projects_dirs()
+    let roots: Vec<String> = all_roots()
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
     let mut files = Vec::new();
-    for dir in projects_dirs() {
+    for dir in all_roots() {
         list_jsonl_files(&dir, &mut files);
     }
 

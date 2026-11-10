@@ -159,6 +159,7 @@ Everything is read in place, from files the tools already write.
 | OpenCode (OpenAI provider) | `~/.local/share/opencode/opencode.db` | ✅ |
 | Oh My Pi (Anthropic, OpenAI and OpenAI-Codex rows) | `~/.omp/stats.db` | ✅ |
 | ZCode (Kimi and Qwen models; GLM is left out) | `~/.zcode/cli/db/db.sqlite` | ✅ |
+| Claude Code on another machine (a server on the same plan) | Its `~/.claude/projects`, copied over `ssh`. See [Usage from a server](#usage-from-a-server) | ✅ |
 | Claude plan limits | Anthropic's account API, read-only, with Claude Code's existing sign-in | ✅ |
 | Codex plan limits | `rate_limits` snapshots in the rollout logs | ✅ |
 | Chat in the Claude or ChatGPT apps and on the web | Not recorded on your machine, so it cannot be priced | — |
@@ -166,6 +167,28 @@ Everything is read in place, from files the tools already write.
 ZCode's models are not Claude or OpenAI models, so they appear as a third provider, valued against a dated snapshot of the OpenRouter catalog. That figure is an approximation: OpenRouter's price depends on which upstream served the request, and ZCode does not record it.
 
 Chat usage still moves the plan bars, because those percentages come from the provider and cover your whole account. It is outside Ember's token totals, which makes a measured "per 1%" rate a floor rather than a ceiling.
+
+## Usage from a server
+
+If you run Claude Code on a server or a second computer signed in to the same plan, Ember can add that usage to the totals on your desktop. The plan bars already cover it, because they come from your account. This adds the tokens and the value.
+
+Ember connects with the `ssh` client that ships with Windows 11. About once a minute it copies the remote machine's Claude Code logs into its data folder, and it prices them exactly like local ones. Only new bytes are sent, so once the first copy is done a quiet sync is just a file listing. You don't install anything on the server. It needs a Linux shell and the usual tools (`find`, `tail`, `awk`).
+
+1. Make sure `ssh you@your-server` works from PowerShell **without a password prompt** (a key, not a password). Ember runs ssh in batch mode, so it can't answer prompts.
+2. Open `remote-sources.json` in Ember's data folder (`%APPDATA%\com.harshalvankudre.ember-widget`) and add the server:
+
+```json
+{
+  "intervalSeconds": 60,
+  "sources": [
+    { "name": "vps", "ssh": "you@203.0.113.7" }
+  ]
+}
+```
+
+3. Save the file. No restart is needed: within a minute the server's projects show up as `vps · <project>`, and the totals, charts and session windows include them.
+
+`ssh` can also be a host alias from your `~/.ssh/config`. Optional fields: `port`, `identityFile`, `remotePath` (default `.claude/projects` under the remote home), `sshPath` and `enabled`. The outcome of each sync is written to `remote-sources-status.json` and `ember.log` in the same folder. The copies live under `remote\<name>\`, so the server's history stays in Ember even if its logs are later deleted, the same as for local logs.
 
 ## Install
 
