@@ -109,7 +109,7 @@ window.addEventListener('resize', () => { rootRem = 0; }, { passive: true });
 
 function chartFont(remSize, weight = '') {
   const px = Math.round(remSize * remPx() * 10) / 10;
-  return `${weight ? `${weight} ` : ''}${px}px "Cascadia Mono", Consolas, "Segoe UI", sans-serif`;
+  return `${weight ? `${weight} ` : ''}${px}px "Geist", "Segoe UI Variable Text", "Segoe UI", sans-serif`;
 }
 
 /* Resizing a canvas reallocates its backing store and resets the context, so
@@ -206,7 +206,6 @@ function updateValue(el, to, renderFn, animate) {
 }
 
 const paintMoney = (el, v) => { el.innerHTML = moneyHTML(v); };
-const paintCost = (el, v) => { el.textContent = fmtCost(v); };
 const paintTokens = (el, v) => { el.textContent = `${fmtTok(Math.max(0, v))} tokens`; };
 const paintCalls = (el, v) => { el.textContent = `${Math.round(Math.max(0, v)).toLocaleString()} calls`; };
 
@@ -708,11 +707,17 @@ function render({ animate = false } = {}) {
   // today's spend under the mascots (provider/model filters apply; date filter doesn't — it's live)
   const t = today();
   let todayCost = 0;
+  let todayTok = 0;
+  let todayCalls = 0;
   for (const b of state.buckets) {
     if (state.hiddenProjects.has(b.project)) continue;
-    if (b.date === t && passesLiveFilters(b)) todayCost += b.cost;
+    if (b.date !== t || !passesLiveFilters(b)) continue;
+    todayCost += b.cost;
+    todayTok += b.input + b.output + b.cacheRead + b.cacheWrite;
+    todayCalls += b.msgs;
   }
-  updateValue($('todayVal'), todayCost, paintCost, animate);
+  updateValue($('todayVal'), todayCost, paintMoney, animate);
+  $('todayTok').textContent = todayCalls ? `${fmtTok(todayTok)} tokens\n${todayCalls.toLocaleString()} calls` : 'no activity';
 
   // rolling windows: last 5 hours (to the minute) and last 7 days.
   // Provider/model filters apply; the date filter intentionally doesn't — these are live.
@@ -758,6 +763,7 @@ function render({ animate = false } = {}) {
   updateValue($('heroMsgs'), tot.msgs, paintCalls, animate);
   renderPeriodDelta(tot.cost);
   renderPricingConfidence(tot, byModel);
+  renderLedger(tot);
 
   const providersKey = `${state.dataRevision}|${setKey(state.selectedProviders)}`;
   if (sectionRenderKeys.providers !== providersKey) {
@@ -945,6 +951,19 @@ function renderPricingConfidence(tot, byModel) {
   range.textContent = spread >= 0.005 ? `lower ${fmtCost(tot.costMin)}` : '';
 }
 
+/* The four billable classes of the current view. The costs are the priced
+   portion, the same figures that add up to the headline. */
+function renderLedger(tot) {
+  const cell = (id, tokens, cost, note = '', estimated = false) => {
+    $(id).innerHTML = tokHTML(tokens);
+    $(`${id}Cost`).textContent = `${estimated ? '≈' : ''}${fmtCost(cost)}${note}`;
+  };
+  cell('ledIn', tot.input, tot.cIn);
+  cell('ledOut', tot.output, tot.cOut, tot.reasoning > 0 ? ` · ${fmtTok(tot.reasoning)} reasoning` : '');
+  cell('ledRead', tot.cacheRead, tot.cCr);
+  cell('ledWrite', tot.cacheWrite, tot.cCw, '', tot.estimated);
+}
+
 function renderProviderChips() {
   const present = [...new Set(state.buckets.map((b) => b.provider))];
   const wrap = $('providerChips');
@@ -1030,9 +1049,12 @@ function renderModelTable(byModel) {
   if (archived.length) {
     const tr = document.createElement('tr');
     const label = document.createElement('td');
-    label.colSpan = 5;
+    // The total can read "≈$8,642 + unpriced", which a single cost column
+    // clips, so the row is split in two halves instead.
+    label.colSpan = 3;
     label.textContent = `Archived models · ${archived.length} · included in totals`;
     const cost = document.createElement('td');
+    cost.colSpan = 3;
     cost.className = 'r';
     const value = archived.reduce((sum, m) => sum + m.cost, 0);
     const partial = archived.some((m) => !m.priced);
@@ -2072,7 +2094,9 @@ function buildQuotaScopes() {
       mode,
       meter,
       windowMs,
-      label: both ? `${pmeta(provider).label} · ${short}` : short,
+      // With both providers the name already says which limit it is, so the
+      // word "session" is dropped and four tabs fit on one row.
+      label: both ? `${pmeta(provider).label} · ${short.replace(/ session$/, '')}` : short,
       title,
     });
   };
@@ -2252,6 +2276,7 @@ function renderQuotaLive(rows, scope, animate) {
   }
   card.hidden = false;
   $('quotaLiveLabel').textContent = scope.mode === 'session' ? 'Current session' : 'Current week';
+  $('quotaRingLabel').textContent = scope.mode === 'session' ? 'of session' : 'of week';
   $('quotaLiveClock').textContent = `${fmtClock(live.startedAt)} · ${fmtRemaining(live.endsAt - Date.now())}`;
   updateValue($('quotaLiveCost'), live.totals.cost, paintMoney, animate);
   $('quotaLiveTokens').textContent = live.totals.msgs

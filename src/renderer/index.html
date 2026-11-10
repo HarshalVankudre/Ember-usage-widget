@@ -64,38 +64,10 @@
       </div>
     </header>
 
-    <!-- One scroll for everything under the titlebar. The readout bands scroll
-         away and the filter bar sticks, so the panels get the whole window
-         instead of the sliver left under a fixed stack of bands. -->
+    <!-- One scroll for everything under the titlebar. The filter bar sticks to
+         the top; below it the deck is a grid of cards that sits side by side
+         when the window is wide and folds to one column when it is not. -->
     <div class="scroll-area" id="scrollArea" tabindex="0" aria-label="Usage details">
-      <section class="hero" aria-labelledby="heroLabel">
-        <div class="hero-main">
-          <p class="hero-label" id="heroLabel">API-equivalent spend · all time</p>
-          <div class="hero-cost" id="heroCost" aria-live="polite">$0.00</div>
-          <div class="hero-sub"><span id="heroTokens">0 tokens</span><span aria-hidden="true">/</span><span id="heroMsgs">0 calls</span><span class="hero-delta" id="heroDelta" hidden></span></div>
-          <div class="pricing-confidence" id="pricingConfidence">
-            <span class="confidence-mark" aria-hidden="true"></span>
-            <span id="pricingSummary">Checking official-rate coverage…</span>
-            <span class="confidence-range" id="pricingRange"></span>
-          </div>
-        </div>
-        <button class="pet" id="pet" type="button" title="Ember reacts as plan limits heat up" aria-label="Animate Ember mark">
-          <img class="pet-logo" src="assets/logo-mark.png" alt="" aria-hidden="true" />
-          <span><b id="todayVal">–</b><small>today</small></span>
-        </button>
-      </section>
-
-      <section class="limits" id="limitsSection" aria-labelledby="limitsHeading" hidden>
-        <div class="section-kicker" id="limitsHeading">Plan headroom</div>
-        <div id="limitRows"></div>
-      </section>
-
-      <section class="windows" aria-label="Rolling usage windows">
-        <article class="window-metric"><span>Last 5 hours</span><strong id="w5hCost">–</strong><small id="w5hTok">no activity</small></article>
-        <article class="window-metric"><span>Last 7 days</span><strong id="wkCost">–</strong><small id="wkTok">no activity</small></article>
-        <article class="window-metric"><span>This month</span><strong id="mtdCost">–</strong><small id="mtdProj">no activity</small></article>
-      </section>
-
       <section class="filters" id="filters" aria-label="Usage filters">
         <div class="chip-row date-chips" id="dateChips" role="group" aria-label="Date range">
           <span class="seg-thumb" id="segThumb" aria-hidden="true"></span>
@@ -133,46 +105,85 @@
         <div class="filter-scroller" id="modelScroller"><div class="chip-row models" id="modelChips" aria-label="Model filters"></div></div>
       </section>
 
-      <div class="panels">
-        <section class="panel quota-panel" aria-labelledby="quotaHeading">
+      <div class="deck">
+        <section class="card hero" aria-labelledby="heroLabel">
+          <div class="hero-main">
+            <p class="hero-label" id="heroLabel">API-equivalent spend · all time</p>
+            <div class="hero-cost" id="heroCost" aria-live="polite">$0.00</div>
+            <div class="hero-sub"><span id="heroTokens">0 tokens</span><span aria-hidden="true">·</span><span id="heroMsgs">0 calls</span><span class="hero-delta" id="heroDelta" hidden></span></div>
+            <div class="pricing-confidence" id="pricingConfidence">
+              <span class="confidence-mark" aria-hidden="true"></span>
+              <span id="pricingSummary">Checking official-rate coverage…</span>
+              <span class="confidence-range" id="pricingRange"></span>
+            </div>
+          </div>
+          <button class="pet" id="pet" type="button" title="Ember reacts as plan limits heat up" aria-label="Animate Ember mark">
+            <img class="pet-logo" src="assets/logo-mark.png" alt="" aria-hidden="true" />
+          </button>
+        </section>
+
+        <section class="card limits" id="limitsSection" aria-labelledby="limitsHeading" hidden>
+          <div class="card-label" id="limitsHeading">Plan headroom</div>
+          <div id="limitRows"></div>
+        </section>
+
+        <section class="tiles" aria-label="Rolling usage windows">
+          <article class="card tile"><span>Today</span><strong id="todayVal">–</strong><small id="todayTok">no activity</small></article>
+          <article class="card tile"><span>Last 5 hours</span><strong id="w5hCost">–</strong><small id="w5hTok">no activity</small></article>
+          <article class="card tile"><span>Last 7 days</span><strong id="wkCost">–</strong><small id="wkTok">no activity</small></article>
+          <article class="card tile"><span>This month</span><strong id="mtdCost">–</strong><small id="mtdProj">no activity</small></article>
+        </section>
+
+        <!-- The window that is open right now. It follows the scope chosen in
+             the Session burn card beside it. -->
+        <section class="card live-card" aria-label="Current window">
+          <article class="quota-live" id="quotaLive" hidden>
+            <div class="ring" id="quotaMeter" hidden>
+              <i id="quotaMeterFill" style="--w:0%"></i>
+              <div class="ring-read"><b id="quotaMeterPct">–</b><small id="quotaRingLabel">of session</small></div>
+            </div>
+            <div class="quota-live-body">
+              <span class="quota-live-label" id="quotaLiveLabel">Current window</span>
+              <strong class="quota-live-cost" id="quotaLiveCost">$0.00</strong>
+              <span class="quota-live-tokens" id="quotaLiveTokens">no activity yet</span>
+              <span class="quota-live-clock" id="quotaLiveClock"></span>
+              <p class="quota-projection" id="quotaProjection"></p>
+            </div>
+          </article>
+          <p class="live-empty">No window is open right now. The next call starts one.</p>
+        </section>
+
+        <section class="card panel quota-panel" aria-labelledby="quotaHeading">
           <div class="panel-head">
             <h2 id="quotaHeading">Session burn</h2>
             <span class="panel-note" id="quotaNote">what one window buys</span>
           </div>
-
-          <div class="quota-scopes" id="quotaScopes" role="tablist" aria-label="Quota window"></div>
-
-          <article class="quota-live" id="quotaLive" hidden>
-            <div class="quota-live-top">
-              <span class="quota-live-label" id="quotaLiveLabel">Current window</span>
-              <span class="quota-live-clock" id="quotaLiveClock"></span>
-            </div>
-            <div class="quota-live-figures">
-              <strong class="quota-live-cost" id="quotaLiveCost">$0.00</strong>
-              <span class="quota-live-tokens" id="quotaLiveTokens">no activity yet</span>
-            </div>
-            <div class="quota-meter" id="quotaMeter" hidden>
-              <div class="quota-meter-bar"><i id="quotaMeterFill" style="--w:0%"></i></div>
-              <span class="quota-meter-pct" id="quotaMeterPct">–</span>
-            </div>
-            <p class="quota-projection" id="quotaProjection"></p>
-          </article>
-
-          <div class="quota-metrics" id="quotaMetrics" role="group" aria-label="History metric"></div>
-
+          <div class="quota-controls">
+            <div class="quota-scopes" id="quotaScopes" role="tablist" aria-label="Quota window"></div>
+            <div class="quota-metrics" id="quotaMetrics" role="group" aria-label="History metric"></div>
+          </div>
           <div class="quota-chart-wrap">
             <canvas id="quotaChart" role="application" tabindex="0" aria-label="Usage per window over time. Use left and right arrow keys to move between windows.">Usage per window</canvas>
             <div id="quotaTip" class="chart-tip" hidden></div>
           </div>
-
         </section>
 
-        <section class="panel" aria-labelledby="chartHeading">
+        <section class="card panel history-panel" aria-labelledby="chartHeading">
           <div class="panel-head"><h2 id="chartHeading">Burn history</h2><span class="panel-note" id="chartNote"></span></div>
           <div class="chart-wrap"><canvas id="chart" role="application" tabindex="0" aria-label="Interactive API-equivalent cost history. Use left and right arrow keys to choose a period, then press Enter for full details.">Cost history chart</canvas><div id="chartTip" class="chart-tip" hidden></div></div>
         </section>
 
-        <section class="panel" aria-labelledby="modelsHeading">
+        <section class="card panel ledger-panel" aria-labelledby="ledgerHeading">
+          <div class="panel-head"><h2 id="ledgerHeading">Token ledger</h2><span class="panel-note">cost by billable class</span></div>
+          <div class="ledger">
+            <article class="ledger-cell"><span>Input</span><strong id="ledIn">–</strong><small id="ledInCost"></small></article>
+            <article class="ledger-cell"><span>Output</span><strong id="ledOut">–</strong><small id="ledOutCost"></small></article>
+            <article class="ledger-cell"><span>Cache read</span><strong id="ledRead">–</strong><small id="ledReadCost"></small></article>
+            <article class="ledger-cell"><span>Cache write</span><strong id="ledWrite">–</strong><small id="ledWriteCost"></small></article>
+          </div>
+        </section>
+
+        <section class="card panel models-panel" aria-labelledby="modelsHeading">
           <div class="panel-head"><h2 id="modelsHeading">Models</h2><span class="panel-note">official-rate cost</span></div>
           <div class="table-scroll">
             <table class="model-table" id="modelTable">
@@ -184,7 +195,7 @@
           </div>
         </section>
 
-        <section class="panel" aria-labelledby="projectsHeading">
+        <section class="card panel projects-panel" aria-labelledby="projectsHeading">
           <div class="panel-head"><h2 id="projectsHeading">Projects</h2><span class="panel-note" id="projNote">sorted by cost</span></div>
           <div id="projectList" class="project-list"></div>
         </section>

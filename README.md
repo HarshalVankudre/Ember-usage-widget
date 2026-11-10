@@ -27,12 +27,12 @@ what you used, what it would have cost at API rates, and how much plan you have 
 
 <table>
   <tr>
-    <td><img src="docs/ember.png" width="380" alt="Ember showing the all-time API-equivalent value, Claude and Codex plan headroom, rolling windows, and the session burn panel with a live 5-hour window and its history" /></td>
-    <td><img src="docs/ember-windows.png" width="380" alt="Ember showing the per-window session history and the token ledger split into input, output, cache read and cache write" /></td>
+    <td><img src="docs/ember.png" width="400" alt="Ember in its dark theme on a portrait monitor: the all-time API-equivalent value beside Claude and Codex plan headroom, four rolling-window tiles, the live session ring beside the session burn chart, burn history beside the token ledger, and the models table beside the project list" /></td>
+    <td><img src="docs/ember-light.png" width="400" alt="The same Ember window in the light theme" /></td>
   </tr>
 </table>
 
-<sub>Local logs · live limits · official API rates · no account, no telemetry</sub>
+<sub>The whole ledger on one portrait 1080p screen, dark or light · local logs · live limits · official API rates · no account, no telemetry</sub>
 
 </div>
 
@@ -53,6 +53,12 @@ A subscription makes AI coding feel unlimited until a meter turns red, and the p
 
 ## Features
 
+**One screen**
+
+- A grid of cards that shows the whole ledger at once on a portrait 1080p monitor, with nothing to scroll
+- Cards sit side by side in any wide window and fold to a single column in a narrow one
+- Long lists (models, projects) scroll inside their own card, so the page stays still
+
 **The ledger**
 
 - One headline figure for combined Claude and Codex API-equivalent value, with a lower bound when part of it is estimated
@@ -70,12 +76,14 @@ A subscription makes AI coding feel unlimited until a meter turns red, and the p
 **Plan headroom**
 
 - Live session and weekly bars for both providers, on a poller that backs off and recovers
+- A ring for the window that is open right now: percent used, value so far, time left
 - [Session burn](#session-burn): what one window costs and what a percent of plan buys
 - Current plan names, including Anthropic's Max and Ultra
 
 **Living on the desktop**
 
-- [Compact mode](#compact-mode), tray residency, always-on-top, autostart, themes, Windows 11 acrylic
+- [Compact mode](#compact-mode), tray residency, always-on-top, autostart, Windows 11 acrylic
+- Six themes: Ember dark and light, Ember Noir, Catppuccin, Tokyo Night and Rosé Pine
 - Export to CSV or JSON, or copy a Markdown summary
 
 ## How the number is worked out
@@ -137,7 +145,7 @@ The session-burn panel ignores the date, provider and model filters on purpose. 
 
 Collapse Ember to a strip that keeps the live window on screen while you work: value spent, quota consumed, time left. Double-click to expand, or use the tray.
 
-<div align="center"><img src="docs/ember-compact.png" width="420" alt="Ember collapsed to a compact strip showing the live session value, quota bar and time remaining" /></div>
+<div align="center"><img src="docs/ember-compact.png" width="348" alt="Ember collapsed to a compact strip showing the live session value, quota bar and time remaining" /></div>
 
 ## What Ember reads
 
@@ -224,11 +232,11 @@ It is not meant to. On a subscription you pay a flat fee; Ember shows what the s
 </details>
 
 <details>
-<summary><strong>My all-time total changed after updating to 2.1.3. Was something counted twice?</strong></summary>
+<summary><strong>My all-time total changed after updating. Was something counted twice?</strong></summary>
 
 <br />
 
-No. The call and token counts are the same; the prices applied to them were corrected. Earlier versions priced all history at today's rates, missed the Fast tier on current Codex logs, and under-read the output of streamed Claude replies. Each correction raises the figure, so totals go up, most of all if you used GPT-5.6 Sol before its August 2026 price cut.
+No. The call and token counts are the same; the prices applied to them were corrected. Versions before 2.1.3 priced all history at today's rates, missed the Fast tier on current Codex logs, and under-read the output of streamed Claude replies. Each correction raises the figure, so totals go up, most of all if you used GPT-5.6 Sol before its August 2026 price cut.
 
 </details>
 
@@ -294,9 +302,13 @@ EMBER_VERIFY_DIR=/path/to/copy cargo test --manifest-path src-tauri/Cargo.toml r
 
 When a provider changes its prices, save the new pricing page into `src-tauri/src/providers/fixtures/` and the row-by-row tests will show which bundled rates need to move.
 
+For work on the interface, the ignored `dump_preview_payload` test writes the usage, limits and quota payloads to `preview-payload.json` in that same folder, so the renderer can be opened in a browser with a stubbed `window.api` instead of inside the app.
+
 ## Author
 
 Created and maintained by **[Harshal Vankudre](https://github.com/HarshalVankudre)**.
+
+The interface is set in [Geist](https://vercel.com/font) (SIL Open Font License), bundled with the app so nothing is fetched at run time.
 
 The Ember mark combines a flame with rising usage-meter bars (`src/assets/logo.png`; regenerate the in-app and Windows icons with `scripts/render-logo.ps1`). Ember grew from the original Claude and Codex usage widgets into a single, provider-aware ledger.
 

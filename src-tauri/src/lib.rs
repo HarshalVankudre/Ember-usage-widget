@@ -1616,3 +1616,56 @@ mod claude_poll_tests {
         assert_eq!(claude_backoff_ms(f64::NAN), CLAUDE_BACKOFF_MIN_MS, "garbage -> floor");
     }
 }
+
+#[cfg(test)]
+mod preview_fixture {
+    use super::*;
+
+    /// Not a unit test: writes what the window asks for at startup (usage,
+    /// limits, quota) to `preview-payload.json`, so the renderer can be opened
+    /// in a browser without the app. Point EMBER_VERIFY_DIR at a **copy** of
+    /// Ember's data folder; the run rewrites the usage caches in it.
+    #[test]
+    #[ignore]
+    fn dump_preview_payload() {
+        let dir = PathBuf::from(std::env::var("EMBER_VERIFY_DIR").expect("EMBER_VERIFY_DIR"));
+        claude_usage::init(&dir);
+        codex_usage::init(&dir);
+        omp_usage::init(&dir);
+        claude_pricing_live::init(&dir);
+        codex_pricing_live::init(&dir);
+        let claude = claude_usage::aggregate();
+        let codex = codex_usage::aggregate();
+        let omp = omp_usage::aggregate();
+        let mut buckets = Vec::new();
+        for b in claude.buckets.iter().filter(|b| is_first_party_model(&b.model)) {
+            buckets.push(normalize::normalize_claude(b));
+        }
+        for b in codex.buckets.iter().filter(|b| is_first_party_model(&b.model)) {
+            buckets.push(normalize::normalize_codex(b));
+        }
+        buckets.extend(omp.buckets.iter().cloned());
+        let read = |name: &str| {
+            std::fs::read_to_string(dir.join(name))
+                .ok()
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                .unwrap_or(Value::Null)
+        };
+        let ledger = providers::quota_ledger::Ledger::load(&dir);
+        let payload = json!({
+            "usage": {
+                "buckets": buckets,
+                "generatedAt": now_ms(),
+                "revision": 1,
+                "fileCount": claude.file_count + codex.file_count + omp.file_count,
+                "pricing": {
+                    "openai": codex_pricing_live::status(),
+                    "anthropic": claude_pricing_live::status(),
+                },
+            },
+            "limits": { "claude": read("claude-limits-cache.json"), "codex": read("codex-limits-cache.json") },
+            "quota": ledger.snapshot(now_ms()),
+        });
+        std::fs::write(dir.join("preview-payload.json"), serde_json::to_string(&payload).unwrap()).unwrap();
+    }
+}

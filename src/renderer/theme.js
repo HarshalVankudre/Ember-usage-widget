@@ -13,10 +13,12 @@
 (() => {
   const STORAGE_KEY = 'emberTheme';
 
-  /* Ordered as the picker shows them: Ember's own first, then the schemes
-     developers are most likely already running in their editor. */
+  /* Ordered as the picker shows them, three to a row: Ember's own palettes
+     first, then the schemes developers are most likely already running in
+     their editor. */
   const THEMES = [
-    { id: 'classic', name: 'Ember Classic', swatch: ['#0d0806', '#46c194', '#f2b45c', '#ff6d3b'] },
+    { id: 'classic', name: 'Ember', swatch: ['#0e0d0c', '#4fc79b', '#f2b45c', '#ff7a45'] },
+    { id: 'light', name: 'Ember Light', swatch: ['#f1eeea', '#1d9a6c', '#c28100', '#d4521b'] },
     { id: 'noir', name: 'Ember Noir', swatch: ['#0b0e14', '#2fb59c', '#f0b44f', '#ff7a45'] },
     { id: 'catppuccin', name: 'Catppuccin', swatch: ['#11111b', '#a6e3a1', '#f9e2af', '#fab387'] },
     { id: 'tokyonight', name: 'Tokyo Night', swatch: ['#16161e', '#73daca', '#e0af68', '#ff9e64'] },
