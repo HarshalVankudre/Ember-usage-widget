@@ -424,9 +424,38 @@
     return Math.sqrt(varSum / clean.length) / avg;
   }
 
+  /* ---------------- Claude's optional five-hour limit ---------------- */
+
+  // Since 30 Oct 2026 a verified Ultra account (the plan that was Max 20x)
+  // has no five-hour limit: the account API stops publishing a session window
+  // and only the weekly ones remain. Returns:
+  //   { known: false }               — no usable account telemetry
+  //   { known: true, window: null }  — telemetry says there is no session limit
+  //   { known: true, window: {...} } — the session limit, as { utilization, resets_at }
+  function claudeSessionLimit(limits) {
+    const d = limits && limits.ok && limits.data;
+    if (!d || typeof d !== 'object') return { known: false, window: null };
+    const list = Array.isArray(d.limits) ? d.limits.filter(Boolean) : [];
+    if (d.five_hour) {
+      return {
+        known: true,
+        window: { utilization: d.five_hour.utilization, resets_at: d.five_hour.resets_at },
+      };
+    }
+    const entry = list.find((v) => v.kind === 'session');
+    if (entry) {
+      return { known: true, window: { utilization: entry.percent, resets_at: entry.resets_at } };
+    }
+    // Only a payload that still carries the weekly limit proves the session
+    // one is gone; an empty or unfamiliar payload proves nothing.
+    const hasWeekly = !!d.seven_day || list.some((v) => v.kind === 'weekly_all');
+    return { known: hasWeekly, window: null };
+  }
+
   return {
     HOUR_MS,
     SESSION_MS,
+    claudeSessionLimit,
     WEEK_MS,
     floorToHour,
     bucketTime,

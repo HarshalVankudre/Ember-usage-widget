@@ -36,11 +36,12 @@ const WATCH_MAX_WAIT_MS: u64 = 380;
 // An unchanged pass costs a stat sweep rather than a full rebuild, which is
 // what makes reconciling this often affordable.
 const RECONCILE_INTERVAL_MS: u64 = 8 * 1000;
-// The account endpoint rate-limits hard, so polls stay spaced even when usage
-// is pouring in; the periodic poll below is the floor, this is the ceiling.
-const CLAUDE_MIN_POLL_MS: f64 = 90.0 * 1000.0;
-const CLAUDE_FORCE_COOLDOWN_MS: f64 = 60.0 * 1000.0;
-const CLAUDE_CATCH_UP_MS: u64 = 25 * 1000;
+// The plan meters are polled every minute; while usage is pouring in, catch-up
+// polls can tighten that to the minimum spacing below, never past it.
+const CLAUDE_POLL_INTERVAL_MS: u64 = 60 * 1000;
+const CLAUDE_MIN_POLL_MS: f64 = 30.0 * 1000.0;
+const CLAUDE_FORCE_COOLDOWN_MS: f64 = 15.0 * 1000.0;
+const CLAUDE_CATCH_UP_MS: u64 = 10 * 1000;
 // A poll that never returns must not own the slot forever. The request itself
 // is capped at 15s, so anything still "in flight" past this was dropped or
 // wedged (a suspend mid-request outlives tokio's timer, which is monotonic and
@@ -49,7 +50,7 @@ const CLAUDE_POLL_STALL_MS: f64 = 60.0 * 1000.0;
 // Retry-After is honored, but only within a window a person would wait through:
 // below the floor the endpoint just gets hammered again, above the ceiling the
 // meter silently sits out the rest of the day.
-const CLAUDE_BACKOFF_MIN_MS: f64 = 10.0 * 60.0 * 1000.0;
+const CLAUDE_BACKOFF_MIN_MS: f64 = 2.0 * 60.0 * 1000.0;
 const CLAUDE_BACKOFF_MAX_MS: f64 = 30.0 * 60.0 * 1000.0;
 
 /* ---------------- small JS-parity helpers ---------------- */
@@ -355,8 +356,8 @@ fn send_limits(app: &AppHandle) {
 }
 
 /// New usage moves the plan meters, so the headroom bars and the quota rate
-/// would otherwise lag the burn by up to five minutes. One catch-up poll after
-/// a burst settles keeps them current without a faster polling loop.
+/// would otherwise lag the burn by up to a full poll interval. One catch-up
+/// poll after a burst settles keeps them current between periodic polls.
 fn schedule_claude_catch_up(app: &AppHandle) {
     let state = app.state::<EmberState>();
     if state.catch_up_pending.swap(true, Ordering::SeqCst) {
@@ -394,8 +395,8 @@ fn claude_poll_gate(cl: &ClaudeLimitsState, now: f64, force: bool) -> PollGate {
         // The 429 backoff is deliberately not consulted here. Refresh is the
         // manual override, and a widget that cannot be told to try again is how
         // one transient rate limit turns into a snapshot frozen for hours. The
-        // cooldown below is what keeps the strict endpoint safe from spam: even
-        // held down, the button is worth at most one request a minute.
+        // cooldown below is what keeps the endpoint safe from spam: even held
+        // down, the button is worth at most one request every 15 seconds.
         let retry_at = (cl.last_forced_at + CLAUDE_FORCE_COOLDOWN_MS)
             .max(cl.last_poll_at + CLAUDE_FORCE_COOLDOWN_MS);
         if now < retry_at {
@@ -501,8 +502,9 @@ async fn push_claude_limits(app: &AppHandle, force: bool) -> Value {
         journal::note("claude poll ok");
     } else {
         journal::note(format!(
-            "claude poll failed reason={} backoff={}s",
+            "claude poll failed reason={} retry_after={}s backoff={}s",
             res.get("reason").and_then(|r| r.as_str()).unwrap_or("?"),
+            res.get("retryAfter").and_then(|v| v.as_f64()).unwrap_or(0.0),
             ((retry_at - now_ms()) / 1000.0).max(0.0).round()
         ));
     }
@@ -1309,7 +1311,7 @@ pub fn run() {
                 .as_ref()
                 .and_then(|v| v.get("fetchedAt"))
                 .and_then(|v| v.as_f64())
-                .map(|at| now_ms() - at < 4.0 * 60.0 * 1000.0)
+                .map(|at| now_ms() - at < CLAUDE_POLL_INTERVAL_MS as f64)
                 .unwrap_or(false);
 
             let (update_tx, update_rx) = mpsc::unbounded_channel::<bool>();
@@ -1358,9 +1360,8 @@ pub fn run() {
             tauri::async_runtime::spawn(watch_debouncer(handle.clone(), watch_rx));
             tauri::async_runtime::spawn(bounds_worker(handle.clone(), bounds_rx));
 
-            // Claude plan-limit polling: a fresh-enough snapshot from the last
-            // run means startup costs no request; the periodic poll stays
-            // gentle because the endpoint 429s easily.
+            // Claude plan-limit polling: a snapshot from the last run that is
+            // younger than one interval means startup costs no request.
             journal::note(format!(
                 "cached claude snapshot {}",
                 if cache_fresh { "fresh, first poll skipped" } else { "stale, polling at +2s" }
@@ -1375,7 +1376,8 @@ pub fn run() {
             {
                 let app = handle.clone();
                 tauri::async_runtime::spawn(async move {
-                    let mut interval = tokio::time::interval(Duration::from_secs(5 * 60));
+                    let mut interval =
+                        tokio::time::interval(Duration::from_millis(CLAUDE_POLL_INTERVAL_MS));
                     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     interval.tick().await; // immediate first tick — skip it
                     loop {

@@ -252,7 +252,7 @@ pub fn scoped_model_key(display_name: &str) -> String {
 
 fn scoped_model_label(display_name: &str) -> String {
     static FABLE: OnceLock<Regex> = OnceLock::new();
-    let fable = FABLE.get_or_init(|| Regex::new(r"(?i)^fable(\s*5)?$").unwrap());
+    let fable = FABLE.get_or_init(|| Regex::new(r"(?i)^fable(\s*5(\.\d+)?)?$").unwrap());
     let name = display_name.trim();
     if name.is_empty() {
         return "Scoped model".to_string();

@@ -14,14 +14,24 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 // v5: reasoning (thinking) tokens appended to cached entries
 // v6: turn time appended; older logs are reparsed once to backfill it
-const CACHE_VERSION: u32 = 6;
+// v7: turn time and exact request timestamp stored as an object
+// v8: advisor-model passes are entries of their own; logs are reparsed once
+const CACHE_VERSION: u32 = 8;
 const LEGACY_ENTRY_LENGTH: usize = 13;
 const V4_ENTRY_LENGTH: usize = 14;
 const V5_ENTRY_LENGTH: usize = 15;
+const V6_ENTRY_LENGTH: usize = 16;
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallTiming {
+    pub turn_ms: f64,
+    pub timestamp_ms: Option<f64>,
+}
 
 /// entry: [dedupKey, date, hour, model, input, output, cacheRead, cacheW5m,
 ///         cacheW1h, speed, inferenceGeo, webSearches, serviceTier, minute,
-///         reasoning, turnMs]
+///         reasoning, { turnMs, timestampMs }]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Entry(
     pub String,      // dedup key
@@ -39,7 +49,7 @@ pub struct Entry(
     pub String,      // service tier
     pub Option<u32>, // minute
     pub f64,         // reasoning (thinking subset of output — informational)
-    pub f64,         // turn ms: work time of the turn this call ended, else 0
+    pub CallTiming,
 );
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -69,7 +79,7 @@ struct CacheFileRef<'a> {
     files: &'a BTreeMap<String, FileRec>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Bucket {
     pub date: String,
     pub hour: u32,
@@ -165,6 +175,10 @@ fn upgrade_old_files(files: BTreeMap<String, serde_json::Value>) -> BTreeMap<Str
                     if arr.len() == V5_ENTRY_LENGTH {
                         arr.push(serde_json::json!(0.0));
                     }
+                    // v7 already stores the object; only a bare v6 number is wrapped.
+                    if arr.len() == V6_ENTRY_LENGTH && !arr[15].is_object() {
+                        arr[15] = serde_json::json!({ "turnMs": arr[15], "timestampMs": null });
+                    }
                 }
             }
         }
@@ -198,7 +212,7 @@ pub fn init(user_data: &Path) {
                 }
             }
         }
-        Some(3..=5) => {
+        Some(3..=7) => {
             if let Some(files) = parsed.get("files") {
                 if let Ok(files) =
                     serde_json::from_value::<BTreeMap<String, serde_json::Value>>(files.clone())
@@ -303,7 +317,7 @@ pub fn parse_transcript(text: &str, source: &str) -> (Vec<Entry>, Option<(usize,
     let mut turn = TurnClock::default();
     let book = |entries: &mut Vec<Entry>, closed: Option<(usize, f64)>| {
         if let Some((index, ms)) = closed {
-            entries[index].15 = ms;
+            entries[index].15.turn_ms = ms;
         }
     };
     for line in text.split('\n') {
@@ -415,11 +429,12 @@ pub fn parse_transcript(text: &str, source: &str) -> (Vec<Entry>, Option<(usize,
             str_field(u.get("service_tier")).unwrap_or("standard").to_string(),
             Some(parts.minute),
             reasoning,
-            0.0,
+            CallTiming { turn_ms: 0.0, timestamp_ms: at_ms },
         ));
+        let base_index = entries.len() - 1;
         if main_thread {
             if let Some(at) = at_ms {
-                turn.call(entries.len() - 1, at);
+                turn.call(base_index, at);
                 let finished = matches!(
                     msg.get("stop_reason").and_then(|v| v.as_str()),
                     Some("end_turn" | "stop_sequence" | "max_tokens" | "refusal")
@@ -428,6 +443,48 @@ pub fn parse_transcript(text: &str, source: &str) -> (Vec<Entry>, Option<(usize,
                     book(&mut entries, turn.finish(at));
                 }
             }
+        }
+        // The advisor tool runs a second model inside the request. Its tokens
+        // are billed at that model's rates and are deliberately left out of
+        // the top-level usage, so each advisor pass is a call of its own.
+        let advisor_passes = u
+            .get("iterations")
+            .and_then(|v| v.as_array())
+            .map(|a| a.as_slice())
+            .unwrap_or(&[]);
+        for (pass, it) in advisor_passes.iter().enumerate() {
+            if it.get("type").and_then(|v| v.as_str()) != Some("advisor_message") {
+                continue;
+            }
+            let Some(advisor) = str_field(it.get("model")) else { continue };
+            let icc = it.get("cache_creation");
+            let i5 = icc.and_then(|c| c.get("ephemeral_5m_input_tokens")).and_then(|v| v.as_f64());
+            let i1 = icc.and_then(|c| c.get("ephemeral_1h_input_tokens")).and_then(|v| v.as_f64());
+            let (w5, w1) = if i5.is_some() || i1.is_some() {
+                (i5.unwrap_or(0.0), i1.unwrap_or(0.0))
+            } else {
+                (num(it.get("cache_creation_input_tokens")), 0.0)
+            };
+            let base = &entries[base_index];
+            let (key, date, geo, tier) = (base.0.clone(), base.1.clone(), base.10.clone(), base.12.clone());
+            entries.push(Entry(
+                format!("{key}#advisor{pass}"),
+                date,
+                parts.hour,
+                advisor.to_string(),
+                num(it.get("input_tokens")),
+                num(it.get("output_tokens")),
+                num(it.get("cache_read_input_tokens")),
+                w5,
+                w1,
+                "standard".to_string(),
+                geo,
+                0.0,
+                tier,
+                Some(parts.minute),
+                0.0,
+                CallTiming { turn_ms: 0.0, timestamp_ms: at_ms },
+            ));
         }
     }
     let open_turn = turn.pending();
@@ -451,6 +508,24 @@ fn is_prompt(obj: &serde_json::Value) -> bool {
         }
         _ => false,
     }
+}
+
+/// For every dedup key, the copy that counts: (output tokens, file, index).
+/// The copy with the most output wins; among equals, the first.
+fn kept_copies(files: &BTreeMap<String, FileRec>) -> HashMap<&str, (f64, &str, usize)> {
+    let mut best: HashMap<&str, (f64, &str, usize)> = HashMap::new();
+    for (file, rec) in files {
+        for (index, entry) in rec.entries.iter().enumerate() {
+            match best.get_mut(entry.0.as_str()) {
+                Some(kept) if entry.5 > kept.0 => *kept = (entry.5, file.as_str(), index),
+                Some(_) => {}
+                None => {
+                    best.insert(entry.0.as_str(), (entry.5, file.as_str(), index));
+                }
+            }
+        }
+    }
+    best
 }
 
 pub fn aggregate() -> Arc<Aggregate> {
@@ -556,7 +631,17 @@ pub fn aggregate() -> Arc<Aggregate> {
 
     // Global dedup (resumed sessions copy older messages into new files),
     // then bucket by date|hour|minute|model|project|session.
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    //
+    // Which copy is kept matters. One API response is logged once per content
+    // block, and every line but the last carries the usage from the start of
+    // the stream: the real prompt counts, but a placeholder output count (8,
+    // say, for a reply that ran to thousands) and no thinking breakdown. Only
+    // the line written when the response finished has the billed output. So
+    // the copy with the most output tokens is the one that counts — keeping
+    // the first copy instead undercounted output and thinking.
+    let best = kept_copies(&file_cache);
+    // Turn time seen on a duplicate before the kept copy has a bucket.
+    let mut pending_time: HashMap<&str, f64> = HashMap::new();
     let mut buckets: BTreeMap<String, Bucket> = BTreeMap::new();
     let mut order: Vec<String> = Vec::new();
     let mut project_live: HashMap<String, bool> = HashMap::new();
@@ -580,7 +665,7 @@ pub fn aggregate() -> Arc<Aggregate> {
         .iter()
         .flat_map(|(file, rec)| {
             let quiet = abandoned.get(file.as_str()).map(|(i, _)| *i);
-            rec.entries.iter().enumerate().filter(move |(i, e)| e.15 > 0.0 || quiet == Some(*i))
+            rec.entries.iter().enumerate().filter(move |(i, e)| e.15.turn_ms > 0.0 || quiet == Some(*i))
         })
         .map(|(_, e)| e.0.as_str())
         .collect();
@@ -596,21 +681,28 @@ pub fn aggregate() -> Arc<Aggregate> {
         let session = session_of(file, &roots);
         let quiet = abandoned.get(file.as_str()).copied();
         for (index, entry) in rec.entries.iter().enumerate() {
-            let Entry(key, date, hour, model, inp, out, cr, cw5, cw1, speed, geo, web_searches, service_tier, minute, reasoning, turn_ms) = entry;
+            let Entry(key, date, hour, model, inp, out, cr, cw5, cw1, speed, geo, web_searches, service_tier, minute, reasoning, timing) = entry;
             let turn_ms = &match quiet {
                 Some((i, ms)) if i == index => ms,
-                _ => *turn_ms,
+                _ => timing.turn_ms,
             };
-            if seen.contains(key) {
+            let kept = best
+                .get(key.as_str())
+                .is_some_and(|b| b.1 == file.as_str() && b.2 == index);
+            if !kept {
                 if *turn_ms > 0.0 && !timed_done.contains(key) {
-                    if let Some(b) = timed_bucket.get(key).and_then(|bk| buckets.get_mut(bk)) {
-                        b.active_ms += turn_ms;
-                        timed_done.insert(key.clone());
+                    match timed_bucket.get(key).and_then(|bk| buckets.get_mut(bk)) {
+                        Some(b) => {
+                            b.active_ms += turn_ms;
+                            timed_done.insert(key.clone());
+                        }
+                        None => {
+                            pending_time.entry(key.as_str()).or_insert(*turn_ms);
+                        }
                     }
                 }
                 continue;
             }
-            seen.insert(key.clone());
             let minute_str = minute.map(|m| m.to_string()).unwrap_or_else(|| "null".into());
             let bk = format!("{date}|{hour}|{minute_str}|{model}|{project}|{session}");
             let bucket = buckets.entry(bk.clone()).or_insert_with(|| {
@@ -644,9 +736,12 @@ pub fn aggregate() -> Arc<Aggregate> {
             bucket.msgs += 1;
             if timed_keys.contains(key.as_str()) {
                 timed_bucket.insert(key.clone(), bk.clone());
-                if *turn_ms > 0.0 {
-                    bucket.active_ms += turn_ms;
-                    timed_done.insert(key.clone());
+                let own = if *turn_ms > 0.0 { Some(*turn_ms) } else { None };
+                if let Some(ms) = own.or_else(|| pending_time.remove(key.as_str())) {
+                    if !timed_done.contains(key) {
+                        bucket.active_ms += ms;
+                        timed_done.insert(key.clone());
+                    }
                 }
             }
 
@@ -661,6 +756,7 @@ pub fn aggregate() -> Arc<Aggregate> {
                     total_input: inp + cr + cw5 + cw1,
                     reasoning: *reasoning,
                     service_tier,
+                    date: Some(date),
                 });
                 bucket.cost += c.total;
                 bucket.cost_min += c.cost_min;
@@ -687,9 +783,9 @@ pub fn aggregate() -> Arc<Aggregate> {
                     cache_w1h: *cw1,
                     speed,
                     inference_geo: geo,
+                    service_tier,
                     web_searches: *web_searches,
                 });
-                let _ = service_tier; // recorded in the cache; not a rate input
                 bucket.cost += c.total;
                 bucket.cost_min += c.cost_min;
                 bucket.cost_max += c.cost_max;
@@ -737,6 +833,29 @@ pub fn aggregate() -> Arc<Aggregate> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn old_cache_migration_preserves_tokens_and_turn_time() {
+        let entry = parse_content(&reply("2026-11-04T20:44:49Z", "m1", "end_turn").to_string(), "claude").remove(0);
+        for length in 13..=16 {
+            let mut old = serde_json::to_value(&entry).unwrap();
+            let arr = old.as_array_mut().unwrap();
+            arr[15] = serde_json::json!(1234.0);
+            arr.truncate(length);
+            let files = BTreeMap::from([("deleted.jsonl".into(), serde_json::json!({
+                "mtimeMs": 0, "size": 0, "entries": [old], "gone": true
+            }))]);
+            let upgraded = upgrade_old_files(files);
+            let rec = &upgraded["deleted.jsonl"];
+            assert!(rec.gone);
+            assert_eq!(rec.entries[0].4, 1.0);
+            assert_eq!(rec.entries[0].5, 1.0);
+            assert_eq!(rec.entries[0].15.turn_ms, if length == 16 { 1234.0 } else { 0.0 });
+            assert_eq!(rec.entries[0].15.timestamp_ms, None);
+            let restored: FileRec = serde_json::from_str(&serde_json::to_string(rec).unwrap()).unwrap();
+            assert_eq!(restored.entries.len(), 1);
+        }
+    }
+
     fn transcript(lines: &[serde_json::Value]) -> String {
         lines.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n")
     }
@@ -767,8 +886,8 @@ mod tests {
             reply("2026-09-29T10:07:25Z", "m2", "end_turn"),
         ]);
         let entries = parse_content(&lines, "claude");
-        assert_eq!(entries[0].15, 0.0);
-        assert_eq!(entries[1].15, 445_000.0); // 7m 25s
+        assert_eq!(entries[0].15.turn_ms, 0.0);
+        assert_eq!(entries[1].15.turn_ms, 445_000.0); // 7m 25s
     }
 
     #[test]
@@ -779,7 +898,7 @@ mod tests {
             tool_result("2026-09-29T10:01:00Z"),
             reply("2026-09-29T10:02:00Z", "m2", "tool_use"),
         ]);
-        assert!(parse_content(&lines, "claude").iter().all(|e| e.15 == 0.0));
+        assert!(parse_content(&lines, "claude").iter().all(|e| e.15.turn_ms == 0.0));
     }
 
     #[test]
@@ -790,7 +909,7 @@ mod tests {
             serde_json::json!({ "type": "system", "subtype": "turn_duration", "durationMs": 31_250,
                 "timestamp": "2026-09-29T10:00:31Z" }),
         ]);
-        assert_eq!(parse_content(&lines, "claude")[0].15, 31_250.0);
+        assert_eq!(parse_content(&lines, "claude")[0].15.turn_ms, 31_250.0);
     }
 
     #[test]
@@ -800,7 +919,7 @@ mod tests {
             reply("2026-09-29T10:01:00Z", "m1", "tool_use"),
             prompt("2026-09-29T11:00:00Z", "actually, stop"),
         ]);
-        assert_eq!(parse_content(&lines, "claude")[0].15, 60_000.0);
+        assert_eq!(parse_content(&lines, "claude")[0].15.turn_ms, 60_000.0);
     }
 
     #[test]
@@ -810,7 +929,7 @@ mod tests {
         let mut sub_reply = reply("2026-09-29T10:02:00Z", "s1", "end_turn");
         sub_reply["isSidechain"] = serde_json::json!(true);
         let entries = parse_content(&transcript(&[sub_prompt, sub_reply]), "claude");
-        assert_eq!(entries[0].15, 0.0);
+        assert_eq!(entries[0].15.turn_ms, 0.0);
     }
 
     #[test]
@@ -888,6 +1007,84 @@ mod tests {
         assert_eq!(entries[0].14, 7415.0);
         assert!(entries[0].14 < entries[0].5, "thinking is part of output, never on top of it");
         assert_eq!(entries[1].14, 0.0);
+    }
+
+    #[test]
+    fn the_finished_copy_of_a_streamed_response_is_the_one_counted() {
+        // Seen in the field: one response, three log lines. The first two were
+        // written mid-stream with a placeholder output count.
+        let line = |out: u64, thinking: Option<u64>, stop: Option<&str>| {
+            serde_json::json!({
+                "timestamp": "2026-11-10T10:00:00Z", "requestId": "req-1",
+                "message": { "id": "m1", "model": "claude-opus-5-5", "stop_reason": stop, "usage": {
+                    "input_tokens": 2, "output_tokens": out, "cache_read_input_tokens": 78877,
+                    "cache_creation_input_tokens": 1932,
+                    "output_tokens_details": thinking.map(|t| serde_json::json!({ "thinking_tokens": t })),
+                }}
+            })
+        };
+        let text = transcript(&[line(8, None, None), line(8, None, None), line(351, Some(97), Some("tool_use"))]);
+        let (entries, _) = parse_transcript(&text, "claude");
+        // A resumed session copies the finished line into a second file.
+        let resumed = vec![entries[2].clone()];
+        let files = BTreeMap::from([
+            ("a.jsonl".to_string(), FileRec { entries, ..Default::default() }),
+            ("b.jsonl".to_string(), FileRec { entries: resumed, ..Default::default() }),
+        ]);
+        let best = kept_copies(&files);
+        assert_eq!(best.len(), 1);
+        let (output, file, index) = best["m1:req-1"];
+        assert_eq!((output, file, index), (351.0, "a.jsonl", 2));
+        assert_eq!(files[file].entries[index].14, 97.0, "the thinking breakdown comes with it");
+    }
+
+    #[test]
+    fn advisor_passes_are_calls_of_their_own_at_the_advisor_models_rates() {
+        // The documented shape: top-level usage is the executor only.
+        let line = serde_json::json!({
+            "timestamp": "2026-11-10T10:00:00Z", "requestId": "req-1",
+            "message": { "id": "m1", "model": "claude-sonnet-5-5", "stop_reason": "end_turn", "usage": {
+                "input_tokens": 1760, "cache_read_input_tokens": 412,
+                "cache_creation_input_tokens": 0, "output_tokens": 531, "inference_geo": "us",
+                "iterations": [
+                    { "type": "message", "input_tokens": 412, "output_tokens": 89 },
+                    { "type": "advisor_message", "model": "claude-opus-5-5", "input_tokens": 823,
+                      "cache_read_input_tokens": 10, "cache_creation_input_tokens": 20, "output_tokens": 1612 },
+                    { "type": "message", "input_tokens": 1348, "cache_read_input_tokens": 412, "output_tokens": 442 },
+                ],
+            }}
+        })
+        .to_string();
+        let entries = parse_content(&line, "claude");
+        assert_eq!(entries.len(), 2);
+        assert_eq!((entries[0].3.as_str(), entries[0].4, entries[0].5), ("claude-sonnet-5-5", 1760.0, 531.0));
+        let advisor = &entries[1];
+        assert_eq!(advisor.0, "m1:req-1#advisor1");
+        assert_eq!(advisor.3, "claude-opus-5-5");
+        assert_eq!((advisor.4, advisor.5, advisor.6, advisor.7, advisor.8), (823.0, 1612.0, 10.0, 20.0, 0.0));
+        assert_eq!(advisor.10, "us");
+        assert_eq!(advisor.15.turn_ms, 0.0);
+    }
+
+    /// Not a unit test: prints per-model totals for the real logs so they can
+    /// be recounted independently. Run with
+    /// `EMBER_VERIFY_DIR=<copy of the app data dir> cargo test real_claude_totals -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn real_claude_totals() {
+        let dir = std::env::var("EMBER_VERIFY_DIR").expect("EMBER_VERIFY_DIR");
+        init(Path::new(&dir));
+        let agg = aggregate();
+        let mut by_model: BTreeMap<String, [f64; 8]> = BTreeMap::new();
+        for b in &agg.buckets {
+            let m = by_model.entry(b.model.clone()).or_insert([0.0; 8]);
+            for (slot, v) in [b.msgs as f64, b.input, b.output, b.cache_read, b.cache_w5m, b.cache_w1h, b.reasoning, b.cost].into_iter().enumerate() {
+                m[slot] += v;
+            }
+        }
+        for (model, m) in by_model {
+            println!("CLAUDE	{model}	{}	{}	{}	{}	{}	{}	{}	{:.6}", m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]);
+        }
     }
 
     #[test]

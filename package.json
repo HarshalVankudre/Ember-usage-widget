@@ -1,6 +1,6 @@
 {
   "name": "ember-widget",
-  "version": "2.1.1",
+  "version": "2.1.3",
   "description": "Ember — desktop widget showing Claude Code + ChatGPT Codex token usage, API-equivalent cost, plan limits, and what a percent of your plan actually buys",
   "scripts": {
     "start": "tauri dev",

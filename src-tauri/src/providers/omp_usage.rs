@@ -6,8 +6,8 @@
 //! First-party Anthropic rows join Claude; first-party OpenAI/OpenAI-Codex rows
 //! join Codex. All other OMP providers and models are deliberately ignored.
 
-use super::claude_pricing::price_for as claude_price_for;
-use super::codex_pricing::price_for as codex_price_for;
+use super::claude_pricing::{cost_of as claude_cost_of, ClaudeUsage};
+use super::codex_pricing::{cost_of as codex_cost_of, CodexUsage};
 use super::model_attribution::{is_claude_model, is_openai_model};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Value};
@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-const QUERY_WITH_NO_CACHE_COST: &str = r#"
+const QUERY: &str = r#"
 SELECT
   session_file,
   folder,
@@ -26,35 +26,7 @@ SELECT
   input_tokens,
   output_tokens,
   cache_read_tokens,
-  cache_write_tokens,
-  cost_input,
-  cost_output,
-  cost_cache_read,
-  cost_cache_write,
-  cost_total,
-  cost_no_cache_input
-FROM messages
-WHERE provider IN ('anthropic', 'openai', 'openai-codex')
-ORDER BY timestamp, id
-"#;
-
-const QUERY_LEGACY: &str = r#"
-SELECT
-  session_file,
-  folder,
-  model,
-  provider,
-  timestamp,
-  input_tokens,
-  output_tokens,
-  cache_read_tokens,
-  cache_write_tokens,
-  cost_input,
-  cost_output,
-  cost_cache_read,
-  cost_cache_write,
-  cost_total,
-  NULL AS cost_no_cache_input
+  cache_write_tokens
 FROM messages
 WHERE provider IN ('anthropic', 'openai', 'openai-codex')
 ORDER BY timestamp, id
@@ -90,12 +62,6 @@ struct DbRow {
     output: f64,
     cache_read: f64,
     cache_write: f64,
-    cost_input: f64,
-    cost_output: f64,
-    cost_cache_read: f64,
-    cost_cache_write: f64,
-    cost_total: f64,
-    cost_no_cache_input: Option<f64>,
 }
 
 pub fn data_dir() -> PathBuf {
@@ -151,29 +117,13 @@ fn db_signature() -> DbSignature {
     )
 }
 
-fn has_column(connection: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
-    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
-    let names = statement.query_map([], |row| row.get::<_, String>(1))?;
-    for name in names {
-        if name? == column {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 fn read_rows() -> rusqlite::Result<Vec<DbRow>> {
     let connection = Connection::open_with_flags(
         stats_db_path(),
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     connection.busy_timeout(Duration::from_secs(2))?;
-    let query = if has_column(&connection, "messages", "cost_no_cache_input")? {
-        QUERY_WITH_NO_CACHE_COST
-    } else {
-        QUERY_LEGACY
-    };
-    let mut statement = connection.prepare(query)?;
+    let mut statement = connection.prepare(QUERY)?;
     let rows = statement.query_map([], |row| {
         Ok(DbRow {
             session_file: row.get(0)?,
@@ -185,12 +135,6 @@ fn read_rows() -> rusqlite::Result<Vec<DbRow>> {
             output: row.get::<_, i64>(6)? as f64,
             cache_read: row.get::<_, i64>(7)? as f64,
             cache_write: row.get::<_, i64>(8)? as f64,
-            cost_input: row.get(9)?,
-            cost_output: row.get(10)?,
-            cost_cache_read: row.get(11)?,
-            cost_cache_write: row.get(12)?,
-            cost_total: row.get(13)?,
-            cost_no_cache_input: row.get(14)?,
         })
     })?;
     rows.collect()
@@ -228,12 +172,69 @@ fn session_of(session_file: &str) -> String {
     format!("omp:{id}")
 }
 
-fn officially_priced(provider: &str, model: &str, date: &str) -> bool {
+/// What a row is worth at the official rates — the same tables, and the same
+/// rate-on-the-day rule, that price native Claude Code and Codex calls.
+///
+/// OMP stores a cost of its own, frozen from whatever price list it shipped
+/// with on the day. Using that would value one model at two prices depending
+/// on which tool made the call, so only the token counts are taken from OMP.
+struct RowCost {
+    total: f64,
+    cost_min: f64,
+    cost_max: f64,
+    c_in: f64,
+    c_out: f64,
+    c_cr: f64,
+    c_cw: f64,
+    cache_savings: f64,
+    estimated: bool,
+    long_context: bool,
+    known: bool,
+    source: String,
+}
+
+fn price_row(provider: &str, row: &DbRow, date: &str) -> RowCost {
+    let (input, output) = (row.input.max(0.0), row.output.max(0.0));
+    let (cache_read, cache_write) = (row.cache_read.max(0.0), row.cache_write.max(0.0));
     if provider == "claude" {
-        claude_price_for(model, Some(date)).is_some()
+        // OMP writes to the 5-minute cache.
+        let c = claude_cost_of(&row.model, &ClaudeUsage {
+            date: Some(date), input, output, cache_read, cache_w5m: cache_write,
+            ..Default::default()
+        });
+        RowCost {
+            total: c.total, cost_min: c.cost_min, cost_max: c.cost_max,
+            c_in: c.input, c_out: c.output, c_cr: c.cache_read, c_cw: c.cache_write,
+            cache_savings: c.cache_savings, estimated: c.estimated,
+            long_context: c.long_context, known: c.known, source: c.source,
+        }
     } else {
-        codex_price_for(model).is_some()
+        let c = codex_cost_of(&row.model, &CodexUsage {
+            input, output, cached: cache_read, cache_write,
+            // A zero is "not reported", as in Codex's own rollouts.
+            cache_write_known: cache_write > 0.0,
+            total_input: input + cache_read + cache_write,
+            date: Some(date),
+            ..Default::default()
+        });
+        RowCost {
+            total: c.total, cost_min: c.cost_min, cost_max: c.cost_max,
+            c_in: c.input, c_out: c.output, c_cr: c.cached, c_cw: c.cache_write,
+            cache_savings: c.cache_savings, estimated: c.estimated,
+            long_context: c.long_context, known: c.known, source: c.source,
+        }
     }
+}
+
+/// OMP names a project by its folder path with the separators turned into
+/// dashes ("-Desktop-modal-finder"). Claude Code does the same, so the same
+/// reading gives the same label and one folder stays one project.
+fn project_of_folder(folder: &str) -> String {
+    if folder.is_empty() {
+        return "unknown".to_string();
+    }
+    let name = folder.trim_matches('-').replace('-', "/");
+    if name.is_empty() { "~ (home)".to_string() } else { name }
 }
 
 #[derive(Default)]
@@ -251,6 +252,8 @@ struct Bucket {
     cache_read: f64,
     cache_write: f64,
     cost: f64,
+    cost_min: f64,
+    cost_max: f64,
     c_in: f64,
     c_out: f64,
     c_cr: f64,
@@ -258,32 +261,31 @@ struct Bucket {
     cache_savings: f64,
     priced_calls: u64,
     unpriced_calls: u64,
+    long_context_calls: u64,
+    estimated: bool,
     pricing_source: String,
 }
 
 impl Bucket {
-    fn add(&mut self, row: &DbRow, priced: bool) {
+    fn add(&mut self, row: &DbRow, c: RowCost) {
         self.msgs += 1;
         self.input += row.input.max(0.0);
         self.output += row.output.max(0.0);
         self.cache_read += row.cache_read.max(0.0);
         self.cache_write += row.cache_write.max(0.0);
-        if priced {
-            self.cost += row.cost_total.max(0.0);
-            self.c_in += row.cost_input.max(0.0);
-            self.c_out += row.cost_output.max(0.0);
-            self.c_cr += row.cost_cache_read.max(0.0);
-            self.c_cw += row.cost_cache_write.max(0.0);
-            let prompt_cost = row.cost_input + row.cost_cache_read + row.cost_cache_write;
-            self.cache_savings += row
-                .cost_no_cache_input
-                .map(|uncached| (uncached - prompt_cost).max(0.0))
-                .unwrap_or(0.0);
-            self.priced_calls += 1;
-            self.pricing_source = "Oh My Pi stats database".to_string();
-        } else {
-            self.unpriced_calls += 1;
-            self.pricing_source = "No official price".to_string();
+        self.cost += c.total;
+        self.cost_min += c.cost_min;
+        self.cost_max += c.cost_max;
+        self.c_in += c.c_in;
+        self.c_out += c.c_out;
+        self.c_cr += c.c_cr;
+        self.c_cw += c.c_cw;
+        self.cache_savings += c.cache_savings;
+        self.estimated |= c.estimated;
+        self.long_context_calls += u64::from(c.long_context);
+        if c.known { self.priced_calls += 1 } else { self.unpriced_calls += 1 }
+        if !c.source.is_empty() {
+            self.pricing_source = c.source;
         }
     }
 
@@ -295,14 +297,14 @@ impl Bucket {
             "msgs": self.msgs,
             "input": self.input, "output": self.output,
             "cacheRead": self.cache_read, "cacheWrite": self.cache_write, "reasoning": 0,
-            "cost": self.cost, "costMin": self.cost, "costMax": self.cost,
+            "cost": self.cost, "costMin": self.cost_min, "costMax": self.cost_max,
             "cIn": self.c_in, "cOut": self.c_out, "cCr": self.c_cr,
             "cCw": self.c_cw, "cRs": 0, "cTool": 0,
             "cacheSavings": self.cache_savings,
             "priced": self.priced_calls > 0 && self.unpriced_calls == 0,
-            "estimated": false,
+            "estimated": self.estimated,
             "pricedCalls": self.priced_calls, "unpricedCalls": self.unpriced_calls,
-            "longContextCalls": 0, "fastCalls": 0, "usRegionCalls": 0,
+            "longContextCalls": self.long_context_calls, "fastCalls": 0, "usRegionCalls": 0,
             "pricingSource": self.pricing_source,
             "projectDeleted": project_deleted,
         })
@@ -319,12 +321,13 @@ fn parse_rows<F: Fn(&str) -> bool>(rows: &[DbRow], exists: F) -> Vec<Value> {
         let Some(parts) = crate::local_parts_ms(row.timestamp) else {
             continue;
         };
+        // A request that errored or was aborted before the model answered is
+        // logged with no tokens. It used nothing, so it is not a call.
+        if row.input.max(0.0) + row.output.max(0.0) + row.cache_read.max(0.0) + row.cache_write.max(0.0) == 0.0 {
+            continue;
+        }
         let session = session_of(&row.session_file);
-        let project = if row.folder.is_empty() {
-            "unknown".to_string()
-        } else {
-            row.folder.clone()
-        };
+        let project = project_of_folder(&row.folder);
         let live = project_live.entry(project.clone()).or_insert(false);
         *live |= exists(&row.session_file);
         let key = format!(
@@ -341,7 +344,7 @@ fn parse_rows<F: Fn(&str) -> bool>(rows: &[DbRow], exists: F) -> Vec<Value> {
             session: session.clone(),
             ..Default::default()
         });
-        bucket.add(row, officially_priced(provider, &row.model, &parts.date));
+        bucket.add(row, price_row(provider, row, &parts.date));
     }
 
     buckets
@@ -392,7 +395,7 @@ pub fn aggregate() -> Arc<Aggregate> {
 mod tests {
     use super::*;
 
-    fn row(provider: &str, model: &str, input: i64, cost: f64) -> DbRow {
+    fn row(provider: &str, model: &str, input: i64) -> DbRow {
         DbRow {
             session_file: format!(
                 "{}\\project\\2026-08-17_session.jsonl",
@@ -406,23 +409,17 @@ mod tests {
             output: 20.0,
             cache_read: 30.0,
             cache_write: 40.0,
-            cost_input: cost / 5.0,
-            cost_output: cost / 5.0,
-            cost_cache_read: cost / 5.0,
-            cost_cache_write: cost / 5.0,
-            cost_total: cost,
-            cost_no_cache_input: Some(cost),
         }
     }
 
     #[test]
     fn maps_only_first_party_database_rows_to_the_two_ember_providers() {
         let rows = vec![
-            row("anthropic", "claude-opus-5", 10, 1.0),
-            row("openai-codex", "gpt-5.6-sol", 11, 2.0),
-            row("openai", "gpt-5.6-sol", 12, 0.0),
-            row("openrouter", "claude-opus-5", 100, 9.0),
-            row("google", "gemini-3-pro", 100, 9.0),
+            row("anthropic", "claude-opus-5", 10),
+            row("openai-codex", "gpt-5.6-sol", 11),
+            row("openai", "gpt-5.6-sol", 12),
+            row("openrouter", "claude-opus-5", 100),
+            row("google", "gemini-3-pro", 100),
         ];
         let buckets = parse_rows(&rows, |_| true);
         assert_eq!(buckets.len(), 2);
@@ -436,26 +433,45 @@ mod tests {
     }
 
     #[test]
-    fn uses_the_dashboard_database_cost_instead_of_repricing_tokens() {
-        let buckets = parse_rows(&[row("anthropic", "claude-fable-5", 1, 12.34)], |_| true);
-        assert_eq!(buckets[0]["cost"], 12.34);
-        assert_eq!(buckets[0]["costMin"], 12.34);
-        assert_eq!(buckets[0]["costMax"], 12.34);
-        assert_eq!(buckets[0]["pricingSource"], "Oh My Pi stats database");
+    fn rows_are_priced_at_official_rates_not_at_the_cost_omp_stored() {
+        // 1M input, 20 output, 30 cache read, 40 written to the 5-minute cache.
+        let buckets = parse_rows(&[row("anthropic", "claude-fable-5", 1_000_000)], |_| true);
+        let expected = 10.0 + 20.0 * 50.0 / 1e6 + 30.0 * 1.0 / 1e6 + 40.0 * 12.5 / 1e6;
+        assert!((buckets[0]["cost"].as_f64().unwrap() - expected).abs() < 1e-9);
+        assert_eq!(buckets[0]["costMin"], buckets[0]["cost"]);
+        assert_eq!(buckets[0]["estimated"], false);
+        assert_eq!(buckets[0]["project"], "Desktop/project");
+    }
+
+    #[test]
+    fn a_codex_row_takes_the_price_in_force_on_its_day() {
+        // The fixture row is dated 2026-08-17, before GPT-5.6 Sol's August 21
+        // cut: $5 input, $0.50 cached, $6.25 write, $30 output.
+        let buckets = parse_rows(&[row("openai-codex", "gpt-5.6-sol", 100_000)], |_| true);
+        assert_eq!(buckets[0]["date"], "2026-08-17");
+        let expected = 0.5 + 20.0 * 30.0 / 1e6 + 30.0 * 0.5 / 1e6 + 40.0 * 6.25 / 1e6;
+        assert!((buckets[0]["cost"].as_f64().unwrap() - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_request_that_used_no_tokens_is_not_a_call() {
+        let mut empty = row("anthropic", "claude-opus-5", 0);
+        (empty.output, empty.cache_read, empty.cache_write) = (0.0, 0.0, 0.0);
+        assert!(parse_rows(&[empty], |_| true).is_empty());
     }
 
     #[test]
     fn database_rows_survive_deleted_session_files() {
-        let buckets = parse_rows(&[row("openai-codex", "gpt-5.6-sol", 1, 1.0)], |_| false);
+        let buckets = parse_rows(&[row("openai-codex", "gpt-5.6-sol", 1)], |_| false);
         assert_eq!(buckets[0]["projectDeleted"], true);
     }
 
     #[test]
     fn query_selects_only_accounting_and_attribution_columns() {
-        let query = QUERY_WITH_NO_CACHE_COST.to_lowercase();
+        let query = QUERY.to_lowercase();
         assert!(query.contains("from messages"));
         assert!(query.contains("input_tokens"));
-        assert!(query.contains("cost_total"));
+        assert!(!query.contains("cost"), "OMP's own cost is not used");
         for sensitive in ["content", "error_message", "tool_calls", "user_messages"] {
             assert!(
                 !query.contains(sensitive),

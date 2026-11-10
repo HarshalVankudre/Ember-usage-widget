@@ -29,7 +29,7 @@ const RATES: &[(&str, f64, f64, f64)] = &[
     ("moonshotai/kimi-k3", 3.00, 15.00, 0.30),
     ("qwen/qwen3.8-flash", 0.15, 0.47, 0.016),
     ("qwen/qwen3.8-27b", 0.425, 2.55, 0.085),
-    ("qwen/qwen3.8-max", 2.00, 6.00, 0.25),
+    ("qwen/qwen3.8-max-0902", 2.00, 6.00, 0.25),
 ];
 
 /// Reduce a zcode `model_id` to the catalog id it should be priced against.
@@ -85,16 +85,10 @@ fn rate_for(model_id: &str) -> Option<(f64, f64, f64)> {
     if id.is_empty() {
         return None;
     }
-    if let Some(&(_, i, o, c)) = RATES.iter().find(|(k, ..)| *k == id) {
-        return Some((i, o, c));
-    }
-    // Longest catalog id that prefixes this one, so an unseen routing variant
-    // still prices against its family rather than falling through to unpriced.
-    RATES
-        .iter()
-        .filter(|(k, ..)| id.starts_with(k))
-        .max_by_key(|(k, ..)| k.len())
-        .map(|&(_, i, o, c)| (i, o, c))
+    // Exact ids only. A longer id is a different product with its own price
+    // (kimi-k3.1-pro is not kimi-k3, qwen3.8-max-prime is not qwen3.8-max), so
+    // it stays unpriced until it has a row.
+    RATES.iter().find(|(k, ..)| *k == id).map(|&(_, i, o, c)| (i, o, c))
 }
 
 /// Reasoning is a subset of output (zcode's `totalTokens` is input + output),
@@ -165,6 +159,16 @@ mod tests {
         assert!((c.total - c.output).abs() < 1e-12, "reasoning must not inflate the total");
         assert!(c.reasoning < c.output);
         assert!(c.reasoning > 0.0);
+    }
+
+    #[test]
+    fn a_longer_model_id_is_not_priced_as_its_shorter_namesake() {
+        for model in ["moonshotai/kimi-k3.1-pro", "qwen/qwen3.8-max-prime", "z-ai/glm-5.3-flash-x"] {
+            let c = cost_of(model, &ZcodeUsage { input: 1e6, output: 1e6, ..Default::default() }, 0.0);
+            assert!(!c.known, "{model}");
+        }
+        assert!(cost_of("moonshotai/kimi-k3", &ZcodeUsage { input: 1e6, ..Default::default() }, 0.0).known);
+        assert!(cost_of("qwen/qwen3.8-max-0902", &ZcodeUsage { input: 1e6, ..Default::default() }, 0.0).known);
     }
 
     #[test]

@@ -15,7 +15,8 @@ use std::time::Duration;
 pub const SOURCE_URL: &str = "https://developers.openai.com/api/docs/pricing.md";
 pub const REFRESH: Duration = Duration::from_secs(24 * 3600);
 pub const RETRY: Duration = Duration::from_secs(3600);
-const CACHE_VERSION: u32 = 5;
+// 6: specialized rows split by context are folded into one model.
+const CACHE_VERSION: u32 = 6;
 
 #[derive(Clone, Copy, Default)]
 struct LiveState {
@@ -35,9 +36,13 @@ struct CacheFile {
     prices: HashMap<String, LivePrice>,
 }
 
+/// "gpt-5.5 (<272K context length)" and "gpt-6-cyber (short context)" are
+/// rows of gpt-5.5 and gpt-6-cyber; the note is not part of the model id.
 fn clean_model_name(name: &str) -> String {
     static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"(?i)\s*\(<272k context length\)\s*").unwrap());
+    let re = RE.get_or_init(|| {
+        Regex::new(r"(?i)\s*\((?:<272k context length|short context|long context)\)\s*").unwrap()
+    });
     re.replacen(&name.to_lowercase(), 1, "").trim().to_string()
 }
 
@@ -55,8 +60,13 @@ pub fn build_map(markdown: &str) -> HashMap<String, LivePrice> {
     let tier_re = TIER.get_or_init(|| Regex::new(r"(?i)<\s*272k context length").unwrap());
     let id_re = ID.get_or_init(|| Regex::new(r"^(?:gpt|chatgpt|chat-|codex|o\d)").unwrap());
 
-    let mut map = HashMap::new();
+    static LONG_ROW: OnceLock<Regex> = OnceLock::new();
+    let long_row_re = LONG_ROW.get_or_init(|| Regex::new(r"(?i)\(long context\)").unwrap());
+
+    let mut map: HashMap<String, LivePrice> = HashMap::new();
     let mut fast_rows = HashMap::new();
+    // Specialized models list their long-context prices on a row of their own.
+    let mut long_rows: Vec<(String, bool)> = Vec::new();
     let mut speed = "standard";
     let mut header: Option<Vec<String>> = None;
     for line in markdown.lines() {
@@ -98,6 +108,12 @@ pub fn build_map(markdown: &str) -> HashMap<String, LivePrice> {
         if !id_re.is_match(&id) {
             continue;
         }
+        if long_row_re.is_match(name) {
+            // Priced: the model is tiered. "-": long context is not offered.
+            let priced = col(&["input"]).is_some() && col(&["output"]).is_some();
+            long_rows.push((id, priced && speed == "standard"));
+            continue;
+        }
         let (Some(input), Some(output)) = (
             col(&["short context input", "input"]),
             col(&["short context output", "output"]),
@@ -125,6 +141,13 @@ pub fn build_map(markdown: &str) -> HashMap<String, LivePrice> {
             long_context: Some(long_context || tier_re.is_match(name)),
             fast: None,
         });
+    }
+    for (id, priced) in long_rows {
+        if let Some(price) = map.get_mut(&id) {
+            if priced {
+                price.long_context = Some(true);
+            }
+        }
     }
     for (id, rates) in fast_rows {
         if let Some(price) = map.get_mut(&id) {
@@ -234,6 +257,23 @@ mod tests {
         assert_eq!(map["gpt-5.3-codex"].fast.as_ref().unwrap().output, 28.0);
         assert!(map["gpt-5-pro"].fast.is_none());
         assert_eq!(map.values().filter(|p| p.fast.is_some()).count(), 24);
+    }
+
+    #[test]
+    fn specialized_rows_split_by_context_belong_to_one_model() {
+        let map = build_map(include_str!("fixtures/openai-pricing-2026-11-10.md"));
+        assert!(!map.keys().any(|k| k.contains('(')), "a context note leaked into a model id");
+        let cyber = &map["gpt-6-cyber"];
+        assert_eq!((cyber.input, cyber.cached, cyber.write, cyber.output), (20.0, 2.0, Some(25.0), 100.0));
+        assert_eq!(cyber.long_context, Some(true));
+        assert_eq!(map["gpt-5.6-cyber"].long_context, Some(false));
+        assert_eq!(map["gpt-5.5-cyber-preview"].input, 12.5);
+        assert_eq!(map["gpt-rosalind-research"].output, 25.0);
+        assert_eq!(map["gpt-6-astra-law"].cached, 1.0);
+        // Batch, Flex and Ultrafast never overwrite Standard.
+        assert_eq!(map["gpt-6-astra"].input, 10.0);
+        assert_eq!(map["gpt-6-astra"].fast.as_ref().unwrap().input, 20.0);
+        assert_eq!(map["gpt-5.3-codex"].fast.as_ref().unwrap().input, 3.5);
     }
 
     const HEAD: &str = "| Model | Short context input | Short context output | Short context cached input | Short context 30m write | Short context 12h write | Long context input | Long context output | Long context cached input | Long context 30m write | Long context 12h write |\n\

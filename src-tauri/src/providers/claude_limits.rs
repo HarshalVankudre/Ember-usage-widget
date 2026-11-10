@@ -44,15 +44,25 @@ fn claude_json_path() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".claude.json")
 }
 
-/// "max" + "default_claude_max_20x" -> "Max (20x)", "pro" -> "Pro", etc.
+/// "max" + "default_claude_max_20x" -> "Ultra", "max" + "..._5x" -> "Max",
+/// "pro" -> "Pro", etc.
+///
+/// Anthropic renamed the plans on 30 Oct 2026: Max 20x became Ultra and Max 5x
+/// became plain Max. The account still reports the old identifiers (type
+/// "max", tier "default_claude_max_20x"), so the old names are mapped here; a
+/// type or tier that already says "ultra" is honoured too.
 fn plan_label(sub: Option<&str>, tier: Option<&str>) -> String {
     static MULT: OnceLock<regex::Regex> = OnceLock::new();
     let mult_re = MULT.get_or_init(|| regex::Regex::new(r"(\d+)x").unwrap());
     let mult = tier.and_then(|t| mult_re.captures(t)).map(|c| c[1].to_string());
+    let tier_says_ultra = tier.is_some_and(|t| t.to_ascii_lowercase().contains("ultra"));
     match sub {
-        Some("max") => match mult {
+        Some("ultra") => "Ultra".to_string(),
+        Some("max") if tier_says_ultra => "Ultra".to_string(),
+        Some("max") => match mult.as_deref() {
+            Some("20") => "Ultra".to_string(),
+            Some("5") | None => "Max".to_string(),
             Some(m) => format!("Max ({m}x)"),
-            None => "Max".to_string(),
         },
         Some("pro") => "Pro".to_string(),
         Some("free") => "Free".to_string(),
@@ -165,7 +175,12 @@ mod tests {
 
     #[test]
     fn plan_labels_read_like_the_account_page() {
-        assert_eq!(plan_label(Some("max"), Some("default_claude_max_20x")), "Max (20x)");
+        // Max 20x was renamed Ultra, and Max 5x plain Max, on 30 Oct 2026.
+        assert_eq!(plan_label(Some("max"), Some("default_claude_max_20x")), "Ultra");
+        assert_eq!(plan_label(Some("max"), Some("default_claude_max_5x")), "Max");
+        assert_eq!(plan_label(Some("max"), Some("default_claude_ultra")), "Ultra");
+        assert_eq!(plan_label(Some("ultra"), None), "Ultra");
+        assert_eq!(plan_label(Some("max"), Some("default_claude_max_40x")), "Max (40x)");
         assert_eq!(plan_label(Some("max"), None), "Max");
         assert_eq!(plan_label(Some("pro"), None), "Pro");
         assert_eq!(plan_label(Some("team"), None), "Team");

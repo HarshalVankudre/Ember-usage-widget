@@ -51,7 +51,7 @@
       return {
         tone: 'estimated',
         summary: '100% officially priced · cache-write premium estimated',
-        title: 'Codex logs omit GPT-5.6 cache-write counts. The headline uses the conservative upper estimate.',
+        title: 'Codex logs do not report how much of each prompt was written to cache (GPT-5.6 and later bill those tokens at 1.25x input). The headline counts all new input as written, the upper bound; the lower bound counts none.',
       };
     }
 

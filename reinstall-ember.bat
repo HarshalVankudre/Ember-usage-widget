@@ -204,7 +204,9 @@ rem ===========================================================================
 :build
 echo   building ^(npm run dist^)...
 pushd "%REPO_DIR%" >nul || exit /b 1
+set "RC="
 call npm run dist
+set "RC=0"
 set "BUILD_RC=!ERRORLEVEL!"
 popd >nul
 if not "!BUILD_RC!"=="0" echo   build failed ^(exit !BUILD_RC!^)

@@ -52,9 +52,23 @@ const pmeta = (p) => PROVIDERS[p] || UNKNOWN_PROVIDER;
 
 const mkey = (b) => `${b.provider}|${b.model}`;
 
+// Oh My Pi projects used to be listed under their raw folder slug
+// ("-Desktop-my-app") and now share Claude Code's label ("Desktop/my/app").
+// A project hidden or archived under the old name stays that way.
+function withRelabelledProjects(names) {
+  const out = new Set(names);
+  for (const name of names) {
+    if (typeof name === 'string' && name.startsWith('-')) {
+      const relabelled = name.replace(/^-+|-+$/g, '').replace(/-/g, '/');
+      if (relabelled) out.add(relabelled);
+    }
+  }
+  return out;
+}
+
 function loadHiddenProjects() {
   try {
-    return new Set(JSON.parse(localStorage.getItem('hiddenProjects') || '[]'));
+    return withRelabelledProjects(JSON.parse(localStorage.getItem('hiddenProjects') || '[]'));
   } catch {
     return new Set();
   }
@@ -68,7 +82,7 @@ function saveHiddenProjects() {
 // the chart and the model table, it just stops crowding the project list.
 function loadArchivedProjects() {
   try {
-    return new Set(JSON.parse(localStorage.getItem('archivedProjects') || '[]'));
+    return withRelabelledProjects(JSON.parse(localStorage.getItem('archivedProjects') || '[]'));
   } catch {
     return new Set();
   }
@@ -117,17 +131,21 @@ function prepCanvas(canvas, W, H) {
 
 /* ───────────────────────── helpers ───────────────────────── */
 
+// The thresholds sit where the rounded figure changes unit, not at the round
+// number: 999,950 is "1.00M", never "1000.0K".
 function fmtTok(n) {
-  if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
-  if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
-  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  if (n >= 999995000) return (n / 1e9).toFixed(2) + 'B';
+  if (n >= 999950) return (n / 1e6).toFixed(2) + 'M';
+  if (n >= 999.5) return (n / 1e3).toFixed(1) + 'K';
   return String(Math.round(n));
 }
 
 function fmtCost(c) {
-  if (c >= 1000) return '$' + c.toLocaleString('en-US', { maximumFractionDigits: 0 });
-  if (c >= 100) return '$' + c.toFixed(1);
+  if (c >= 999.95) return '$' + c.toLocaleString('en-US', { maximumFractionDigits: 0 });
+  if (c >= 99.995) return '$' + c.toFixed(1);
   if (c >= 0.01 || c === 0) return '$' + c.toFixed(2);
+  // A real but tiny cost must not print as zero.
+  if (c > 0 && c < 0.00005) return '<$0.0001';
   return '$' + c.toFixed(4);
 }
 
@@ -135,7 +153,7 @@ function fmtCost(c) {
 function moneyHTML(v) {
   const a = Math.abs(v);
   let int, dec = '';
-  if (a >= 1000) {
+  if (a >= 999.995) {
     int = Math.round(a).toLocaleString('en-US');
   } else if (a >= 0.01 || a === 0) {
     const f = a.toFixed(2);
@@ -696,7 +714,7 @@ function render({ animate = false } = {}) {
   }
   updateValue($('todayVal'), todayCost, paintCost, animate);
 
-  // rolling windows: last 5 hours (hour resolution) and last 7 days.
+  // rolling windows: last 5 hours (to the minute) and last 7 days.
   // Provider/model filters apply; the date filter intentionally doesn't — these are live.
   const now = Date.now();
   const cutoff5h = now - 5 * 3600 * 1000;
@@ -710,8 +728,15 @@ function render({ animate = false } = {}) {
     if (b.date >= floor7 && b.date <= t) {
       wk.cost += b.cost; wk.tok += tokens; wk.msgs += b.msgs;
     }
-    const epoch = new Date(`${b.date}T${String(b.hour ?? 0).padStart(2, '0')}:00:00`).getTime();
-    if (epoch >= cutoff5h && epoch <= now) {
+    // A bucket is one minute of calls, so it belongs to the window when that
+    // minute does. Judging by the hour instead dropped everything in the
+    // window's first, partial hour — up to a fifth of it. History that is
+    // only known to the hour counts when any part of its hour is inside.
+    const hh = String(b.hour ?? 0).padStart(2, '0');
+    const mm = String(b.minute ?? 0).padStart(2, '0');
+    const epoch = new Date(`${b.date}T${hh}:${mm}:00`).getTime();
+    const span = (b.minute == null ? 60 : 1) * 60000;
+    if (epoch + span > cutoff5h && epoch <= now) {
       w5.cost += b.cost; w5.tok += tokens; w5.msgs += b.msgs;
     }
   }
@@ -801,6 +826,9 @@ function render({ animate = false } = {}) {
    A number alone says nothing about direction. Each bounded range is
    measured against the stretch of equal length immediately before it. */
 
+// bucketMatchesRange applies minute bounds only to a custom range.
+const CUSTOM_RANGE_SOURCE = { preset: 'custom' };
+
 function shiftRangeBack([from, to]) {
   const start = new Date(`${from}T00:00:00`);
   const end = new Date(`${to}T00:00:00`);
@@ -828,16 +856,31 @@ function renderPeriodDelta(currentCost) {
     return;
   }
   const [from, to] = previous.range;
+  // Compare like with like. A range that ends today is only part-way through
+  // its last day, so the earlier stretch stops at the same time of day; a
+  // custom range carries its own start and end times back with it. Measuring
+  // a morning against a whole previous day read as a fall that never happened.
+  const [curFrom, curTo] = rangeForPreset();
+  const bounds = state.preset === 'custom'
+    ? resolveCustomBounds()
+    : {
+      from: minuteStamp(curFrom, '00:00'),
+      to: minuteStamp(curTo, curTo === today() ? currentTime() : '23:59'),
+    };
+  const shift = previous.days * 1440;
+  const prevBounds = { from: bounds.from - shift, to: bounds.to - shift };
+  const partial = bounds.to - bounds.from + 1 < shift;
   let prevCost = 0;
   let prevCalls = 0;
   for (const b of state.buckets) {
-    if (b.date < from || b.date > to) continue;
+    if (!bucketMatchesRange(b, CUSTOM_RANGE_SOURCE, previous.range, prevBounds)) continue;
     if (state.hiddenProjects.has(b.project)) continue;
     if (!passesLiveFilters(b)) continue;
     prevCost += b.cost;
     prevCalls += b.msgs;
   }
-  if (!prevCalls) {
+  // Nothing to measure against, or nothing priced to divide by.
+  if (!prevCalls || !(prevCost > 0)) {
     el.hidden = true;
     return;
   }
@@ -850,7 +893,7 @@ function renderPeriodDelta(currentCost) {
   el.textContent = pct === 0
     ? `level vs ${label}`
     : `${change > 0 ? '+' : '−'}${pct}% vs ${label}`;
-  el.title = `${fmtCost(prevCost)} over the ${previous.days === 1 ? 'previous day' : `previous ${previous.days} days`} (${from} to ${to}), under the same filters`;
+  el.title = `${fmtCost(prevCost)} over the ${previous.days === 1 ? 'previous day' : `previous ${previous.days} days`} (${from} to ${to})${partial ? ', up to the same time of day' : ''}, under the same filters`;
 }
 
 /* ───────────────────────── month projection ─────────────────────────
@@ -1068,7 +1111,13 @@ function renderModelTable(byModel) {
     }
     const cost = document.createElement('td');
     cost.className = 'r';
-    if (!m.priced) {
+    if (!m.priced && m.pricedCalls > 0 && m.cost > 0) {
+      // The priced calls are in the headline; saying "Unpriced" here would
+      // leave the table short of it.
+      cost.textContent = `≥${fmtCost(m.cost)}`;
+      cost.classList.add('cost-est');
+      cost.title = `${m.unpricedCalls.toLocaleString()} of ${(m.pricedCalls + m.unpricedCalls).toLocaleString()} calls have no published official API price and are not in this figure`;
+    } else if (!m.priced) {
       cost.textContent = 'Unpriced';
       cost.classList.add('unpriced');
       cost.title = `${m.unpricedCalls.toLocaleString()} calls have no published official API price`;
@@ -1146,7 +1195,12 @@ function projTableRow(label, tok, cost, opts = {}) {
 function appendProjectModels(table, p) {
   const entries = [...p.models.values()].sort((a, b) =>
     b.cost - a.cost || a.model.localeCompare(b.model, undefined, { sensitivity: 'base' }));
-  const money = (v, priced, estimated = false) => (priced ? `${estimated ? '≈' : ''}${fmtCost(v)}` : 'Unpriced');
+  // priced: true, false, or 'partial' when only some of the calls have a price
+  // (their value is shown as a floor rather than hidden behind "Unpriced").
+  const money = (v, priced, estimated = false) => (priced
+    ? `${priced === 'partial' ? '≥' : estimated ? '≈' : ''}${fmtCost(v)}`
+    : 'Unpriced');
+  const pricedState = (x) => (x.unpricedCalls === 0 ? true : x.pricedCalls > 0 && x.cost > 0 ? 'partial' : false);
   const addGroup = (head, m, priced, provider) => {
     const g = document.createElement('div');
     g.className = 'proj-tgroup';
@@ -1182,14 +1236,14 @@ function appendProjectModels(table, p) {
   table.appendChild(projTableRow('', 'tokens', 'cost', { cols: true }));
   for (const m of entries) {
     addGroup(
-      projTableRow(prettyModel(m.provider, m.model, m.source), `${m.msgs.toLocaleString()} calls`, money(m.cost, m.priced, m.estimated),
+      projTableRow(prettyModel(m.provider, m.model, m.source), `${m.msgs.toLocaleString()} calls`, money(m.cost, pricedState(m), m.estimated),
         { head: true, dot: modelColor(m.provider, m.model), title: `${pmeta(m.provider).label} · ${m.model}` }),
-      m, m.priced, m.provider);
+      m, pricedState(m), m.provider);
   }
   if (entries.length > 1) {
     addGroup(
-      projTableRow('All models', `${p.msgs.toLocaleString()} calls`, money(p.cost, p.unpricedCalls === 0, p.estimated), { head: true }),
-      p, p.unpricedCalls === 0, 'all');
+      projTableRow('All models', `${p.msgs.toLocaleString()} calls`, money(p.cost, pricedState(p), p.estimated), { head: true }),
+      p, pricedState(p), 'all');
   }
 }
 
@@ -1539,9 +1593,22 @@ function renderProjects(byProject) {
         ? `sorted by cost · ${marks.join(' · ')}`
         : 'sorted by cost · tick to export · right-click to hide';
   }
+  // Projects whose logs have all been deleted keep counting in the totals
+  // but have no row here; say so, or the list looks like it should add up.
+  const goneEntries = [...byProject.entries()].filter(([n, p]) => !p.live && !state.hiddenProjects.has(n));
+  const goneNote = () => {
+    if (!goneEntries.length) return;
+    const cost = goneEntries.reduce((s, [, p]) => s + p.cost, 0);
+    const calls = goneEntries.reduce((s, [, p]) => s + p.msgs, 0);
+    const div = document.createElement('div');
+    div.className = 'limits-msg proj-gone-note';
+    div.textContent = `Not listed: ${goneEntries.length.toLocaleString()} project${goneEntries.length === 1 ? '' : 's'} whose logs were deleted · ${fmtCost(cost)} · ${calls.toLocaleString()} calls, still counted in the totals`;
+    wrap.appendChild(div);
+  };
   if (!entries.length && !archivedEntries.length) {
     state.expandedProject = null;
-    wrap.innerHTML = `<div class="empty">no usage in this range</div>`;
+    wrap.innerHTML = goneEntries.length ? '' : `<div class="empty">no usage in this range</div>`;
+    goneNote();
     return;
   }
 
@@ -1582,6 +1649,7 @@ function renderProjects(byProject) {
   }
 
   buildArchivedDrawer(wrap, byProject, archivedEntries, max);
+  goneNote();
 }
 
 // Archived projects live behind one collapsed row. Opening it shows them with
@@ -1974,8 +2042,15 @@ const HOUR_MS = 3600 * 1000;
 // asks for it once a second.
 const scopeCache = { key: '', scopes: [] };
 
+// True only when current account telemetry positively shows no five-hour
+// limit (a verified Ultra account) — never merely because limits are missing.
+function claudeHasNoSessionLimit() {
+  const s = window.EmberQuota.claudeSessionLimit(state.limits && state.limits.claude);
+  return s.known && !s.window;
+}
+
 function quotaScopeList() {
-  const key = `${state.dataRevision}|${state.quotaRevision}`;
+  const key = `${state.dataRevision}|${state.quotaRevision}|${claudeHasNoSessionLimit()}`;
   if (scopeCache.key === key) return scopeCache.scopes;
   const scopes = buildQuotaScopes();
   scopeCache.key = key;
@@ -2005,8 +2080,12 @@ function buildQuotaScopes() {
   if (providers.has('claude')) {
     // Claude's session window is a documented fixed length, so the block
     // history is reconstructable whether or not a meter has been seen yet.
-    push('claude', 'session', meterFor('claude', 'session'), 5 * HOUR_MS, '5h session',
-      'Claude Code five-hour session windows, rebuilt from the logs');
+    // The exception is a verified Ultra account, which has no five-hour limit
+    // at all: once the account says so, there is no session to measure.
+    if (!claudeHasNoSessionLimit()) {
+      push('claude', 'session', meterFor('claude', 'session'), 5 * HOUR_MS, '5h session',
+        'Claude Code five-hour session windows, rebuilt from the logs');
+    }
     push('claude', 'period', meterFor('claude', 'weekly'), 7 * 24 * HOUR_MS, 'Week',
       'Claude weekly quota periods');
   }
@@ -2455,7 +2534,7 @@ function renderQuota(animate = false) {
 // Only the countdown moves between renders; recomputing the panel every
 // second for it would be wasteful.
 function tickQuotaClock() {
-  const live = quotaCache.liveQuotaRow(rows);
+  const live = liveQuotaRow(quotaCache.rows);
   if (state.settings.miniMode) {
     const kind = quotaCache.scope && quotaCache.scope.mode === 'period' ? 'week' : 'session';
     $('miniWhen').textContent = live
@@ -2492,8 +2571,10 @@ function claudeRows(l) {
   const d = l.data || {};
   const rows = [];
   const modelRows = new Set();
-  if (d.five_hour) {
-    rows.push({ name: 'Current session', sub: () => fmtCountdown(d.five_hour.resets_at), u: d.five_hour.utilization });
+  // Absent on a verified Ultra account, which has no five-hour limit.
+  const session = window.EmberQuota.claudeSessionLimit(l).window;
+  if (session) {
+    rows.push({ name: 'Current session', sub: () => fmtCountdown(session.resets_at), u: session.utilization });
   }
   if (d.seven_day) {
     rows.push({ name: 'Weekly · all models', sub: () => fmtResetDay(d.seven_day.resets_at), u: d.seven_day.utilization });
@@ -3521,8 +3602,15 @@ async function init() {
   });
 
   window.api.onLimits((l) => {
+    const hadNoSession = claudeHasNoSessionLimit();
     state.limits = l;
     renderLimits();
+    // The five-hour limit appearing or disappearing changes which Session
+    // burn scopes exist, so that panel has to be rebuilt too.
+    if (hadNoSession !== claudeHasNoSessionLimit()) {
+      state.quotaRevision++;
+      if (state.hasRenderedUsage) render();
+    }
   });
   window.api.onQuota((q) => {
     state.quota = q;

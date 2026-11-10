@@ -185,9 +185,12 @@ pub fn parse_rows<F: Fn(&str) -> bool>(rows: &[Value], exists: F) -> Vec<Bucket>
             cached,
             reasoning,
             cache_write,
-            cache_write_known: row.get("cache_write").is_some_and(|v| !v.is_null()),
+            // As in Codex rollouts, a zero here is "not reported": these rows
+            // read prompts back from cache that some request must have written.
+            cache_write_known: cache_write > 0.0,
             total_input: input + cached + cache_write,
             service_tier: row.get("service_tier").and_then(Value::as_str).unwrap_or("standard"),
+            date: Some(&parts.date),
         });
         bucket.cost += c.total;
         bucket.cost_min += c.cost_min;
@@ -346,7 +349,16 @@ mod tests {
         assert_eq!(b.output, 25.0, "reasoning is folded into billed output");
         assert_eq!(b.reasoning, 5.0);
         assert_eq!(b.msgs, 1);
-        assert!(!b.estimated, "OpenCode reports cache writes explicitly");
+        // A zero write beside a cache read is "not reported": the prompt that
+        // was read back had to be written by some request.
+        assert!(b.estimated, "an unreported cache write carries the write-premium range");
+        assert!(b.cost_max > b.cost_min);
+
+        let mut measured = rows[0].clone();
+        measured["cache_write"] = json!(40);
+        let buckets = parse_rows(&[measured], |_| true);
+        assert!(!buckets[0].estimated, "a positive write count is a measurement");
+        assert_eq!(buckets[0].cache_write, 40.0);
     }
 
     #[test]

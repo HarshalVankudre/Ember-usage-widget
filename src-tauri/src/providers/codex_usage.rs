@@ -16,7 +16,9 @@ use std::sync::{Arc, Mutex};
 // earlier account-wide reading in the same rollout.
 // v6: turn time appended; older rollouts are reparsed once to backfill it.
 // v7: per-call service tier appended; backfill Fast/Priority from live logs.
-const CACHE_VERSION: u32 = 7;
+// v8: the tier is read from thread_settings_applied, where current rollouts
+// record it, and a logged zero cache write is no longer taken as measured.
+const CACHE_VERSION: u32 = 8;
 const LEGACY_ENTRY_LENGTH: usize = 11;
 const V5_ENTRY_LENGTH: usize = 12;
 const V6_ENTRY_LENGTH: usize = 13;
@@ -143,9 +145,34 @@ static STATE: Mutex<State> = Mutex::new(State {
     memo_expires_ms: f64::INFINITY,
 });
 
+/// Every Codex home on this machine. The CLI, the IDE extension and the Codex
+/// desktop app all write to `~/.codex`; anything that runs Codex with its own
+/// home keeps rollouts Ember would otherwise never see.
+fn codex_homes() -> Vec<PathBuf> {
+    let mut homes = vec![dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".codex")];
+    // CODEX_HOME relocates the whole home.
+    if let Some(custom) = std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()) {
+        homes.push(PathBuf::from(custom));
+    }
+    // Orca runs Codex in panes against a runtime home of its own. Sessions it
+    // also mirrors into ~/.codex share a dedup key, so they are counted once.
+    if let Some(roaming) = dirs::config_dir() {
+        homes.push(roaming.join("orca").join("codex-runtime-home").join("home"));
+    }
+    let mut unique: Vec<PathBuf> = Vec::new();
+    for home in homes {
+        if !unique.contains(&home) {
+            unique.push(home);
+        }
+    }
+    unique
+}
+
 pub fn session_dirs() -> Vec<PathBuf> {
-    let codex = dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".codex");
-    vec![codex.join("sessions"), codex.join("archived_sessions")]
+    codex_homes()
+        .into_iter()
+        .flat_map(|home| [home.join("sessions"), home.join("archived_sessions")])
+        .collect()
 }
 
 pub fn invalidate() {
@@ -181,6 +208,12 @@ fn upgrade_old_files(files: BTreeMap<String, Value>) -> BTreeMap<String, FileRec
                     }
                     if arr.len() == V6_ENTRY_LENGTH {
                         arr.push(serde_json::json!("standard"));
+                    }
+                    // Rollouts log `cache_write_input_tokens: 0` on every call,
+                    // including calls whose prompt the next call then reads
+                    // from cache. A zero is "not reported", not "no write".
+                    if arr.len() > 9 && arr[8].as_f64().unwrap_or(0.0) <= 0.0 {
+                        arr[9] = serde_json::json!(false);
                     }
                 }
             }
@@ -227,7 +260,7 @@ pub fn init(user_data: &Path) {
                 }
             }
         }
-        Some(3..=6) => {
+        Some(3..=7) => {
             if let Some(files) = parsed.get("files") {
                 if let Ok(files) = serde_json::from_value::<BTreeMap<String, Value>>(files.clone()) {
                     let mut files = upgrade_old_files(files);
@@ -319,6 +352,9 @@ pub fn parse_content(text: &str) -> ParsedFile {
     let mut turn = TurnClock::default();
     let mut model = "unknown".to_string();
     let mut service_tier = "standard".to_string();
+    // Current rollouts state the tier in thread_settings_applied and leave it
+    // out of turn_context; older ones put it in turn_context.
+    let mut tier_from_settings = false;
     let mut project = "unknown".to_string();
     let mut session_id: Option<String> = None;
     let mut limits: Option<LimitsSnap> = None;
@@ -329,10 +365,11 @@ pub fn parse_content(text: &str) -> ParsedFile {
         let is_meta = line.contains("\"session_meta\"");
         let is_turn = line.contains("\"turn_context\"");
         let is_count = line.contains("\"token_count\"");
+        let is_settings = line.contains("\"thread_settings_applied\"");
         let is_task = line.contains("\"task_started\"")
             || line.contains("\"task_complete\"")
             || line.contains("\"turn_aborted\"");
-        if !is_meta && !is_turn && !is_count && !is_task {
+        if !is_meta && !is_turn && !is_count && !is_task && !is_settings {
             continue;
         }
         let Ok(obj) = serde_json::from_str::<Value>(line) else { continue };
@@ -356,10 +393,15 @@ pub fn parse_content(text: &str) -> ParsedFile {
             if let Some(m) = p.get("model").and_then(|m| m.as_str()).filter(|m| !m.is_empty()) {
                 model = m.to_string();
             }
-            // Each context describes a new request. Missing/null tiers mean
-            // standard, including when Fast was enabled on an earlier turn.
-            service_tier = p.get("service_tier").and_then(Value::as_str)
-                .filter(|s| !s.is_empty()).unwrap_or("standard").to_string();
+            // Each context describes a new request. In a rollout that states
+            // the tier here, a missing/null tier means standard, including
+            // when Fast was enabled on an earlier turn. In one that states it
+            // in thread_settings_applied, the key is simply absent and the
+            // settings in force carry over.
+            if p.get("service_tier").is_some() || !tier_from_settings {
+                service_tier = p.get("service_tier").and_then(Value::as_str)
+                    .filter(|s| !s.is_empty()).unwrap_or("standard").to_string();
+            }
             continue;
         }
         if obj_type != "event_msg" {
@@ -367,6 +409,16 @@ pub fn parse_content(text: &str) -> ParsedFile {
         }
         let timestamp = obj.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
         let event = p.get("type").and_then(|t| t.as_str());
+        if event == Some("thread_settings_applied") {
+            // Written whenever the thread's settings change, and after the
+            // first turn_context. It holds until the next one.
+            if let Some(settings) = p.get("thread_settings").filter(|v| v.is_object()) {
+                tier_from_settings = true;
+                service_tier = settings.get("service_tier").and_then(Value::as_str)
+                    .filter(|s| !s.is_empty()).unwrap_or("standard").to_string();
+            }
+            continue;
+        }
         if matches!(event, Some("task_started" | "task_complete" | "turn_aborted")) {
             let Some(at) = crate::parse_ts_ms(timestamp) else { continue };
             let closed = if event == Some("task_started") { turn.prompt(at) } else { turn.finish(at) };
@@ -442,7 +494,10 @@ pub fn parse_content(text: &str) -> ParsedFile {
         .into_iter()
         .flatten()
         .find(|v| !v.is_null());
-        let cache_write_known = raw_write.is_some_and(|v| v.as_f64().is_some());
+        // Only a positive count is a measurement. Rollouts write a literal 0
+        // here on every call, even when the next call reads this call's prompt
+        // back from cache, which a billed write must have put there.
+        let cache_write_known = raw_write.is_some_and(|v| v.as_f64().is_some_and(|n| n > 0.0));
         let cache_write = if cache_write_known {
             raw_write
                 .and_then(|v| v.as_f64())
@@ -696,6 +751,7 @@ pub fn aggregate() -> Arc<Aggregate> {
                 cache_write_known: *cache_write_known,
                 total_input: *total_input,
                 service_tier,
+                date: Some(date),
             });
             bucket.cost += c.total;
             bucket.cost_min += c.cost_min;
@@ -833,6 +889,79 @@ mod tests {
     }
 
     #[test]
+    fn the_service_tier_comes_from_thread_settings_and_holds_across_turns() {
+        // Order seen in the field: turn_context first, then the settings.
+        let settings = |tier: &str| json!({ "type": "event_msg", "timestamp": "2026-11-02T19:51:29Z",
+            "payload": { "type": "thread_settings_applied", "thread_settings": { "model": "gpt-6-astra", "service_tier": tier } } });
+        let context = || json!({ "type": "turn_context", "payload": { "model": "gpt-6-astra" } });
+        let lines = [
+            json!({ "type": "session_meta", "payload": { "id": "s" } }),
+            task("2026-11-02T19:51:00Z", "task_started"),
+            context(),
+            settings("priority"),
+            count("2026-11-02T19:52:00Z", 11),
+            // The next turn repeats no settings: the tier in force carries over.
+            task("2026-11-02T19:53:00Z", "task_started"),
+            context(),
+            count("2026-11-02T19:54:00Z", 22),
+            settings("default"),
+            task("2026-11-02T19:55:00Z", "task_started"),
+            context(),
+            count("2026-11-02T19:56:00Z", 33),
+        ]
+        .map(|v| v.to_string())
+        .join("\n");
+        let tiers: Vec<String> = parse_content(&lines).entries.iter().map(|e| e.13.clone()).collect();
+        assert_eq!(tiers, ["priority", "priority", "default"]);
+    }
+
+    #[test]
+    fn an_older_rollout_still_takes_the_tier_from_turn_context() {
+        let lines = [
+            json!({ "type": "turn_context", "payload": { "model": "gpt-5.6-sol", "service_tier": "priority" } }),
+            count("2026-09-29T10:00:20Z", 11),
+            json!({ "type": "turn_context", "payload": { "model": "gpt-5.6-sol" } }),
+            count("2026-09-29T10:01:20Z", 22),
+        ]
+        .map(|v| v.to_string())
+        .join("\n");
+        let tiers: Vec<String> = parse_content(&lines).entries.iter().map(|e| e.13.clone()).collect();
+        assert_eq!(tiers, ["priority", "standard"]);
+    }
+
+    #[test]
+    fn a_logged_zero_cache_write_is_not_a_measurement() {
+        let lines = [
+            json!({ "type": "turn_context", "payload": { "model": "gpt-6.1-sol" } }),
+            json!({
+                "type": "event_msg", "timestamp": "2026-11-02T19:52:00Z",
+                "payload": { "type": "token_count", "info": {
+                    "total_token_usage": { "total_tokens": 18812 },
+                    "last_token_usage": { "input_tokens": 18666, "cached_input_tokens": 0,
+                        "cache_write_input_tokens": 0, "output_tokens": 146, "total_tokens": 18812 }
+                }}
+            }),
+        ]
+        .map(|v| v.to_string())
+        .join("\n");
+        let e = &parse_content(&lines).entries[0];
+        assert_eq!((e.4, e.8), (18666.0, 0.0));
+        assert!(!e.9, "a zero leaves the write share unknown, so the cost carries a range");
+
+        let old = BTreeMap::from([("gone.jsonl".to_string(), json!({
+            "mtimeMs": 0, "size": 0, "project": "p", "gone": true,
+            "entries": [
+                ["k1", "2026-11-02", 19, "gpt-6.1-sol", 18666.0, 146.0, 0.0, 0.0, 0.0, true, 18666.0, 52, 0.0, "standard"],
+                ["k2", "2026-11-02", 19, "gpt-6.1-sol", 8666.0, 146.0, 0.0, 0.0, 10000.0, true, 18666.0, 52, 0.0, "standard"],
+            ]
+        }))]);
+        let upgraded = upgrade_old_files(old);
+        let entries = &upgraded["gone.jsonl"].entries;
+        assert!(!entries[0].9);
+        assert!(entries[1].9, "a positive count stays measured");
+    }
+
+    #[test]
     fn keeps_the_newest_rate_limit_snapshot() {
         let lines = [
             json!({
@@ -849,6 +978,27 @@ mod tests {
         let parsed = parse_content(&lines);
         let limits = parsed.limits.unwrap();
         assert_eq!(limits.rate_limits["primary"]["used_percent"], json!(30));
+    }
+
+    /// Not a unit test: prints per-model totals for the real rollouts so they
+    /// can be recounted independently. Run with
+    /// `EMBER_VERIFY_DIR=<copy of the app data dir> cargo test real_codex_totals -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn real_codex_totals() {
+        let dir = std::env::var("EMBER_VERIFY_DIR").expect("EMBER_VERIFY_DIR");
+        init(Path::new(&dir));
+        let agg = aggregate();
+        let mut by_model: BTreeMap<String, [f64; 8]> = BTreeMap::new();
+        for b in &agg.buckets {
+            let m = by_model.entry(b.model.clone()).or_insert([0.0; 8]);
+            for (slot, v) in [b.msgs as f64, b.input, b.output, b.cached, b.cache_write, b.reasoning, b.cost_min, b.cost].into_iter().enumerate() {
+                m[slot] += v;
+            }
+        }
+        for (model, m) in by_model {
+            println!("CODEX	{model}	{}	{}	{}	{}	{}	{}	{:.6}	{:.6}", m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]);
+        }
     }
 
     #[test]

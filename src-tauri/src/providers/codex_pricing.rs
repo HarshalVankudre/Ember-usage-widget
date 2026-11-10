@@ -55,13 +55,20 @@ const PRICING_RULES: &[PriceRule] = &[
     tiered_with_write(r"gpt-6\.1-terra", 1.0, 0.05, 1.25, 5.0, "gpt5"),
     tiered_with_write(r"gpt-6-sol", 2.0, 0.2, 2.5, 10.0, "gpt5"),
     tiered_with_write(r"gpt-6-luna", 0.1, 0.01, 0.125, 0.5, "gpt5"),
+    // Specialized (trusted-access) models. A row is tiered only when the page
+    // prices its long context; "-" there means long context is not offered.
+    tiered_with_write(r"gpt-6-cyber", 20.0, 2.0, 25.0, 100.0, "gpt5"),
+    tiered_with_write(r"gpt-6-rosalind", 15.0, 1.5, 18.75, 75.0, "gpt5"),
+    rule(r"gpt-rosalind-(?:research|discovery)", 5.0, 0.5, 25.0, "gpt5"),
+    rule(r"gpt-6-astra-law", 10.0, 1.0, 50.0, "gpt5"),
+    rule(r"gpt-5-search-api", 1.25, 0.125, 10.0, "gpt5"),
     with_write(r"gpt-5\.6-cyber", 12.5, 1.25, 15.625, 75.0, "gpt5"),
     tiered_with_write(r"gpt-5\.6-terra", 2.0, 0.2, 2.5, 12.0, "gpt5"),
     tiered_with_write(r"gpt-5\.6-luna", 0.2, 0.02, 0.25, 1.2, "gpt5"),
-    // Promotional through at least November 21, 2026; the live table tracks
-    // whatever replaces it.
+    // Promotional until November 30, 2026; the live table tracks whatever
+    // replaces it.
     tiered_with_write(r"gpt-5\.6(?:-sol)?", 4.0, 0.4, 5.0, 20.0, "gpt5"),
-    rule(r"gpt-5\.5-cyber", 12.5, 1.25, 75.0, "gpt5"),
+    rule(r"gpt-5\.5-cyber(?:-preview)?", 12.5, 1.25, 75.0, "gpt5"),
     tiered(r"gpt-5\.5-pro", 30.0, 30.0, 180.0, "pro"),
     tiered(r"gpt-5\.5", 5.0, 0.5, 30.0, "gpt5"),
     tiered(r"gpt-5\.4-pro", 30.0, 30.0, 180.0, "pro"),
@@ -122,6 +129,52 @@ const FAST_PRICING_RULES: &[PriceRule] = &[
     rule(r"gpt-4o-mini", 0.25, 0.125, 1.0, "mini"),
     rule(r"o3", 3.5, 0.875, 14.0, "o"),
     rule(r"o4-mini", 2.0, 0.5, 8.0, "o"),
+];
+
+/// A price a model carried between two local dates (inclusive; "" = open).
+/// The official page only states today's price, so a call is priced by the row
+/// in force on the day it was made, ahead of the live and bundled tables.
+struct DatedRule {
+    pattern: &'static str,
+    from: &'static str,
+    to: &'static str,
+    input: f64,
+    cached: f64,
+    write: f64,
+    output: f64,
+}
+
+// GPT-5.6 Luna and Terra launched at $1/$6 and $2.50/$15 and were cut on
+// July 30, 2026 (openai.com/index/advancing-the-price-performance-frontier-
+// with-gpt-5-6). GPT-5.6 Sol launched at $5/$30 and has been $4/$20 since
+// August 21, 2026 (OpenAI's developer-community announcement of that date),
+// a promotion that ends when list pricing returns on November 30, 2026.
+// Cached input is 0.1x and the 30-minute write 1.25x input throughout.
+const DATED_PRICING_RULES: &[DatedRule] = &[
+    DatedRule { pattern: r"gpt-5\.6-luna", from: "", to: "2026-07-29", input: 1.0, cached: 0.1, write: 1.25, output: 6.0 },
+    DatedRule { pattern: r"gpt-5\.6-terra", from: "", to: "2026-07-29", input: 2.5, cached: 0.25, write: 3.125, output: 15.0 },
+    DatedRule { pattern: r"gpt-5\.6(?:-sol)?", from: "", to: "2026-08-20", input: 5.0, cached: 0.5, write: 6.25, output: 30.0 },
+    // Pinned so the promotion's own days keep its price once the live table
+    // moves on.
+    DatedRule { pattern: r"gpt-5\.6(?:-sol)?", from: "2026-08-21", to: "2026-11-29", input: 4.0, cached: 0.4, write: 5.0, output: 20.0 },
+];
+
+fn dated_rule_for(model: &str, date: &str) -> Option<&'static DatedRule> {
+    static RULES: OnceLock<Vec<(Regex, &DatedRule)>> = OnceLock::new();
+    let rules = RULES.get_or_init(|| DATED_PRICING_RULES.iter().map(|r| {
+        (Regex::new(&format!(r"^{}(?:-\d{{4}}-\d{{2}}-\d{{2}})?$", r.pattern)).unwrap(), r)
+    }).collect());
+    // ISO dates order as text.
+    rules
+        .iter()
+        .find(|(re, r)| (r.from.is_empty() || date >= r.from) && (r.to.is_empty() || date <= r.to) && re.is_match(model))
+        .map(|(_, r)| *r)
+}
+
+// Published Ultrafast rates: two models, each six times its Standard row.
+const ULTRAFAST_PRICING_RULES: &[PriceRule] = &[
+    tiered_with_write(r"gpt-6-astra", 60.0, 6.0, 75.0, 300.0, "gpt5"),
+    tiered_with_write(r"gpt-6\.1-sol", 12.0, 0.6, 15.0, 60.0, "gpt5"),
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -200,18 +253,72 @@ pub fn price_for(model: &str) -> Option<ResolvedPrice> {
 }
 
 pub fn price_for_tier(model: &str, service_tier: &str) -> Option<ResolvedPrice> {
-    let live_guard = LIVE_PRICES.read().unwrap();
-    resolve_price(model, service_tier, live_guard.as_ref())
+    price_on(model, service_tier, None)
 }
 
+/// The price in force on `date` (a local YYYY-MM-DD); today's when `None`.
+pub fn price_on(model: &str, service_tier: &str, date: Option<&str>) -> Option<ResolvedPrice> {
+    let live_guard = LIVE_PRICES.read().unwrap();
+    resolve_price_on(model, service_tier, date, live_guard.as_ref())
+}
+
+#[cfg(test)]
 fn resolve_price(model: &str, service_tier: &str, live_prices: Option<&HashMap<String, LivePrice>>) -> Option<ResolvedPrice> {
+    resolve_price_on(model, service_tier, None, live_prices)
+}
+
+fn resolve_price_on(model: &str, service_tier: &str, date: Option<&str>, live_prices: Option<&HashMap<String, LivePrice>>) -> Option<ResolvedPrice> {
     let fast = match service_tier.trim().to_ascii_lowercase().as_str() {
         "fast" | "priority" => true,
         "" | "standard" | "default" | "auto" => false,
+        // Flex and Batch are published as exactly half of every Standard rate
+        // (input, cached input, cache writes and output, both context tiers).
+        "flex" | "batch" => {
+            let mut p = resolve_price_on(model, "standard", date, live_prices)?;
+            if !p.unpriced {
+                p.input *= 0.5;
+                p.cached *= 0.5;
+                p.write = p.write.map(|w| w * 0.5);
+                p.output *= 0.5;
+                p.source = "OpenAI Flex/Batch pricing (half of Standard)";
+            }
+            return Some(p);
+        }
+        "ultrafast" => {
+            static RULES: OnceLock<Vec<(Regex, &PriceRule)>> = OnceLock::new();
+            let rules = RULES.get_or_init(|| ULTRAFAST_PRICING_RULES.iter().map(|r| {
+                (Regex::new(&format!(r"^{}(?:-\d{{4}}-\d{{2}}-\d{{2}})?$", r.pattern)).unwrap(), r)
+            }).collect());
+            let r = rules.iter().find(|(re, _)| re.is_match(&model.to_lowercase()))?.1;
+            return Some(ResolvedPrice {
+                unpriced: false,
+                input: r.input, cached: r.cached, write: r.write, output: r.output,
+                long_context: r.long_context, short_context_only: false,
+                family: r.family.to_string(), source: "OpenAI Ultrafast pricing (bundled)",
+            });
+        }
         _ => return None,
     };
     let m = model.to_lowercase();
     let bundled = bundled_rule_for(&m);
+
+    if let Some(dated) = date.and_then(|d| dated_rule_for(&m, d)) {
+        // Fast has been twice Standard on these models since it replaced
+        // Priority processing on July 30, 2026, and the Sol promotion kept
+        // that ratio.
+        let k = if fast { 2.0 } else { 1.0 };
+        return Some(ResolvedPrice {
+            unpriced: false,
+            input: dated.input * k,
+            cached: dated.cached * k,
+            write: Some(dated.write * k),
+            output: dated.output * k,
+            long_context: true,
+            short_context_only: false,
+            family: bundled.map(|b| b.family).unwrap_or("gpt5").to_string(),
+            source: "OpenAI pricing (rate on the day of use)",
+        });
+    }
 
     static DATE_SUFFIX: OnceLock<Regex> = OnceLock::new();
     let date_suffix = DATE_SUFFIX.get_or_init(|| Regex::new(r"-\d{4}-\d{2}-\d{2}$").unwrap());
@@ -296,6 +403,8 @@ pub struct CodexUsage<'a> {
     pub total_input: f64,
     /// The recorded request tier; empty means legacy logs with standard pricing.
     pub service_tier: &'a str,
+    /// Local date of the call, so it is priced at the rate in force that day.
+    pub date: Option<&'a str>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -321,7 +430,7 @@ pub struct CodexCost {
 /// omit writes, so those calls carry a transparent min/max range and use the
 /// conservative upper estimate (all new input was written to cache).
 pub fn cost_of(model: &str, usage: &CodexUsage) -> CodexCost {
-    let p = match price_for_tier(model, usage.service_tier) {
+    let p = match price_on(model, usage.service_tier, usage.date) {
         None => return CodexCost { source: "No official price".to_string(), ..Default::default() },
         Some(p) if p.unpriced => return CodexCost { source: p.source.to_string(), ..Default::default() },
         Some(p) => p,
@@ -420,6 +529,91 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Today's official page, row by row, against the table shipped in the
+    /// binary — the prices Ember uses before (or without) a live refresh.
+    #[test]
+    fn bundled_prices_match_every_row_of_the_official_page() {
+        let map = super::super::codex_pricing_live::build_map(include_str!("fixtures/openai-pricing-2026-11-10.md"));
+        assert!(map.len() >= 35, "only {} rows parsed", map.len());
+        for (model, live) in &map {
+            let p = resolve_price(model, "standard", None).unwrap_or_else(|| panic!("no bundled price for {model}"));
+            assert_eq!((p.input, p.cached, p.write, p.output), (live.input, live.cached, live.write, live.output), "{model}");
+            assert_eq!(Some(p.long_context), live.long_context, "{model} context tier");
+            if let Some(fast) = &live.fast {
+                let f = resolve_price(model, "priority", None).unwrap_or_else(|| panic!("no bundled Fast price for {model}"));
+                assert_eq!((f.input, f.cached, f.write, f.output), (fast.input, fast.cached, fast.write, fast.output), "{model} fast");
+                assert_eq!((f.long_context, f.short_context_only), (fast.long_context, fast.short_context_only), "{model} fast tier");
+            }
+        }
+        for model in ["gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol",
+            "gpt-6-cyber", "gpt-6-rosalind", "gpt-5.5-cyber-preview", "gpt-6-astra-law", "gpt-5.3-codex"] {
+            assert!(map.contains_key(model), "{model} missing from the parsed page");
+        }
+        // Long context is priced for gpt-6-cyber and not offered for gpt-5.6-cyber.
+        assert_eq!(map["gpt-6-cyber"].long_context, Some(true));
+        assert_eq!(map["gpt-5.6-cyber"].long_context, Some(false));
+    }
+
+    #[test]
+    fn a_call_is_priced_at_the_rate_in_force_on_its_day() {
+        let on = |model: &str, tier: &str, date: &str| {
+            let p = resolve_price_on(model, tier, Some(date), None).unwrap();
+            (p.input, p.cached, p.write, p.output)
+        };
+        // Sol: $5/$30 at launch, $4/$20 from August 21, 2026.
+        assert_eq!(on("gpt-5.6-sol", "standard", "2026-08-20"), (5.0, 0.5, Some(6.25), 30.0));
+        assert_eq!(on("gpt-5.6-sol", "standard", "2026-08-21"), (4.0, 0.4, Some(5.0), 20.0));
+        assert_eq!(on("gpt-5.6-sol", "priority", "2026-08-10"), (10.0, 1.0, Some(12.5), 60.0));
+        assert_eq!(on("gpt-5.6-sol", "flex", "2026-08-10"), (2.5, 0.25, Some(3.125), 15.0));
+        // Luna and Terra: cut on July 30, 2026.
+        assert_eq!(on("gpt-5.6-luna", "standard", "2026-07-29"), (1.0, 0.1, Some(1.25), 6.0));
+        assert_eq!(on("gpt-5.6-luna", "standard", "2026-07-30"), (0.2, 0.02, Some(0.25), 1.2));
+        assert_eq!(on("gpt-5.6-terra", "standard", "2026-07-29"), (2.5, 0.25, Some(3.125), 15.0));
+        assert_eq!(on("gpt-5.6-terra", "standard", "2026-07-30"), (2.0, 0.2, Some(2.5), 12.0));
+        // Models whose price never moved are unaffected by the date.
+        assert_eq!(on("gpt-6-astra", "standard", "2026-08-01"), (10.0, 1.0, Some(12.5), 50.0));
+
+        // The promotion's days keep the promotional price after the live
+        // table has gone back to list.
+        let mut live = super::super::codex_pricing_live::build_map(include_str!("fixtures/openai-pricing-2026-11-10.md"));
+        let sol = live.get_mut("gpt-5.6-sol").unwrap();
+        (sol.input, sol.cached, sol.write, sol.output) = (5.0, 0.5, Some(6.25), 30.0);
+        assert_eq!(resolve_price_on("gpt-5.6-sol", "standard", Some("2026-11-10"), Some(&live)).unwrap().input, 4.0);
+        assert_eq!(resolve_price_on("gpt-5.6-sol", "standard", Some("2026-12-01"), Some(&live)).unwrap().input, 5.0);
+
+        // Long context still reprices the whole request: 2x input, 1.5x output.
+        let c = cost_of("gpt-5.6-sol", &CodexUsage {
+            input: 300_000.0, output: 10_000.0, cache_write: 1.0, cache_write_known: true,
+            total_input: 300_001.0, date: Some("2026-08-01"), ..Default::default()
+        });
+        close(c.total, 300_000.0 * 10.0 / 1e6 + 10_000.0 * 45.0 / 1e6 + 12.5 / 1e6);
+        assert!(c.long_context);
+    }
+
+    #[test]
+    fn flex_batch_and_ultrafast_use_their_published_rates() {
+        // Flex/Batch rows on the official page: half of Standard throughout.
+        for tier in ["flex", "batch"] {
+            let p = resolve_price("gpt-6-astra", tier, None).unwrap();
+            assert_eq!((p.input, p.cached, p.write, p.output), (5.0, 0.5, Some(6.25), 25.0));
+            assert!(p.long_context);
+            let sol = resolve_price("gpt-6.1-sol", tier, None).unwrap();
+            assert_eq!((sol.input, sol.cached, sol.write, sol.output), (1.0, 0.05, Some(1.25), 5.0));
+        }
+        let ultra = resolve_price("gpt-6-astra", "ultrafast", None).unwrap();
+        assert_eq!((ultra.input, ultra.cached, ultra.write, ultra.output), (60.0, 6.0, Some(75.0), 300.0));
+        let ultra = resolve_price("gpt-6.1-sol", "ultrafast", None).unwrap();
+        assert_eq!((ultra.input, ultra.cached, ultra.write, ultra.output), (12.0, 0.6, Some(15.0), 60.0));
+        assert!(resolve_price("gpt-6-luna", "ultrafast", None).is_none());
+        assert!(!cost_of("gpt-5.3-codex-spark", &CodexUsage { input: 1.0, service_tier: "flex", ..Default::default() }).known);
+        // Long context on Flex: $10 in / $37.50 out for gpt-6-astra.
+        let long = cost_of("gpt-6-astra", &CodexUsage {
+            input: 300_000.0, output: 10_000.0, cache_write: 1.0, cache_write_known: true,
+            total_input: 300_001.0, service_tier: "flex", ..Default::default()
+        });
+        close(long.total, 300_000.0 * 10.0 / 1e6 + 10_000.0 * 37.5 / 1e6 + 12.5 / 1e6);
     }
 
     #[test]

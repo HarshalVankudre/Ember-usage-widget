@@ -236,6 +236,8 @@ mod tests {
     fn parses_anthropic_official_model_price_table_rows() {
         let map = build_map(
             "| Model | Base Input Tokens | 5m Cache Writes | 1h Cache Writes | Cache Hits & Refreshes | Output Tokens |\n\
+             | Claude Fable 5.2 | $8 / MTok | $10 / MTok | $16 / MTok | $0.20 / MTok<sup>1</sup> | $40 / MTok |\n\
+             | Claude Mythos 5.2 ([limited availability](x)) | $8 / MTok | $10 / MTok | $16 / MTok | $0.20 / MTok<sup>1</sup> | $40 / MTok |\n\
              | Claude Opus 4.8 | $5 / MTok | $6.25 / MTok | $10 / MTok | $0.50 / MTok | $25 / MTok |\n\
              | Claude Fable 5.1 | $10 / MTok | $12.50 / MTok | $20 / MTok | $0.25 / MTok<sup>1</sup> | $50 / MTok |\n\
              | Claude Mythos 5.1 ([limited availability](x)) | $10 / MTok | $12.50 / MTok | $20 / MTok | $0.25 / MTok<sup>1</sup> | $50 / MTok |\n\
@@ -250,11 +252,19 @@ mod tests {
              | Claude Haiku 5.5 (for prompts over 100,000 tokens) | $0.50 / MTok | $0.625 / MTok | $1 / MTok | $0.05 / MTok | $2.50 / MTok |\n\
              ### Fast mode pricing\n\
              | Model | Input | Output |\n\
+             | Claude Fable 5.2 | $16 USD / MTok | $80 USD / MTok |\n\
+             | Claude Mythos 5.2 | $16 USD / MTok | $80 USD / MTok |\n\
              | Claude Opus 5.5 | $8 / MTok | $40 / MTok |\n\
              | Claude Opus 5 / Claude Opus 4.8 | $10 / MTok | $50 / MTok |\n\
              ### Batch processing\n\
              | Claude Opus 5.5 | $2 / MTok | $10 / MTok |",
         );
+        assert_eq!(map["fable-5-2"].input, 8.0);
+        assert_eq!(map["fable-5-2"].cache_read, 0.2);
+        assert_eq!(map["fable-5-2"].output, 40.0);
+        assert_eq!(map["fable-5-2"].fast_input, Some(16.0));
+        assert_eq!(map["fable-5-2"].fast_output, Some(80.0));
+        assert_eq!(map["mythos-5-2"].fast_input, Some(16.0));
         assert_eq!(map["opus-5-5"].input, 4.0);
         assert_eq!(map["opus-5-5"].cache_read, 0.2);
         assert_eq!(map["opus-5-5"].fast_input, Some(8.0));

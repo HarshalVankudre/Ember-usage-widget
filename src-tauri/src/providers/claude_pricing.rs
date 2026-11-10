@@ -31,6 +31,7 @@ const fn rates(input: f64, cache_w5m: f64, cache_w1h: f64, cache_read: f64, outp
 // Order matters: the first matching rule wins, so point releases with their
 // own rates (Fable 5.1's cheaper cache reads) sit above the family catch-all.
 const PRICING_RULES: &[PriceRule] = &[
+    PriceRule { test: r"(?:fable|mythos)-5-2", rates: rates(8.0, 10.0, 16.0, 0.2, 40.0), family: "fable" },
     PriceRule { test: r"(?:fable|mythos)-5-1", rates: rates(10.0, 12.5, 20.0, 0.25, 50.0), family: "fable" },
     PriceRule { test: r"(?:fable|mythos)-5", rates: rates(10.0, 12.5, 20.0, 1.0, 50.0), family: "fable" },
     // Opus 5.5 reads cache at 0.05x input rather than the usual 0.1x.
@@ -248,9 +249,13 @@ fn supports_us_geo(model: &str) -> bool {
 
 fn bundled_fast_rates(canonical: &str) -> Option<(f64, f64)> {
     match canonical {
+        "fable-5-2" | "mythos-5-2" => Some((16.0, 80.0)),
         "opus-5-5" => Some((8.0, 40.0)),
         "opus-5" | "opus-4-8" => Some((10.0, 50.0)),
-        "opus-4-7" => Some((30.0, 150.0)),
+        // Retired fast modes, kept for the logs written while they ran: six
+        // times standard. usage.speed reports the speed actually served, so a
+        // call logged as fast was billed as fast.
+        "opus-4-7" | "opus-4-6" => Some((30.0, 150.0)),
         _ => None,
     }
 }
@@ -274,6 +279,8 @@ pub struct ClaudeUsage<'a> {
     pub cache_w1h: f64,
     pub speed: &'a str,
     pub inference_geo: &'a str,
+    /// "batch" halves every token rate; anything else is standard.
+    pub service_tier: &'a str,
     pub web_searches: f64,
 }
 
@@ -327,13 +334,17 @@ pub fn cost_of(model: &str, usage: &ClaudeUsage) -> ClaudeCost {
             p = rates(input, p.cache_w5m * k, p.cache_w1h * k, p.cache_read * k, output);
             fast = true;
         }
-        // Opus 4.6 reports fast in some logs but is explicitly billed standard.
     }
 
     let geo = usage.inference_geo.to_lowercase();
-    let geo_multiplier = if geo == "us" && supports_us_geo(model) { 1.1 } else { 1.0 };
+    let us_region = geo == "us" && supports_us_geo(model);
+    // The Batch API bills every token category at half price, and the
+    // discount stacks with the caching and data-residency multipliers. Fast
+    // mode is not offered with it.
+    let batch = !fast && usage.service_tier.eq_ignore_ascii_case("batch");
+    let geo_multiplier = if us_region { 1.1 } else { 1.0 } * if batch { 0.5 } else { 1.0 };
     const M: f64 = 1e6;
-    let input =(nn(usage.input) / M) * p.input * geo_multiplier;
+    let input = (nn(usage.input) / M) * p.input * geo_multiplier;
     let output = (nn(usage.output) / M) * p.output * geo_multiplier;
     let cache_read = (nn(usage.cache_read) / M) * p.cache_read * geo_multiplier;
     let cache_write = (nn(usage.cache_w5m) / M) * p.cache_w5m * geo_multiplier
@@ -355,7 +366,7 @@ pub fn cost_of(model: &str, usage: &ClaudeUsage) -> ClaudeCost {
         known: true,
         estimated: false,
         fast,
-        us_region: geo_multiplier > 1.0,
+        us_region,
         long_context,
         source: resolved.source.to_string(),
     }
@@ -373,6 +384,38 @@ mod tests {
 
     fn close(actual: f64, expected: f64) {
         assert!((actual - expected).abs() <= 1e-9, "{actual} != {expected}");
+    }
+
+    /// Today's official page, row by row, against the table shipped in the
+    /// binary — the prices Ember uses before (or without) a live refresh.
+    #[test]
+    fn bundled_prices_match_every_row_of_the_official_page() {
+        let map = super::super::claude_pricing_live::build_map(include_str!("fixtures/anthropic-pricing-2026-11-10.md"));
+        assert!(map.len() >= 21, "only {} rows parsed", map.len());
+        for (model, live) in &map {
+            let rule = bundled_rule_for(model).unwrap_or_else(|| panic!("no bundled price for {model}"));
+            assert_eq!(
+                rule.rates,
+                rates(live.input, live.cache_w5m, live.cache_w1h, live.cache_read, live.output),
+                "{model}"
+            );
+            if let (Some(input), Some(output)) = (live.fast_input, live.fast_output) {
+                assert_eq!(bundled_fast_rates(model), Some((input, output)), "{model} fast");
+            }
+            let long = live.long_context.map(|t| (t.threshold, rates(t.input, t.cache_w5m, t.cache_w1h, t.cache_read, t.output)));
+            assert_eq!(bundled_long_rates(model), long, "{model} long-prompt tier");
+        }
+        for model in ["fable-5-2", "mythos-5-2", "fable-5-1", "fable-5", "opus-5-5", "opus-5", "opus-4-8",
+            "opus-4-5", "opus-4-1", "sonnet-5-5", "sonnet-5", "sonnet-4-6", "haiku-5-5", "haiku-4-5"] {
+            assert!(map.contains_key(model), "{model} missing from the parsed page");
+        }
+        // Every fast-mode row on the page, and nothing the page does not list.
+        let fast: Vec<&str> = {
+            let mut v: Vec<&str> = map.iter().filter(|(_, p)| p.fast_input.is_some()).map(|(k, _)| k.as_str()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(fast, ["fable-5-2", "mythos-5-2", "opus-4-8", "opus-5", "opus-5-5"]);
     }
 
     #[test]
@@ -469,6 +512,22 @@ mod tests {
     }
 
     #[test]
+    fn batch_requests_pay_half_on_every_token_category() {
+        let usage = ClaudeUsage {
+            input: 1_000_000.0, output: 1_000_000.0, cache_read: 1_000_000.0,
+            cache_w5m: 1_000_000.0, cache_w1h: 1_000_000.0, web_searches: 3.0,
+            ..Default::default()
+        };
+        let standard = cost_of("claude-opus-5-5", &usage);
+        let batch = cost_of("claude-opus-5-5", &ClaudeUsage { service_tier: "batch", ..usage });
+        close(standard.total, 4.0 + 20.0 + 0.2 + 5.0 + 8.0 + 0.03);
+        // $2 / $10 per the official batch table; searches are not discounted.
+        close(batch.total, (4.0 + 20.0 + 0.2 + 5.0 + 8.0) / 2.0 + 0.03);
+        close(batch.input, 2.0);
+        close(batch.output, 10.0);
+    }
+
+    #[test]
     fn unknown_models_stay_unpriced() {
         let c = cost_of("mistral-large", &ClaudeUsage { input: 1e6, ..Default::default() });
         assert!(!c.known);
@@ -484,6 +543,34 @@ mod tests {
         assert_eq!(fable.rates.input, 10.0);
         assert_eq!(fable.rates.output, 50.0);
         assert_eq!(fable.family, "fable");
+    }
+
+    #[test]
+    fn fable_5_2_cuts_tier_rates_and_adds_fast_mode() {
+        assert_eq!(canonical_model("claude-fable-5-2"), "fable-5-2");
+        let fable52 = price_for("claude-fable-5-2", None).unwrap();
+        let mythos52 = price_for("claude-mythos-5-2", None).unwrap();
+        assert_eq!(fable52.rates, mythos52.rates);
+        assert_eq!(fable52.rates, rates(8.0, 10.0, 16.0, 0.2, 40.0));
+        assert_eq!(fable52.fast, Some((16.0, 80.0)));
+        assert_eq!(mythos52.fast, Some((16.0, 80.0)));
+        assert_eq!(fable52.family, "fable");
+        let c = cost_of("claude-fable-5-2", &ClaudeUsage {
+            input: 1_000_000.0, output: 1_000_000.0, cache_read: 1_000_000.0,
+            cache_w5m: 1_000_000.0, cache_w1h: 1_000_000.0,
+            ..Default::default()
+        });
+        close(c.total, 74.2);
+        close(c.cache_savings, 7.8);
+
+        let fast_us = cost_of("claude-fable-5-2", &ClaudeUsage {
+            input: 1_000_000.0, output: 1_000_000.0, cache_read: 1_000_000.0,
+            speed: "fast", inference_geo: "us",
+            ..Default::default()
+        });
+        assert!(fast_us.fast);
+        assert!(fast_us.us_region);
+        close(fast_us.total, (16.0 + 80.0 + 0.4) * 1.1);
     }
 
     #[test]

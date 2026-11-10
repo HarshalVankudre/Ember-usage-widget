@@ -29,7 +29,7 @@ test('old releases archive regardless of recent use and variant suffixes', () =>
     'claude-sonnet-5', 'claude-opus-5', 'claude-haiku-4-5-20251001']) {
     assert.equal(isArchivedModel(model, '2026-09-03'), true, model);
   }
-  for (const model of ['claude-sonnet-5-5', 'claude-opus-5-5', 'claude-haiku-5-5',
+  for (const model of ['claude-fable-5-2', 'claude-sonnet-5-5', 'claude-opus-5-5', 'claude-haiku-5-5',
     'gpt-6-luna', 'gpt-6.1-terra', 'future-model', 'gpt-7']) {
     assert.equal(isArchivedModel(model, '2026-09-03'), false, model);
   }

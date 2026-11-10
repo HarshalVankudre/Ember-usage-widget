@@ -344,6 +344,45 @@ test('Codex session burn follows the active account window and rejects a foreign
   );
 });
 
+test('a verified Ultra account has no five-hour limit, and only real telemetry can say so', () => {
+  const weekly = { utilization: 40, resets_at: '2026-11-14T03:59:59Z' };
+
+  // Unverified (or any other plan): the session window is published.
+  const metered = Q.claudeSessionLimit({
+    ok: true,
+    data: { five_hour: { utilization: 12, resets_at: '2026-11-10T19:59:59Z' }, seven_day: weekly },
+  });
+  assert.deepEqual(metered, {
+    known: true,
+    window: { utilization: 12, resets_at: '2026-11-10T19:59:59Z' },
+  });
+
+  // An idle account still has the limit, just no open window.
+  assert.equal(Q.claudeSessionLimit({
+    ok: true, data: { five_hour: { utilization: 0, resets_at: null }, seven_day: weekly },
+  }).window.utilization, 0);
+
+  // The generic limits array alone is enough.
+  assert.deepEqual(Q.claudeSessionLimit({
+    ok: true,
+    data: { five_hour: null, limits: [{ kind: 'session', percent: 7, resets_at: 'x' }] },
+  }), { known: true, window: { utilization: 7, resets_at: 'x' } });
+
+  // Verified Ultra: weekly limits only.
+  assert.deepEqual(Q.claudeSessionLimit({
+    ok: true,
+    data: { five_hour: null, seven_day: weekly, limits: [{ kind: 'weekly_all', percent: 40 }] },
+  }), { known: true, window: null });
+  assert.deepEqual(Q.claudeSessionLimit({
+    ok: true, data: { limits: [{ kind: 'weekly_all', percent: 40 }] },
+  }), { known: true, window: null });
+
+  // Missing, failed or empty telemetry proves nothing about the limit.
+  for (const unknown of [null, undefined, { ok: false, reason: 'network' }, { ok: true }, { ok: true, data: {} }]) {
+    assert.deepEqual(Q.claudeSessionLimit(unknown), { known: false, window: null });
+  }
+});
+
 test('Codex rolling session history is not forced onto the current five-hour cadence', () => {
   const now = at('2026-07-20', 12, 0);
   const activeReset = now + HOUR;
