@@ -2786,7 +2786,8 @@ function renderRemote() {
   const sources = remoteSnapshot.sources || [];
   wrap.hidden = sources.length === 0;
   const keep = new Set(sources.map((s) => s.name));
-  for (const el of [...wrap.children]) if (!keep.has(el.dataset.name)) el.remove();
+  for (const el of [...wrap.querySelectorAll('.remote-pill')]) if (!keep.has(el.dataset.name)) el.remove();
+  const editBtn = $('btnEditServers');
   const now = Date.now();
   sources.forEach((src, i) => {
     let btn = wrap.querySelector(`[data-name="${CSS.escape(src.name)}"]`);
@@ -2804,7 +2805,7 @@ function renderRemote() {
       btn.append(light, label);
       btn.addEventListener('click', () => toggleRemote(btn.dataset.name));
     }
-    if (wrap.children[i] !== btn) wrap.insertBefore(btn, wrap.children[i] || null);
+    if (wrap.children[i] !== btn) wrap.insertBefore(btn, wrap.children[i] || editBtn);
     const b = EmberRemoteView.badge(src, now, remoteSnapshot.intervalMs);
     btn.dataset.tone = b.tone;
     btn.title = b.title;
@@ -2813,6 +2814,186 @@ function renderRemote() {
     btn.setAttribute('aria-pressed', String(b.included));
   });
   placeRemote();
+  renderServersSummary();
+  if (!$('serversOverlay').hidden) renderServerList();
+}
+
+/* ───────────────────────── servers dialog ───────────────────────── */
+
+let serverSources = [];        // full config rows, from remote_sources
+let serverEditing = undefined; // undefined: form closed; null: adding; name: editing
+let serverConfirming = null;   // name awaiting delete confirmation
+let serversReturnFocus = null;
+
+function renderServersSummary() {
+  const el = $('serversSummary');
+  if (!el) return;
+  const sources = remoteSnapshot.sources || [];
+  if (!sources.length) { el.textContent = 'Add Claude Code usage from a server on the same plan'; return; }
+  const now = Date.now();
+  el.textContent = sources
+    .map((s) => `${s.name} · ${EmberRemoteView.badge(s, now, remoteSnapshot.intervalMs).status}`)
+    .join(', ');
+}
+
+function svgButton(cls, label, title, onClick) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = cls;
+  b.textContent = label;
+  if (title) b.title = title;
+  b.addEventListener('click', onClick);
+  return b;
+}
+
+function renderServerList() {
+  const list = $('serverList');
+  const now = Date.now();
+  const live = new Map((remoteSnapshot.sources || []).map((s) => [s.name, s]));
+  list.replaceChildren();
+  $('serverEmpty').hidden = serverSources.length > 0 || serverEditing === null;
+  for (const src of serverSources) {
+    const key = folderKey(src.name);
+    const row = document.createElement('li');
+    row.className = 'server-row';
+    const snap = live.get(key) || { ...src, name: key, atMs: null, ok: null };
+    const b = EmberRemoteView.badge({ ...snap, host: src.ssh }, now, remoteSnapshot.intervalMs);
+    row.dataset.tone = b.tone;
+    if (serverConfirming === src.name) {
+      const msg = document.createElement('span');
+      msg.className = 'server-confirm';
+      msg.textContent = `Delete ${src.name}? Its synced usage is removed from Ember too.`;
+      const actions = document.createElement('div');
+      actions.className = 'server-actions';
+      actions.append(
+        svgButton('btn-quiet', 'Cancel', '', () => { serverConfirming = null; renderServerList(); }),
+        svgButton('btn-danger', 'Delete', '', () => deleteServer(src.name)),
+      );
+      row.append(msg, actions);
+      list.append(row);
+      continue;
+    }
+    const light = document.createElement('span');
+    light.className = 'remote-light';
+    light.setAttribute('aria-hidden', 'true');
+    const meta = document.createElement('span');
+    meta.className = 'server-meta';
+    const name = document.createElement('strong');
+    name.textContent = src.name;
+    const sub = document.createElement('small');
+    const port = src.port ? `:${src.port}` : '';
+    const state = b.status === 'offline' && snap.error ? `can't connect: ${snap.error}` : b.status;
+    sub.textContent = `${src.ssh}${port} · ${state}${src.included === false ? ' · left out of totals' : ''}`;
+    sub.title = b.title;
+    if (b.tone === 'bad') sub.classList.add('bad');
+    meta.append(name, sub);
+    const actions = document.createElement('div');
+    actions.className = 'server-actions';
+    actions.append(
+      svgButton('btn-quiet', 'Edit', `Edit ${src.name}`, () => openServerForm(src.name)),
+      svgButton('btn-quiet', 'Delete', `Delete ${src.name}`, () => { serverConfirming = src.name; renderServerList(); }),
+    );
+    row.append(light, meta, actions);
+    list.append(row);
+  }
+}
+
+// The backend keys servers by a folder-safe form of the name.
+function folderKey(name) {
+  const cleaned = String(name).trim().replace(/[^A-Za-z0-9._-]/g, '-').replace(/^\.+|\.+$/g, '');
+  return cleaned || 'remote';
+}
+
+async function loadServerSources() {
+  try { serverSources = (await window.api.listRemoteSources()) || []; }
+  catch { serverSources = []; }
+}
+
+async function setServersOpen(open) {
+  const overlay = $('serversOverlay');
+  if (open) {
+    serversReturnFocus = document.activeElement;
+    if (!$('settingsOverlay').hidden) setSettingsOpen(false);
+    await loadServerSources();
+    serverEditing = undefined;
+    serverConfirming = null;
+    $('serverForm').hidden = true;
+    $('btnAddServer').hidden = false;
+    renderServerList();
+    overlay.hidden = false;
+    if (!serverSources.length) openServerForm(null);
+    else requestAnimationFrame(() => $('btnServersClose').focus());
+  } else {
+    overlay.hidden = true;
+    if (serversReturnFocus && typeof serversReturnFocus.focus === 'function') serversReturnFocus.focus();
+    serversReturnFocus = null;
+  }
+}
+
+function openServerForm(name) {
+  serverEditing = name;
+  serverConfirming = null;
+  const src = name == null ? null : serverSources.find((s) => s.name === name);
+  $('serverFormTitle').textContent = src ? `Edit ${src.name}` : 'Add server';
+  $('srvName').value = src ? src.name : '';
+  $('srvSsh').value = src ? src.ssh : '';
+  $('srvPort').value = src && src.port ? String(src.port) : '';
+  $('srvKey').value = src && src.identityFile ? src.identityFile : '';
+  $('srvEnabled').checked = src ? src.enabled !== false : true;
+  for (const id of ['srvName', 'srvSsh', 'srvPort', 'srvKey']) $(id).removeAttribute('aria-invalid');
+  $('srvError').hidden = true;
+  $('serverForm').hidden = false;
+  $('btnAddServer').hidden = true;
+  renderServerList();
+  requestAnimationFrame(() => $(src ? 'srvSsh' : 'srvName').focus());
+}
+
+function closeServerForm() {
+  serverEditing = undefined;
+  $('serverForm').hidden = true;
+  $('btnAddServer').hidden = false;
+  renderServerList();
+}
+
+function showServerError(message, field) {
+  const el = $('srvError');
+  el.textContent = message;
+  el.hidden = false;
+  const id = { name: 'srvName', ssh: 'srvSsh', port: 'srvPort', key: 'srvKey' }[field];
+  if (id) { $(id).setAttribute('aria-invalid', 'true'); $(id).focus(); }
+}
+
+async function submitServerForm(e) {
+  e.preventDefault();
+  for (const id of ['srvName', 'srvSsh', 'srvPort', 'srvKey']) $(id).removeAttribute('aria-invalid');
+  $('srvError').hidden = true;
+  const read = EmberRemoteView.readServerForm({
+    name: $('srvName').value,
+    ssh: $('srvSsh').value,
+    port: $('srvPort').value,
+    key: $('srvKey').value,
+    enabled: $('srvEnabled').checked,
+  });
+  if (read.error) { showServerError(read.error, read.field); return; }
+  $('srvSave').disabled = true;
+  try {
+    const res = await window.api.saveRemoteSource(serverEditing, read.value);
+    if (!res || !res.ok) { showServerError((res && res.error) || 'Could not save the server.'); return; }
+    await loadServerSources();
+    closeServerForm();
+    toast(`Saved ${read.value.name}. Connecting…`);
+  } finally {
+    $('srvSave').disabled = false;
+  }
+}
+
+async function deleteServer(name) {
+  const res = await window.api.deleteRemoteSource(name);
+  serverConfirming = null;
+  await loadServerSources();
+  if (serverEditing === name) closeServerForm();
+  renderServerList();
+  toast(res && res.ok ? `Deleted ${name}` : `Could not delete ${name}: ${(res && res.error) || 'unknown error'}`);
 }
 
 /* The pills sit in the titlebar while every name fits there, and move to a
@@ -3555,6 +3736,13 @@ function setupEvents() {
   };
 
   $('btnSettings').onclick = () => setSettingsOpen(true);
+  $('btnEditServers').onclick = () => setServersOpen(true);
+  $('btnOpenServers').onclick = () => setServersOpen(true);
+  $('btnServersClose').onclick = () => setServersOpen(false);
+  $('serversOverlay').onclick = (e) => { if (e.target === $('serversOverlay')) setServersOpen(false); };
+  $('btnAddServer').onclick = () => openServerForm(null);
+  $('srvCancel').onclick = () => (serverSources.length ? closeServerForm() : setServersOpen(false));
+  $('serverForm').addEventListener('submit', submitServerForm);
   $('btnSettingsClose').onclick = () => setSettingsOpen(false);
   $('settingsOverlay').onclick = (e) => { if (e.target === $('settingsOverlay')) setSettingsOpen(false); };
   $('setAutostart').onchange = (e) => window.api.setAutostart(e.target.checked);
@@ -3617,6 +3805,13 @@ function setupEvents() {
       $('btnExport').focus();
       return;
     }
+    if (e.key === 'Escape' && !$('serversOverlay').hidden) {
+      e.preventDefault();
+      if (serverConfirming) { serverConfirming = null; renderServerList(); }
+      else if (serverEditing !== undefined && serverSources.length) closeServerForm();
+      else setServersOpen(false);
+      return;
+    }
     if (e.key === 'Escape' && state.settings.miniMode && $('settingsOverlay').hidden) {
       e.preventDefault();
       window.api.setMini(false);
@@ -3627,8 +3822,10 @@ function setupEvents() {
       setSettingsOpen(false);
       return;
     }
-    if (e.key !== 'Tab' || $('settingsOverlay').hidden) return;
-    const focusable = [...$('settingsOverlay').querySelectorAll('button, input:not([disabled])')];
+    const openOverlay = ['serversOverlay', 'settingsOverlay'].map($).find((o) => !o.hidden);
+    if (e.key !== 'Tab' || !openOverlay) return;
+    const focusable = [...openOverlay.querySelectorAll('button:not([hidden]):not([disabled]), input:not([disabled])')]
+      .filter((el) => el.offsetParent !== null);
     if (!focusable.length) return;
     const first = focusable[0];
     const last = focusable[focusable.length - 1];
@@ -3687,6 +3884,7 @@ async function init() {
     remoteSnapshot = await window.api.getRemote();
     renderRemote();
     window.api.onRemote((snap) => {
+      if (!snap || !Array.isArray(snap.sources)) return;
       remoteSnapshot = snap;
       renderRemote();
     });

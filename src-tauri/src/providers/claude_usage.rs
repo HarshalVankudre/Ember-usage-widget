@@ -617,8 +617,17 @@ pub fn aggregate() -> Arc<Aggregate> {
     // Files that vanished from disk (deleted project folders, pruned logs) keep
     // their parsed records forever — usage history survives log deletion. They
     // are flagged `gone` so the UI can group their projects separately.
+    let mirror_parent = super::remote_sync::mirror_parent()
+        .map(|p| format!("{}{}", p.to_string_lossy(), std::path::MAIN_SEPARATOR));
     for (file, rec) in &file_cache {
         if live_cache.contains_key(file) {
+            continue;
+        }
+        // A remote mirror's files only vanish when the server is deleted or
+        // renamed in Ember: its usage goes with it (a rename re-reads it
+        // under the new name) instead of lingering as history.
+        if mirror_parent.as_deref().is_some_and(|p| file.starts_with(p)) {
+            cache_dirty = true;
             continue;
         }
         if rec.gone {

@@ -170,29 +170,21 @@ Chat usage still moves the plan bars, because those percentages come from the pr
 
 ## Usage from a server
 
-If you run Claude Code on a server or a second computer signed in to the same plan, Ember can add that usage to the totals on your desktop. The plan bars already cover it, because they come from your account. This adds the tokens and the value.
+If you run Claude Code on a server or a second computer signed in to the same plan, Ember adds that usage to the totals on your desktop, live. The plan bars already cover it, because they come from your account. This adds the tokens and the value.
 
-Ember connects with the `ssh` client that ships with Windows 11. About once a minute it copies the remote machine's Claude Code logs into its data folder, and it prices them exactly like local ones. Only new bytes are sent, so once the first copy is done a quiet sync is just a file listing. You don't install anything on the server. It needs a Linux shell and the usual tools (`find`, `tail`, `awk`).
+Ember connects with the `ssh` client that ships with Windows 11 and keeps one connection open per server. Every two seconds the server checks its Claude Code logs and sends only what is new, and Ember prices it exactly like local usage. Nothing is installed on the server. It needs a Linux shell and the usual tools (`find`, `tail`, `awk`).
 
-1. Make sure `ssh you@your-server` works from PowerShell **without a password prompt** (a key, not a password). Ember runs ssh in batch mode, so it can't answer prompts.
-2. Open `remote-sources.json` in Ember's data folder (`%APPDATA%\com.harshalvankudre.ember-widget`) and add the server:
+1. Make sure `ssh you@your-server` works from PowerShell **without a password prompt** (a key, not a password). Ember can't answer prompts.
+2. Open **Settings → Servers** (or the ✎ next to the server pills) and choose **Add server**. Give it a name and the ssh login (`you@203.0.113.7` or a host alias from `~/.ssh/config`), plus a port or key file if you need them.
+3. Save. Within a few seconds the server's light turns green, and its projects show up as `<name> · <project>` in every total, chart and list.
 
-```json
-{
-  "intervalSeconds": 60,
-  "sources": [
-    { "name": "vps", "ssh": "you@203.0.113.7" }
-  ]
-}
-```
+In the same dialog you can edit a server or delete it. Deleting also removes the usage synced from it. Renaming keeps that usage under the new name.
 
-3. Save the file. No restart is needed: within a minute the server's projects show up as `vps · <project>`, and the totals, charts and session windows include them.
+**The pills.** Each server gets a pill with its name and a light: **green** while the live connection is up, **amber** while connecting or if it has gone quiet, **red** when it can't connect (hover for the reason), and **grey** when its *Connect* switch is off. The pills sit in the titlebar, or in a row under it when the names don't fit.
 
-Each server gets a pill with its name and a light. The pills sit in the titlebar, or in a row just under it when the names don't fit. The light shows the connection: **green** when the last sync worked, **amber** while connecting or if the last success is more than a few minutes old, **red** when it can't connect (hover for the reason), and **grey** when syncing is paused with `"enabled": false`.
+Click a pill to switch that server out of the totals: the pill blurs, and its calls, tokens and value come out of every figure. Click again to count it back in. The connection stays up meanwhile, so nothing is missed.
 
-Click a pill to switch that server out of the totals: the pill blurs, and its calls, tokens and value come out of every figure, chart and list. Click again to count it back in. Syncing carries on while it is switched out, so nothing is missed. The choice is saved as `"included"` in `remote-sources.json`.
-
-`ssh` can also be a host alias from your `~/.ssh/config`. Optional fields: `port`, `identityFile`, `remotePath` (default `.claude/projects` under the remote home), `sshPath` and `enabled`. The outcome of each sync is written to `remote-sources-status.json` and `ember.log` in the same folder. The copies live under `remote\<name>\`, so the server's history stays in Ember even if its logs are later deleted, the same as for local logs.
+Servers are stored in `remote-sources.json` in Ember's data folder (`%APPDATA%\com.harshalvankudre.ember-widget`), next to `remote-sources-status.json` (the last outcome per server) and `ember.log`. Synced logs live under `remote\<name>\`, so a server's history stays even if its own logs are later deleted.
 
 ## Install
 

@@ -1105,6 +1105,39 @@ fn remote_set_included(app: AppHandle, name: String, value: bool) -> Value {
     }
 }
 
+fn remote_changed(app: &AppHandle) {
+    remote_sync::wake();
+    claude_usage::invalidate();
+    request_update(&app.state::<EmberState>(), true);
+    let _ = app.emit("remote:update", remote_sync::snapshot());
+}
+
+#[tauri::command]
+fn remote_sources() -> Value {
+    json!(remote_sync::list_sources())
+}
+
+#[tauri::command]
+fn remote_save_source(app: AppHandle, original: Option<String>, source: remote_sync::SourceInput) -> Value {
+    match remote_sync::save_source(original.as_deref(), &source) {
+        Ok(()) => {
+            remote_changed(&app);
+            json!({ "ok": true })
+        }
+        Err(err) => json!({ "ok": false, "error": err }),
+    }
+}
+
+#[tauri::command]
+fn remote_delete_source(app: AppHandle, name: String) -> Value {
+    let result = remote_sync::delete_source(&name);
+    remote_changed(&app);
+    match result {
+        Ok(()) => json!({ "ok": true }),
+        Err(err) => json!({ "ok": false, "error": err }),
+    }
+}
+
 #[tauri::command]
 fn get_settings(state: tauri::State<'_, EmberState>) -> Value {
     public_settings(&state)
@@ -1283,6 +1316,9 @@ pub fn run() {
             get_settings,
             get_remote,
             remote_set_included,
+            remote_sources,
+            remote_save_source,
+            remote_delete_source,
             get_version,
             win_hide,
             win_close,
@@ -1448,22 +1484,19 @@ pub fn run() {
                     }
                 });
             }
-            // Claude Code usage from other machines on the same plan, pulled
-            // over ssh into local mirrors. remote-sources.json is reread every
-            // round, so adding a server needs no restart.
+            // Claude Code usage from other machines on the same plan, streamed
+            // over one open ssh connection per server into local mirrors. The
+            // server looks for new usage every couple of seconds; a change to
+            // remote-sources.json restarts only the connections it affects.
             {
                 let app = handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    tokio::time::sleep(Duration::from_secs(3)).await;
-                    loop {
-                        let config = remote_sync::load_config();
-                        if remote_sync::sync_all(&config).await {
-                            request_update(&app.state::<EmberState>(), false);
-                        }
-                        let _ = app.emit("remote:update", remote_sync::snapshot());
-                        remote_sync::wait(config.interval()).await;
+                let notify: remote_sync::Notify = std::sync::Arc::new(move |usage_changed| {
+                    if usage_changed {
+                        request_update(&app.state::<EmberState>(), false);
                     }
+                    let _ = app.emit("remote:update", remote_sync::snapshot());
                 });
+                tauri::async_runtime::spawn(remote_sync::supervise(notify));
             }
             // Saving pricing-overrides.json re-prices everything within seconds.
             {

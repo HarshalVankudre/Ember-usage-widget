@@ -524,6 +524,9 @@ input:focus-visible,
   .remote-strip { padding-left: var(--s-3); padding-right: var(--s-3); }
 }
 
+.remote-edit { width: 1.9rem; height: 1.9rem; }
+.remote-edit svg { width: .95rem; height: .95rem; }
+
 .window-actions, .foot-actions { display: flex; align-items: center; gap: 2px; }
 .wbtn, .fbtn {
   display: grid;
@@ -1389,4 +1392,71 @@ body:not([data-ready]) .ledger-cell strong { --skel-w: 5rem; height: 2rem; }
     animation-iteration-count: 1 !important;
     transition-duration: .01ms !important;
   }
+}
+
+/* ═══════════════════ servers dialog ═══════════════════ */
+
+.setting-link { width: 100%; padding: 0; border-bottom: 0; border-left: 0; border-right: 0; background: transparent; color: inherit; font: inherit; text-align: left; }
+.setting-link:hover strong { color: var(--text); }
+.setting-chev { color: var(--faint); font-size: var(--fs-xl); line-height: 1; }
+.servers-intro { margin: 0 0 var(--s-4); color: var(--muted); font-size: var(--fs-sm); line-height: 1.5; }
+.servers-intro code { padding: .05rem .3rem; border-radius: 4px; background: var(--surface); color: var(--text-2); }
+.server-list { display: grid; margin: 0; padding: 0; list-style: none; }
+.server-row { display: flex; align-items: center; gap: var(--s-3); min-height: 3.6rem; border-top: 1px solid var(--line-soft); }
+.server-row:last-child { border-bottom: 1px solid var(--line-soft); }
+.server-row .remote-light { flex: none; }
+.server-row[data-tone="ok"] .remote-light { background: var(--gauge-ok); }
+.server-row[data-tone="warn"] .remote-light { background: var(--gauge-warn); }
+.server-row[data-tone="bad"] .remote-light { background: var(--red); }
+.server-meta { display: grid; flex: 1 1 auto; min-width: 0; gap: .1rem; }
+.server-meta strong { font-size: var(--fs-md); font-weight: var(--fw-semi); }
+.server-meta small { overflow: hidden; color: var(--muted); font-size: var(--fs-sm); text-overflow: ellipsis; white-space: nowrap; }
+.server-meta small.bad { color: var(--red); }
+.server-actions { display: flex; flex: none; gap: var(--s-1); }
+.btn-quiet, .btn-add, .btn-danger {
+  min-height: 2.3rem;
+  padding: 0 var(--s-3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--text-2);
+  font: inherit;
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  cursor: pointer;
+}
+.btn-quiet:hover, .btn-add:hover { border-color: var(--faint); color: var(--text); }
+.btn-danger { border-color: color-mix(in srgb, var(--red) 55%, transparent); color: var(--red); }
+.btn-danger:hover { background: color-mix(in srgb, var(--red) 14%, transparent); }
+.btn-add { width: 100%; margin-top: var(--s-4); border-style: dashed; }
+.btn-add[hidden] { display: none; }
+.server-confirm { flex: 1 1 auto; color: var(--text-2); font-size: var(--fs-sm); }
+.server-empty { margin: 0; padding: var(--s-4) 0; color: var(--muted); font-size: var(--fs-sm); text-align: center; border-top: 1px solid var(--line-soft); }
+.server-form { margin-top: var(--s-4); padding: var(--s-4); border-radius: var(--r-md); background: var(--surface); }
+.server-form[hidden] { display: none; }
+.server-form h3 { margin: 0 0 var(--s-3); font-size: var(--fs-md); font-weight: var(--fw-semi); }
+.server-form .setting-row { min-height: 3.6rem; margin-top: var(--s-3); }
+.field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-3); }
+.field { display: grid; gap: var(--s-1); min-width: 0; }
+.field > span { color: var(--muted); font-size: var(--fs-xs); }
+.field small { color: var(--faint); }
+.field input {
+  width: 100%;
+  height: 2.6rem;
+  min-width: 0;
+  padding: 0 var(--s-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--pop-bg);
+  color: var(--text-2);
+  font: inherit;
+  font-size: var(--fs-md);
+}
+.field input:focus-visible { outline: 2px solid var(--ember); outline-offset: 1px; }
+.field input[aria-invalid="true"] { border-color: var(--red); }
+.form-error { margin: var(--s-2) 0 0; color: var(--red); font-size: var(--fs-sm); }
+.form-error[hidden] { display: none; }
+.form-actions { display: flex; justify-content: flex-end; gap: var(--s-2); margin-top: var(--s-3); }
+@media (max-width: 420px) {
+  .field-grid { grid-template-columns: 1fr; }
 }

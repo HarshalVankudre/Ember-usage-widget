@@ -11,7 +11,10 @@
   if (typeof module === 'object' && module.exports) module.exports = api;
   if (root) root.EmberRemoteView = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this, () => {
-  const MIN_STALE_MS = 5 * 60 * 1000;
+  // The connection is live: a round every couple of seconds. A dead link is
+  // noticed by ssh's keepalive within about 30 seconds, so silence longer
+  // than that, or than a few rounds, means something is stuck.
+  const MIN_STALE_MS = 45 * 1000;
 
   function ago(ms) {
     const secs = Math.max(0, Math.round(ms / 1000));
@@ -52,12 +55,34 @@
         title: `${name}${host}: can't connect (${source.error || 'unknown error'}). Tried ${ago(age)}; retrying automatically.`,
       };
     }
-    const staleAfter = Math.max(3 * (intervalMs || 60000), MIN_STALE_MS);
+    const staleAfter = Math.max(5 * (intervalMs || 2000), MIN_STALE_MS);
     if (age > staleAfter) {
       return { tone: 'warn', status: 'stale', title: `${name}${host}: last synced ${ago(age)}.` };
     }
-    return { tone: 'ok', status: 'connected', title: `${name}${host}: connected, synced ${ago(age)}.` };
+    return { tone: 'ok', status: 'connected', title: `${name}${host}: connected, live (last checked ${ago(age)}).` };
   }
 
-  return { badge, ago };
+  // The Servers form, checked before it goes to the backend. Returns the
+  // payload for remote_save_source, or the first problem and its field.
+  function readServerForm(fields) {
+    const name = String(fields.name || '').trim();
+    const ssh = String(fields.ssh || '').trim();
+    const portText = String(fields.port || '').trim();
+    const identityFile = String(fields.key || '').trim();
+    if (!name) return { error: 'Give the server a name.', field: 'name' };
+    if (!ssh) return { error: 'Enter the ssh login, like user@203.0.113.7.', field: 'ssh' };
+    if (/\s/.test(ssh) || ssh.startsWith('-')) {
+      return { error: 'The ssh login is one word, like user@host or a host alias.', field: 'ssh' };
+    }
+    let port = null;
+    if (portText) {
+      if (!/^\d+$/.test(portText) || +portText < 1 || +portText > 65535) {
+        return { error: 'The port must be a number from 1 to 65535.', field: 'port' };
+      }
+      port = +portText;
+    }
+    return { value: { name, ssh, port, identityFile: identityFile || null, enabled: fields.enabled !== false } };
+  }
+
+  return { badge, ago, readServerForm };
 });

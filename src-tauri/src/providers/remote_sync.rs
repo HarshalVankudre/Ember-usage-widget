@@ -8,14 +8,16 @@
 //! dedup and pricing as local usage, and its history survives the remote
 //! logs being deleted, just like local history does.
 //!
-//! The transfer is incremental. Ember sends the size it already holds for
-//! each file. The remote shell script sends back only the bytes past that
-//! point, or the whole file if it shrank. Transcripts are append-only, so a
-//! quiet sync moves a file listing and nothing else. The only remote
-//! requirements are `sh`, GNU `find`, `tail`, `head`, `wc` and `awk`, which
-//! any Linux server has.
+//! Each server gets one ssh connection that stays open. Ember sends the
+//! size it already holds for each file; the remote shell script then looks
+//! every couple of seconds and sends only the bytes past that point, or the
+//! whole file if it shrank. Transcripts are append-only, so a quiet round
+//! costs a file listing on the server and a few bytes on the wire. A dropped
+//! connection is reopened with backoff. The only remote requirements are
+//! `sh`, GNU `find`, `tail`, `head`, `wc` and `awk`, which any Linux server
+//! has.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -24,13 +26,13 @@ use std::time::Duration;
 
 pub const FILE_NAME: &str = "remote-sources.json";
 pub const STATUS_FILE_NAME: &str = "remote-sources-status.json";
-pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
-const MIN_INTERVAL_SECS: u64 = 15;
-/// A sync that has not finished by then is abandoned and retried next round.
-const SYNC_TIMEOUT: Duration = Duration::from_secs(300);
+/// How often the remote side looks for new usage, over a connection that
+/// stays open. Each look is a file listing, so this can be short.
+pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(2);
+const MIN_INTERVAL_SECS: u64 = 1;
 const END_MARKER: &str = "EMBER-END";
 const FILE_MARKER: &str = "EMBER-FILE";
-const NO_DIR_MARKER: &str = "EMBER-NODIR";
+const TICK_MARKER: &str = "EMBER-TICK";
 
 const TEMPLATE: &str = r#"{
   "_help": "Claude Code usage from other machines on the same plan, such as a server. Each source is reached with your ssh client (key-based login, no password prompt) and its ~/.claude/projects logs are copied here and added to Ember's totals. Projects show as '<name> · <project>'. Ember rereads this file on every sync, so no restart is needed. 'port', 'identityFile', 'remotePath' (relative to the remote home unless it starts with /), 'sshPath' and 'enabled' are optional.",
@@ -39,12 +41,12 @@ const TEMPLATE: &str = r#"{
       { "name": "vps", "ssh": "harshal@203.0.113.7", "port": 22, "identityFile": "~/.ssh/id_ed25519" }
     ]
   },
-  "intervalSeconds": 60,
+  "intervalSeconds": 2,
   "sources": []
 }
 "#;
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Source {
     pub name: String,
@@ -136,6 +138,147 @@ pub fn snapshot() -> serde_json::Value {
         })
         .collect();
     serde_json::json!({ "sources": sources, "intervalMs": config.interval().as_millis() as f64 })
+}
+
+/// What the Servers dialog edits. Anything else a hand-edited entry carries
+/// (`remotePath`, `sshPath`, `included`) is kept as it was.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceInput {
+    pub name: String,
+    pub ssh: String,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub identity_file: Option<String>,
+    #[serde(default = "enabled_default")]
+    pub enabled: bool,
+}
+
+/// Every configured source with all its fields, for the Servers dialog.
+pub fn list_sources() -> Vec<Source> {
+    load_config().sources
+}
+
+fn config_path() -> Result<PathBuf, String> {
+    Ok(USER_DATA.get().ok_or("not initialised")?.join(FILE_NAME))
+}
+
+fn read_config_doc() -> Result<serde_json::Value, String> {
+    let raw = std::fs::read_to_string(config_path()?).unwrap_or_else(|_| TEMPLATE.to_string());
+    serde_json::from_str(&raw).map_err(|e| format!("{FILE_NAME} is not valid JSON: {e}"))
+}
+
+fn write_config_doc(doc: &serde_json::Value) -> Result<(), String> {
+    let mut out = serde_json::to_string_pretty(doc).map_err(|e| e.to_string())?;
+    out.push('\n');
+    crate::persist::write_atomic(&config_path()?, out).map_err(|e| e.to_string())?;
+    load_config();
+    Ok(())
+}
+
+/// Adds a source (`original` is `None`) or edits the one named `original`,
+/// in the config document. Pure, so the rules are testable.
+pub fn upsert_in(doc: &mut serde_json::Value, original: Option<&str>, input: &SourceInput) -> Result<(), String> {
+    let name = input.name.trim();
+    let ssh = input.ssh.trim();
+    if name.is_empty() {
+        return Err("Give the server a name.".into());
+    }
+    if ssh.is_empty() {
+        return Err("Enter the ssh login, like user@203.0.113.7.".into());
+    }
+    if ssh.chars().any(char::is_whitespace) || ssh.starts_with('-') {
+        return Err("The ssh login is one word, like user@host or a host alias.".into());
+    }
+    if input.port == Some(0) {
+        return Err("The port must be between 1 and 65535.".into());
+    }
+    if !doc.is_object() {
+        *doc = serde_json::json!({});
+    }
+    let obj = doc.as_object_mut().unwrap();
+    let sources = obj.entry("sources").or_insert_with(|| serde_json::json!([]));
+    if !sources.is_array() {
+        *sources = serde_json::json!([]);
+    }
+    let list = sources.as_array_mut().unwrap();
+    let key_of = |v: &serde_json::Value| v.get("name").and_then(|n| n.as_str()).map(folder_name);
+    let target = folder_name(name);
+    let index = match original {
+        Some(orig) => {
+            let orig = folder_name(orig);
+            Some(list.iter().position(|v| key_of(v) == Some(orig.clone())).ok_or("That server no longer exists.")?)
+        }
+        None => None,
+    };
+    if list.iter().enumerate().any(|(i, v)| Some(i) != index && key_of(v) == Some(target.clone())) {
+        return Err(format!("There is already a server called {target}."));
+    }
+    let mut entry = index
+        .and_then(|i| list[i].as_object().cloned())
+        .unwrap_or_default();
+    entry.insert("name".into(), name.into());
+    entry.insert("ssh".into(), ssh.into());
+    match input.port {
+        Some(port) => { entry.insert("port".into(), port.into()); }
+        None => { entry.remove("port"); }
+    }
+    match input.identity_file.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(key) => { entry.insert("identityFile".into(), key.into()); }
+        None => { entry.remove("identityFile"); }
+    }
+    entry.insert("enabled".into(), input.enabled.into());
+    match index {
+        Some(i) => list[i] = serde_json::Value::Object(entry),
+        None => list.push(serde_json::Value::Object(entry)),
+    }
+    Ok(())
+}
+
+/// Saves a source from the Servers dialog. A rename moves the mirror, so the
+/// server's usage history carries over under the new name.
+pub fn save_source(original: Option<&str>, input: &SourceInput) -> Result<(), String> {
+    let mut doc = read_config_doc()?;
+    upsert_in(&mut doc, original, input)?;
+    if let (Some(orig), Some(parent)) = (original, mirror_parent()) {
+        let (old, new) = (folder_name(orig), folder_name(&input.name));
+        if old != new {
+            let (from, to) = (parent.join(&old), parent.join(&new));
+            if to.exists() {
+                // Left over from a server deleted outside Ember; the new name wins.
+                std::fs::remove_dir_all(&to).map_err(|e| e.to_string())?;
+            }
+            if from.exists() {
+                std::fs::rename(&from, &to).map_err(|e| format!("could not move the synced usage: {e}"))?;
+            }
+            let mut last = LAST.lock().unwrap();
+            if let Some(rec) = last.remove(&old) {
+                last.insert(new, rec);
+            }
+        }
+    }
+    write_config_doc(&doc)?;
+    wake();
+    Ok(())
+}
+
+/// Removes a source and the usage synced from it.
+pub fn delete_source(name: &str) -> Result<(), String> {
+    let mut doc = read_config_doc()?;
+    let target = folder_name(name);
+    if let Some(list) = doc.get_mut("sources").and_then(|v| v.as_array_mut()) {
+        list.retain(|v| v.get("name").and_then(|n| n.as_str()).map(folder_name) != Some(target.clone()));
+    }
+    write_config_doc(&doc)?;
+    LAST.lock().unwrap().remove(&target);
+    if let Some(parent) = mirror_parent() {
+        let dir = parent.join(&target);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).map_err(|e| format!("could not remove the synced usage: {e}"))?;
+        }
+    }
+    Ok(())
 }
 
 /// Counts one source in the totals, or leaves it out, by rewriting its
@@ -266,8 +409,13 @@ fn shell_quote(value: &str) -> String {
 }
 
 /// The script the remote `sh` runs. `have` is what Ember already holds:
-/// relative path → size in bytes.
-pub fn build_script(remote_path: &str, have: &BTreeMap<String, u64>) -> String {
+/// relative path → size in bytes. With `every` set, the script keeps the
+/// connection open and checks again at that interval, ending each round with
+/// a tick line; without it, it runs one round and ends.
+///
+/// The remote side keeps its own copy of the manifest and moves it forward
+/// as it sends, so later rounds need nothing more from Ember.
+pub fn build_script(remote_path: &str, have: &BTreeMap<String, u64>, every: Option<Duration>) -> String {
     let remote_path = remote_path.trim();
     let dir = if remote_path.starts_with('/') {
         shell_quote(remote_path)
@@ -283,22 +431,38 @@ pub fn build_script(remote_path: &str, have: &BTreeMap<String, u64>) -> String {
         }
         manifest.push_str(&format!("{size}\t{rel}\n"));
     }
+    let (loop_head, loop_tail) = match every {
+        Some(every) => ("while :; do".to_string(), format!("sleep {}\ndone", every.as_secs().max(1))),
+        None => ("for once in 1; do".to_string(), "done".to_string()),
+    };
     format!(
         r#"set -u
-cd {dir} 2>/dev/null || {{ echo {NO_DIR_MARKER}; exit 0; }}
 m=$(mktemp) || exit 1
-trap 'rm -f "$m"' EXIT
+u=$(mktemp) || exit 1
+trap 'rm -f "$m" "$u" "$m.new"' EXIT
 cat > "$m" <<'EMBER_MANIFEST_EOF'
 {manifest}EMBER_MANIFEST_EOF
-find . -type f -name '*.jsonl' -printf '%s\t%P\n' |
-awk -F '\t' -v m="$m" 'FILENAME == m {{ have[$2]=$1; next }}
-  {{ o = 0; if (($2 in have) && have[$2]+0 <= $1+0) o = have[$2]+0;
-     if (o != $1+0) printf "%d\t%d\t%s\n", o, $1, $2 }}' "$m" - |
-while IFS='	' read -r off size rel; do
-  n=$(tail -c +$((off+1)) -- "$rel" 2>/dev/null | head -c $((size-off)) | wc -c | tr -d ' ')
-  printf '{FILE_MARKER}\t%s\t%s\t%s\n' "$off" "$n" "$rel"
-  tail -c +$((off+1)) -- "$rel" 2>/dev/null | head -c "$n"
-done
+{loop_head}
+if cd {dir} 2>/dev/null; then
+  : > "$u"
+  find . -type f -name '*.jsonl' -printf '%s\t%P\n' |
+  awk -F '\t' -v m="$m" 'FILENAME == m {{ have[$2]=$1; next }}
+    {{ o = 0; if (($2 in have) && have[$2]+0 <= $1+0) o = have[$2]+0;
+       if (o != $1+0) printf "%d\t%d\t%s\n", o, $1, $2 }}' "$m" - |
+  while IFS='	' read -r off size rel; do
+    n=$(tail -c +$((off+1)) -- "$rel" 2>/dev/null | head -c $((size-off)) | wc -c | tr -d ' ')
+    printf '{FILE_MARKER}\t%s\t%s\t%s\n' "$off" "$n" "$rel"
+    tail -c +$((off+1)) -- "$rel" 2>/dev/null | head -c "$n"
+    printf '%s\t%s\n' "$((off+n))" "$rel" >> "$u"
+  done
+  if [ -s "$u" ]; then
+    awk -F '\t' '{{ have[$2]=$1 }} END {{ for (k in have) printf "%s\t%s\n", have[k], k }}' "$m" "$u" > "$m.new" && mv "$m.new" "$m"
+  fi
+  echo {TICK_MARKER}
+else
+  echo {TICK_MARKER}	nodir
+fi
+{loop_tail}
 echo {END_MARKER}
 "#
     )
@@ -352,35 +516,42 @@ fn safe_relative(rel: &str) -> Option<PathBuf> {
     (!out.as_os_str().is_empty()).then_some(out)
 }
 
-fn read_line(reader: &mut impl Read) -> std::io::Result<Option<String>> {
+fn read_line(reader: &mut impl std::io::BufRead) -> std::io::Result<Option<String>> {
     let mut buf = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        match reader.read(&mut byte)? {
-            0 => return Ok(if buf.is_empty() { None } else { Some(String::from_utf8_lossy(&buf).into_owned()) }),
-            _ if byte[0] == b'\n' => return Ok(Some(String::from_utf8_lossy(&buf).into_owned())),
-            _ => buf.push(byte[0]),
-        }
+    let n = reader.read_until(b'\n', &mut buf)?;
+    if n == 0 {
+        return Ok(None);
     }
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+    }
+    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
 }
 
-/// Applies the remote script's output to the mirror. Each file frame is
-/// written only once it has arrived whole, so a dropped connection leaves
-/// every file either at its old size or at a complete new one.
-pub fn apply_stream(mirror: &Path, reader: impl Read) -> Result<SyncReport, String> {
+/// Applies the remote script's output to the mirror, calling `on_tick` with
+/// what changed at the end of every round. Each file frame is written only
+/// once it has arrived whole, so a dropped connection leaves every file
+/// either at its old size or at a complete new one. Returns when the script
+/// ends; an error means the stream broke and should be restarted.
+pub fn apply_frames(
+    mirror: &Path,
+    reader: impl Read,
+    mut on_tick: impl FnMut(SyncReport),
+) -> Result<(), String> {
     let mut reader = std::io::BufReader::new(reader);
     let mut report = SyncReport::default();
     loop {
         let Some(line) = read_line(&mut reader).map_err(|e| e.to_string())? else {
-            return Err("connection closed before the transfer finished".into());
+            return Err("connection closed".into());
         };
         let line = line.trim_end_matches('\r');
         if line == END_MARKER {
-            return Ok(report);
+            return Ok(());
         }
-        if line == NO_DIR_MARKER {
-            report.no_remote_dir = true;
-            return Ok(report);
+        if let Some(rest) = line.strip_prefix(TICK_MARKER) {
+            report.no_remote_dir = rest.trim() == "nodir";
+            on_tick(std::mem::take(&mut report));
+            continue;
         }
         let mut parts = line.splitn(4, '\t');
         let (Some(FILE_MARKER), Some(off), Some(len), Some(rel)) =
@@ -391,7 +562,7 @@ pub fn apply_stream(mirror: &Path, reader: impl Read) -> Result<SyncReport, Stri
         };
         let off: u64 = off.parse().map_err(|_| format!("bad offset in frame for {rel}"))?;
         let len: u64 = len.parse().map_err(|_| format!("bad length in frame for {rel}"))?;
-        let mut data = Vec::with_capacity(len as usize);
+        let mut data = Vec::with_capacity(len.min(64 << 20) as usize);
         (&mut reader).take(len).read_to_end(&mut data).map_err(|e| e.to_string())?;
         if (data.len() as u64) < len {
             return Err(format!("transfer of {rel} was cut short"));
@@ -402,16 +573,19 @@ pub fn apply_stream(mirror: &Path, reader: impl Read) -> Result<SyncReport, Stri
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let current = std::fs::metadata(&target).map(|m| m.len()).ok();
-        if off == 0 || current != Some(off) {
-            if off != 0 {
-                // The local copy changed underneath us; take it again in full next round.
-                let _ = std::fs::remove_file(&target);
-                continue;
-            }
+        if off == 0 {
             crate::persist::write_atomic(&target, &data).map_err(|e| e.to_string())?;
-        } else if !data.is_empty() {
-            let mut file = std::fs::OpenOptions::new().append(true).open(&target).map_err(|e| e.to_string())?;
-            file.write_all(&data).map_err(|e| e.to_string())?;
+        } else if current == Some(off) {
+            if !data.is_empty() {
+                let mut file =
+                    std::fs::OpenOptions::new().append(true).open(&target).map_err(|e| e.to_string())?;
+                file.write_all(&data).map_err(|e| e.to_string())?;
+            }
+        } else {
+            // The local copy changed underneath the stream. Drop it and
+            // restart, so the next connection sends it again in full.
+            let _ = std::fs::remove_file(&target);
+            return Err(format!("local copy of {rel} changed; resyncing"));
         }
         if !data.is_empty() || off == 0 {
             report.files_changed += 1;
@@ -420,12 +594,23 @@ pub fn apply_stream(mirror: &Path, reader: impl Read) -> Result<SyncReport, Stri
     }
 }
 
+/// One round: the whole script output, as a single report.
+pub fn apply_stream(mirror: &Path, reader: impl Read) -> Result<SyncReport, String> {
+    let mut total = SyncReport::default();
+    apply_frames(mirror, reader, |r| {
+        total.files_changed += r.files_changed;
+        total.bytes += r.bytes;
+        total.no_remote_dir |= r.no_remote_dir;
+    })?;
+    Ok(total)
+}
+
 pub fn ssh_args(source: &Source) -> Vec<String> {
     let mut args: Vec<String> = [
         "-T",
         "-o", "BatchMode=yes",
         "-o", "ConnectTimeout=15",
-        "-o", "ServerAliveInterval=15",
+        "-o", "ServerAliveInterval=10",
         "-o", "ServerAliveCountMax=3",
         "-o", "StrictHostKeyChecking=accept-new",
     ]
@@ -454,14 +639,27 @@ fn expand_home(value: &str) -> String {
     value.to_string()
 }
 
-/// One sync of one source. Blocking; run it off the async runtime.
-pub fn sync_source(source: &Source) -> Result<SyncReport, String> {
-    let parent = mirror_parent().ok_or("not initialised")?;
-    let mirror = parent.join(folder_name(&source.name));
+fn mirror_of(source: &Source) -> Result<PathBuf, String> {
+    let mirror = mirror_parent().ok_or("not initialised")?.join(folder_name(&source.name));
     std::fs::create_dir_all(&mirror).map_err(|e| e.to_string())?;
-    let have = local_manifest(&mirror);
-    let script = build_script(source.remote_path.as_deref().unwrap_or(".claude/projects"), &have);
+    Ok(mirror)
+}
 
+/// Runs ssh with the script for `source` and feeds its output to
+/// `apply_frames`. `slot` holds the child while it runs, so another thread
+/// can stop it by killing it.
+fn run_ssh(
+    source: &Source,
+    every: Option<Duration>,
+    slot: &std::sync::Mutex<Option<std::process::Child>>,
+    on_tick: impl FnMut(SyncReport),
+) -> Result<(), String> {
+    let mirror = mirror_of(source)?;
+    let script = build_script(
+        source.remote_path.as_deref().unwrap_or(".claude/projects"),
+        &local_manifest(&mirror),
+        every,
+    );
     let program = source.ssh_path.clone().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "ssh".into());
     let mut cmd = std::process::Command::new(program);
     cmd.args(ssh_args(source))
@@ -475,89 +673,163 @@ pub fn sync_source(source: &Source) -> Result<SyncReport, String> {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     let mut child = cmd.spawn().map_err(|e| format!("could not start ssh: {e}"))?;
-
     let mut stdin = child.stdin.take().ok_or("no stdin")?;
+    let stdout = child.stdout.take().ok_or("no stdout")?;
+    let mut stderr = child.stderr.take().ok_or("no stderr")?;
+    *slot.lock().unwrap() = Some(child);
+
     let writer = std::thread::spawn(move || {
         let _ = stdin.write_all(script.as_bytes());
     });
-    let mut stderr = child.stderr.take().ok_or("no stderr")?;
     let err_reader = std::thread::spawn(move || {
         let mut text = String::new();
         let _ = stderr.read_to_string(&mut text);
         text
     });
-    let stdout = child.stdout.take().ok_or("no stdout")?;
-    let result = apply_stream(&mirror, stdout);
+    let result = apply_frames(&mirror, stdout, on_tick);
+    let child = slot.lock().unwrap().take();
+    if let Some(mut child) = child {
+        if result.is_err() {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+    }
     let _ = writer.join();
-    let status = child.wait().map_err(|e| e.to_string())?;
     let stderr_text = err_reader.join().unwrap_or_default();
-    match result {
-        Ok(report) => Ok(report),
-        Err(err) => {
-            let detail = stderr_text.lines().filter(|l| !l.trim().is_empty()).last().unwrap_or("").trim().to_string();
-            if detail.is_empty() {
-                Err(format!("{err} (ssh exit {status})"))
-            } else {
-                Err(format!("{detail} (ssh exit {status})"))
+    result.map_err(|err| {
+        let detail = stderr_text.lines().filter(|l| !l.trim().is_empty()).last().unwrap_or("").trim().to_string();
+        if detail.is_empty() { err } else { detail }
+    })
+}
+
+/// One sync of one source, start to finish. Blocking.
+pub fn sync_source(source: &Source) -> Result<SyncReport, String> {
+    let slot = std::sync::Mutex::new(None);
+    let mut total = SyncReport::default();
+    run_ssh(source, None, &slot, |r| {
+        total.files_changed += r.files_changed;
+        total.bytes += r.bytes;
+        total.no_remote_dir |= r.no_remote_dir;
+    })?;
+    Ok(total)
+}
+
+fn record(name: &str, outcome: Result<(), String>) -> bool {
+    let mut last = LAST.lock().unwrap();
+    let was = last.get(name).map(|r| (r.ok, r.error.clone()));
+    let now = (outcome.is_ok(), outcome.as_ref().err().cloned());
+    last.insert(name.to_string(), LastSync { ok: now.0, at_ms: crate::now_ms(), error: now.1.clone() });
+    let changed = was.as_ref() != Some(&now);
+    if changed {
+        match &now.1 {
+            None => crate::journal::note(format!("remote {name}: connected")),
+            Some(err) => crate::journal::note(format!("remote {name}: {err}")),
+        }
+        let status: serde_json::Map<String, serde_json::Value> = last
+            .iter()
+            .map(|(k, r)| (k.clone(), serde_json::json!({ "ok": r.ok, "atMs": r.at_ms, "error": r.error })))
+            .collect();
+        if let Some(dir) = USER_DATA.get() {
+            if let Ok(body) = serde_json::to_string_pretty(&serde_json::Value::Object(status)) {
+                let _ = crate::persist::write_atomic(&dir.join(STATUS_FILE_NAME), body);
             }
+        }
+    }
+    changed
+}
+
+/// What the app does when a round lands: `usage_changed` when new bytes
+/// arrived, and always so the light's age can move on.
+pub type Notify = std::sync::Arc<dyn Fn(bool) + Send + Sync>;
+
+struct Live {
+    source: Source,
+    every: Duration,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    child: std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>,
+}
+
+impl Live {
+    fn halt(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(child) = self.child.lock().unwrap().as_mut() {
+            let _ = child.kill();
         }
     }
 }
 
-/// Runs one round over every enabled source and records the outcome in
-/// `remote-sources-status.json`. Returns whether any mirror changed.
-pub async fn sync_all(config: &Config) -> bool {
-    let mut changed = false;
-    let mut status = serde_json::Map::new();
-    let mut seen = std::collections::HashSet::new();
-    for source in config.sources.iter().filter(|s| s.enabled && !s.ssh.trim().is_empty()) {
-        let name = folder_name(&source.name);
-        if !seen.insert(name.clone()) {
-            continue;
+/// Keeps one live connection per enabled source, restarting a connection
+/// whose settings changed and reconnecting with backoff after a failure.
+/// Runs for the life of the app.
+pub async fn supervise(notify: Notify) {
+    let mut live: BTreeMap<String, Live> = BTreeMap::new();
+    loop {
+        let config = load_config();
+        let every = config.interval();
+        let mut wanted: BTreeMap<String, Source> = BTreeMap::new();
+        for source in config.sources.iter().filter(|s| s.enabled && !s.ssh.trim().is_empty()) {
+            wanted.entry(folder_name(&source.name)).or_insert_with(|| source.clone());
         }
-        let owned = source.clone();
-        let outcome = tokio::time::timeout(
-            SYNC_TIMEOUT,
-            tokio::task::spawn_blocking(move || sync_source(&owned)),
-        )
-        .await;
-        let outcome = match outcome {
-            Ok(Ok(result)) => result,
-            Ok(Err(join)) => Err(join.to_string()),
-            Err(_) => Err("timed out".into()),
-        };
-        let now = chrono::Local::now().to_rfc3339();
-        LAST.lock().unwrap().insert(
-            name.clone(),
-            LastSync { ok: outcome.is_ok(), at_ms: crate::now_ms(), error: outcome.as_ref().err().cloned() },
-        );
-        let entry = match &outcome {
-            Ok(report) => {
-                if report.files_changed > 0 {
-                    changed = true;
-                    crate::journal::note(format!(
-                        "remote {name}: {} file(s), {} bytes",
-                        report.files_changed, report.bytes
-                    ));
-                }
-                serde_json::json!({
-                    "ok": true, "at": now, "filesChanged": report.files_changed,
-                    "bytes": report.bytes, "noRemoteDir": report.no_remote_dir,
-                })
+        live.retain(|name, conn| {
+            let keep = wanted.get(name) == Some(&conn.source) && conn.every == every;
+            if !keep {
+                conn.halt();
             }
-            Err(err) => {
-                crate::journal::note(format!("remote {name}: sync failed: {err}"));
-                serde_json::json!({ "ok": false, "at": now, "error": err })
+            keep
+        });
+        for (name, source) in wanted {
+            if live.contains_key(&name) {
+                continue;
             }
-        };
-        status.insert(name, entry);
-    }
-    if let Some(dir) = USER_DATA.get() {
-        if let Ok(body) = serde_json::to_string_pretty(&serde_json::Value::Object(status)) {
-            let _ = crate::persist::write_atomic(&dir.join(STATUS_FILE_NAME), body);
+            let conn = Live {
+                source: source.clone(),
+                every,
+                stop: Default::default(),
+                child: Default::default(),
+            };
+            let (stop, child, notify) = (conn.stop.clone(), conn.child.clone(), notify.clone());
+            let thread_name = name.clone();
+            std::thread::spawn(move || keep_connected(&thread_name, &source, every, &stop, &child, &notify));
+            live.insert(name, conn);
         }
+        wait(Duration::from_secs(5)).await;
     }
-    changed
+}
+
+fn keep_connected(
+    name: &str,
+    source: &Source,
+    every: Duration,
+    stop: &std::sync::atomic::AtomicBool,
+    child: &std::sync::Mutex<Option<std::process::Child>>,
+    notify: &Notify,
+) {
+    use std::sync::atomic::Ordering;
+    let mut backoff = Duration::from_secs(2);
+    while !stop.load(Ordering::SeqCst) {
+        let result = run_ssh(source, Some(every), child, |report| {
+            if stop.load(Ordering::SeqCst) {
+                return;
+            }
+            backoff = Duration::from_secs(2);
+            record(name, Ok(()));
+            notify(report.files_changed > 0);
+        });
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        let outcome = match result {
+            Ok(()) => Err("the server closed the connection".to_string()),
+            Err(err) => Err(err),
+        };
+        record(name, outcome);
+        notify(false);
+        let until = std::time::Instant::now() + backoff;
+        while std::time::Instant::now() < until && !stop.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        backoff = (backoff * 2).min(Duration::from_secs(60));
+    }
 }
 
 #[cfg(test)]
@@ -577,7 +849,7 @@ mod tests {
     #[test]
     fn config_parses_with_optional_fields_and_clamps_interval() {
         let config = parse_config(
-            r#"{ "_help": "x", "intervalSeconds": 3,
+            r#"{ "_help": "x", "intervalSeconds": 0,
                  "sources": [ { "name": "vps", "ssh": "me@host", "port": 2222 } ] }"#,
         )
         .unwrap();
@@ -586,6 +858,7 @@ mod tests {
         assert!(config.sources[0].enabled);
         assert_eq!(config.sources[0].port, Some(2222));
         assert!(parse_config(TEMPLATE).unwrap().sources.is_empty());
+        assert_eq!(parse_config("{}").unwrap().interval(), DEFAULT_INTERVAL);
     }
 
     #[test]
@@ -629,6 +902,39 @@ mod tests {
         assert!(set_flag_in(raw, "nope", "included", true).is_err());
     }
 
+    fn input(name: &str, ssh: &str) -> SourceInput {
+        SourceInput { name: name.into(), ssh: ssh.into(), port: None, identity_file: None, enabled: true }
+    }
+
+    #[test]
+    fn the_servers_dialog_adds_edits_and_validates() {
+        let mut doc: serde_json::Value = serde_json::from_str(TEMPLATE).unwrap();
+        upsert_in(&mut doc, None, &input("vps", "me@a")).unwrap();
+        let mut second = input("box", "me@b");
+        second.port = Some(2222);
+        second.identity_file = Some("  C:\\keys\\id  ".into());
+        upsert_in(&mut doc, None, &second).unwrap();
+        assert_eq!(doc["sources"][1]["port"], 2222);
+        assert_eq!(doc["sources"][1]["identityFile"], "C:\\keys\\id");
+        assert_eq!(doc["_help"], parse_config(TEMPLATE).map(|_| doc["_help"].clone()).unwrap());
+
+        // Hand-edited fields survive an edit from the dialog; cleared ones go.
+        doc["sources"][1]["remotePath"] = "logs".into();
+        upsert_in(&mut doc, Some("box"), &input("box-2", "me@c")).unwrap();
+        assert_eq!(doc["sources"][1]["name"], "box-2");
+        assert_eq!(doc["sources"][1]["remotePath"], "logs");
+        assert!(doc["sources"][1].get("port").is_none());
+
+        assert!(upsert_in(&mut doc, None, &input("vps", "me@z")).unwrap_err().contains("already"));
+        assert!(upsert_in(&mut doc, Some("box-2"), &input("vps", "me@z")).is_err());
+        assert!(upsert_in(&mut doc, None, &input(" ", "me@z")).is_err());
+        assert!(upsert_in(&mut doc, None, &input("x", "me @z")).is_err());
+        assert!(upsert_in(&mut doc, None, &input("x", "-oProxyCommand=x")).is_err());
+        assert!(upsert_in(&mut doc, Some("gone"), &input("x", "me@z")).is_err());
+        let config: Config = serde_json::from_value(doc).unwrap();
+        assert_eq!(config.sources.len(), 2);
+    }
+
     #[test]
     fn frames_cannot_escape_the_mirror() {
         assert!(safe_relative("../evil.jsonl").is_none());
@@ -654,7 +960,7 @@ mod tests {
         let remote = temp_dir("src");
         let mirror = temp_dir("dst");
         let run = |mirror: &Path| -> SyncReport {
-            let script = build_script(remote.to_str().unwrap(), &local_manifest(mirror));
+            let script = build_script(remote.to_str().unwrap(), &local_manifest(mirror), None);
             let mut child = std::process::Command::new("sh")
                 .arg("-s")
                 .stdin(std::process::Stdio::piped())
@@ -695,10 +1001,56 @@ mod tests {
             "{}\n"
         );
 
-        let missing = build_script("/definitely/not/here", &BTreeMap::new());
+        let missing = build_script("/definitely/not/here", &BTreeMap::new(), None);
         let out = std::process::Command::new("sh").arg("-c").arg(&missing).output().unwrap();
         assert!(apply_stream(&mirror, &out.stdout[..]).unwrap().no_remote_dir);
 
+        let _ = std::fs::remove_dir_all(&remote);
+        let _ = std::fs::remove_dir_all(&mirror);
+    }
+
+    /// The live mode: one script run keeps sending new bytes, round after
+    /// round, without Ember sending anything more.
+    #[cfg(unix)]
+    #[test]
+    fn the_live_script_streams_appends_as_they_happen() {
+        let remote = temp_dir("live-src");
+        let mirror = temp_dir("live-dst");
+        std::fs::create_dir_all(remote.join("p")).unwrap();
+        std::fs::write(remote.join("p/s.jsonl"), "1\n").unwrap();
+        let script = build_script(remote.to_str().unwrap(), &BTreeMap::new(), Some(Duration::from_secs(1)));
+        let mut child = std::process::Command::new("sh")
+            .arg("-s")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let m = mirror.clone();
+        let reader = std::thread::spawn(move || apply_frames(&m, stdout, |r| { let _ = tx.send(r); }));
+        let wait_for_change = || loop {
+            let r = rx.recv_timeout(Duration::from_secs(10)).expect("a tick");
+            if r.files_changed > 0 {
+                return r;
+            }
+        };
+        assert_eq!(wait_for_change().bytes, 2);
+        for (i, line) in ["2\n", "33\n"].iter().enumerate() {
+            let mut f = std::fs::OpenOptions::new().append(true).open(remote.join("p/s.jsonl")).unwrap();
+            f.write_all(line.as_bytes()).unwrap();
+            drop(f);
+            let r = wait_for_change();
+            assert_eq!((r.files_changed, r.bytes), (1, line.len() as u64), "round {i}");
+        }
+        std::fs::write(remote.join("p/new.jsonl"), "x\n").unwrap();
+        assert_eq!(wait_for_change().files_changed, 1);
+        assert_eq!(std::fs::read_to_string(mirror.join("p/s.jsonl")).unwrap(), "1\n2\n33\n");
+        assert_eq!(std::fs::read_to_string(mirror.join("p/new.jsonl")).unwrap(), "x\n");
+        child.kill().unwrap();
+        let _ = child.wait();
+        assert!(reader.join().unwrap().is_err(), "a killed stream reports a break");
         let _ = std::fs::remove_dir_all(&remote);
         let _ = std::fs::remove_dir_all(&mirror);
     }
@@ -770,5 +1122,73 @@ mod tests {
         let on = sum(&claude_usage::aggregate());
         println!("switched on   : {} calls, ${:.2}", on.0, on.2);
         assert_eq!((on.0, on.1), (mirrored.0, mirrored.1));
+
+        // Renamed in the Servers dialog: same usage, new label, nothing doubled.
+        let rename = SourceInput { name: "box".into(), ssh: "x".into(), port: None, identity_file: None, enabled: true };
+        save_source(Some("vps"), &rename).unwrap();
+        claude_usage::invalidate();
+        let renamed = sum(&claude_usage::aggregate());
+        println!("renamed       : {} calls, ${:.2}, projects {:?}", renamed.0, renamed.2, renamed.3);
+        assert_eq!((renamed.0, renamed.1), (mirrored.0, mirrored.1));
+        assert!(renamed.3.iter().all(|p| p.starts_with("box · ")));
+
+        // Deleted: its usage goes too, instead of lingering as history.
+        delete_source("box").unwrap();
+        claude_usage::invalidate();
+        let deleted = sum(&claude_usage::aggregate());
+        println!("deleted       : {} calls, ${:.2}", deleted.0, deleted.2);
+        assert_eq!(deleted.0, 0);
+        assert!(!data.join("remote/box").exists());
+        assert!(load_config().sources.is_empty());
+    }
+
+    /// Manual: how long a new line takes to arrive over a live ssh stream.
+    /// Same env vars as `e2e_over_ssh`.
+    #[test]
+    #[ignore]
+    fn e2e_live_latency() {
+        let data = PathBuf::from(std::env::var("EMBER_E2E_DATA").expect("EMBER_E2E_DATA"));
+        init(&data);
+        let remote = data.join("live-remote");
+        std::fs::create_dir_all(remote.join("p")).unwrap();
+        std::fs::write(remote.join("p/s.jsonl"), "{}\n").unwrap();
+        let source = Source {
+            name: "live".into(),
+            ssh: std::env::var("EMBER_E2E_SSH").unwrap(),
+            port: None,
+            identity_file: std::env::var("EMBER_E2E_KEY").ok(),
+            remote_path: Some(remote.to_string_lossy().into_owned()),
+            ssh_path: None,
+            enabled: true,
+            included: true,
+        };
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (s2, src) = (slot.clone(), source.clone());
+        let t = std::thread::spawn(move || run_ssh(&src, Some(Duration::from_secs(2)), &s2, |r| { let _ = tx.send(r); }));
+        let first = rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        println!("connected, first round: {first:?}");
+        let mut worst = Duration::ZERO;
+        for i in 0..5 {
+            std::thread::sleep(Duration::from_millis(700 * i + 300));
+            let t0 = std::time::Instant::now();
+            let mut f = std::fs::OpenOptions::new().append(true).open(remote.join("p/s.jsonl")).unwrap();
+            f.write_all(b"{\"n\":1}\n").unwrap();
+            drop(f);
+            loop {
+                let r = rx.recv_timeout(Duration::from_secs(20)).unwrap();
+                if r.files_changed > 0 { break; }
+            }
+            let took = t0.elapsed();
+            worst = worst.max(took);
+            println!("line {i} arrived after {:.2}s", took.as_secs_f64());
+        }
+        assert_eq!(
+            std::fs::read_to_string(data.join("remote/live/p/s.jsonl")).unwrap(),
+            std::fs::read_to_string(remote.join("p/s.jsonl")).unwrap()
+        );
+        println!("worst: {:.2}s", worst.as_secs_f64());
+        if let Some(c) = slot.lock().unwrap().as_mut() { let _ = c.kill(); }
+        let _ = t.join();
     }
 }
