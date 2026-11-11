@@ -24,7 +24,7 @@
     getVersion: () => invoke('get_version'),
     getRemote: () => invoke('get_remote'),
     onRemote: (cb) => listen('remote:update', cb),
-    setRemoteEnabled: (name, v) => invoke('remote_set_enabled', { name: String(name), value: !!v }),
+    setRemoteIncluded: (name, v) => invoke('remote_set_included', { name: String(name), value: !!v }),
     onUsage: (cb) => listen('usage:update', cb),
     onHeartbeat: (cb) => listen('usage:heartbeat', cb),
     onSettings: (cb) => listen('settings:update', cb),

@@ -1090,8 +1090,13 @@ fn get_remote() -> Value {
 }
 
 #[tauri::command]
-fn remote_set_enabled(app: AppHandle, name: String, value: bool) -> Value {
-    let result = remote_sync::set_enabled(&name, value);
+fn remote_set_included(app: AppHandle, name: String, value: bool) -> Value {
+    let result = remote_sync::set_included(&name, value);
+    if result.is_ok() {
+        // Re-total from the cached records at once; nothing is reparsed.
+        claude_usage::invalidate();
+        request_update(&app.state::<EmberState>(), true);
+    }
     let snapshot = remote_sync::snapshot();
     let _ = app.emit("remote:update", snapshot.clone());
     match result {
@@ -1277,7 +1282,7 @@ pub fn run() {
             get_quota,
             get_settings,
             get_remote,
-            remote_set_enabled,
+            remote_set_included,
             get_version,
             win_hide,
             win_close,

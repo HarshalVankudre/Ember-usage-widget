@@ -473,9 +473,10 @@ input:focus-visible,
 .live-dot.stale { background: var(--gauge-warn); }
 .live-dot.beat { animation: dotBeat 640ms var(--ease); }
 
-/* One pill per server in remote-sources.json. The light is the point; the
-   name says which machine. Clicking pauses or resumes that server. */
-.remote-pills { display: flex; flex: 0 1 auto; align-items: center; gap: var(--s-1); margin-left: auto; min-width: 0; overflow: hidden; }
+/* One pill per server in remote-sources.json. The light is the connection;
+   the name says which machine. Clicking switches the server's usage in or
+   out of the totals, and a switched-out pill is blurred. */
+.remote-pills { display: flex; flex: none; align-items: center; gap: var(--s-1); margin-left: auto; }
 .remote-pills[hidden] { display: none; }
 .remote-pills + .title-status { margin-left: var(--s-2); }
 .remote-pill {
@@ -492,10 +493,8 @@ input:focus-visible,
   font-size: var(--fs-sm);
   white-space: nowrap;
   cursor: pointer;
-  flex: 0 1 auto;
-  min-width: 1.6rem;
+  flex: none;
 }
-.remote-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .remote-pill:hover { color: var(--text); border-color: color-mix(in srgb, var(--muted) 60%, transparent); }
 .remote-pill:focus-visible { outline: 2px solid var(--gauge-ok); outline-offset: 2px; }
 .remote-light { width: .55rem; height: .55rem; border-radius: 50%; background: var(--faint); flex: none; }
@@ -505,17 +504,24 @@ input:focus-visible,
 .remote-pill[data-tone="off"] { opacity: .65; }
 .remote-pill[data-tone="off"] .remote-name { text-decoration: line-through; }
 .remote-pill[disabled] { cursor: progress; }
-.titlebar:has(.remote-pills:not([hidden])) .brand { flex: none; }
-/* With servers configured, the subtitle gives its room to their names. */
+.remote-pill { transition: filter var(--med) var(--ease), opacity var(--med) var(--ease); }
+.remote-pill[data-included="false"] { filter: blur(1.2px); opacity: .55; }
+.remote-pill[data-included="false"]:hover,
+.remote-pill[data-included="false"]:focus-visible { filter: blur(.5px); opacity: .8; }
+.titlebar .brand { flex: none; }
+/* With servers configured, the subtitle gives its room to their names. Keyed
+   to the servers existing, not to where the pills sit, so the fit check in
+   app.js measures the same titlebar either way. */
 @media (max-width: 859px) {
-  .titlebar:has(.remote-pills:not([hidden])) .brand-copy small { display: none; }
-  .remote-pills:has(.remote-pill:nth-child(2)) .remote-name { display: none; }
-  .remote-pills:has(.remote-pill:nth-child(2)) .remote-pill { padding: 0 .5rem; }
+  .app:has(#remotePills:not([hidden])) .brand-copy small { display: none; }
 }
-/* Narrow window: the lights alone, names in the tooltip. */
-@media (max-width: 430px) {
-  .remote-name { display: none; }
-  .remote-pill { padding: 0 .5rem; }
+/* When the names don't fit beside the brand, app.js moves the pills to their
+   own row under the titlebar, where they wrap. */
+.remote-strip { flex: none; display: flex; padding: 0 var(--s-5) var(--s-3); }
+.remote-strip[hidden] { display: none; }
+.remote-strip .remote-pills { flex-wrap: wrap; margin-left: 0; }
+@media (max-width: 420px) {
+  .remote-strip { padding-left: var(--s-3); padding-right: var(--s-3); }
 }
 
 .window-actions, .foot-actions { display: flex; align-items: center; gap: 2px; }

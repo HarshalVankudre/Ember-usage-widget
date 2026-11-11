@@ -649,6 +649,17 @@ pub fn aggregate() -> Arc<Aggregate> {
         }
     }
 
+    // A server switched off from its titlebar pill drops out of every total.
+    // Its records stay cached, so switching it back on costs no reparse.
+    let excluded = super::remote_sync::excluded_mirror_roots();
+    if !excluded.is_empty() {
+        file_cache.retain(|file, _| {
+            !excluded.iter().any(|root| {
+                file.starts_with(&format!("{}{}", root.to_string_lossy(), std::path::MAIN_SEPARATOR))
+            })
+        });
+    }
+
     // Global dedup (resumed sessions copy older messages into new files),
     // then bucket by date|hour|minute|model|project|session.
     //

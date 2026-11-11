@@ -2808,10 +2808,43 @@ function renderRemote() {
     const b = EmberRemoteView.badge(src, now, remoteSnapshot.intervalMs);
     btn.dataset.tone = b.tone;
     btn.title = b.title;
-    btn.setAttribute('aria-label', `${src.name}: ${b.status}`);
-    btn.setAttribute('aria-pressed', String(!!src.enabled));
+    btn.dataset.included = String(b.included);
+    btn.setAttribute('aria-label', `${src.name}: ${b.status}, ${b.included ? 'counted in totals' : 'left out of totals'}`);
+    btn.setAttribute('aria-pressed', String(b.included));
   });
+  placeRemote();
 }
+
+/* The pills sit in the titlebar while every name fits there, and move to a
+   row of their own under it when they don't. Names are never cut. */
+function placeRemote() {
+  const wrap = $('remotePills');
+  const strip = $('remoteStrip');
+  const bar = document.querySelector('.titlebar');
+  const status = bar && bar.querySelector('.title-status');
+  if (!wrap || !strip || !bar || !status) return;
+  const toBar = () => {
+    if (wrap.parentElement !== bar) bar.insertBefore(wrap, status);
+    strip.hidden = true;
+  };
+  if (wrap.hidden || !bar.offsetWidth) { toBar(); return; }
+  const px = (v) => parseFloat(v) || 0;
+  const pills = [...wrap.children];
+  const need = pills.reduce((w, p) => w + p.getBoundingClientRect().width, 0)
+    + px(getComputedStyle(wrap).columnGap) * Math.max(0, pills.length - 1);
+  const cs = getComputedStyle(bar);
+  const others = [...bar.children].filter((c) => c !== wrap && getComputedStyle(c).display !== 'none');
+  const used = others.reduce((w, c) => w + c.getBoundingClientRect().width, 0)
+    + px(cs.columnGap) * others.length + px(cs.paddingLeft) + px(cs.paddingRight)
+    + 16; // the pills' own margin, plus a little air
+  if (bar.clientWidth - used >= need) {
+    toBar();
+  } else {
+    if (wrap.parentElement !== strip) strip.appendChild(wrap);
+    strip.hidden = false;
+  }
+}
+window.addEventListener('resize', () => placeRemote(), { passive: true });
 
 async function toggleRemote(name) {
   const src = (remoteSnapshot.sources || []).find((s) => s.name === name);
@@ -2819,7 +2852,7 @@ async function toggleRemote(name) {
   const btn = $('remotePills').querySelector(`[data-name="${CSS.escape(name)}"]`);
   if (btn) btn.disabled = true;
   try {
-    const next = await window.api.setRemoteEnabled(name, !src.enabled);
+    const next = await window.api.setRemoteIncluded(name, src.included === false);
     if (next && Array.isArray(next.sources)) {
       remoteSnapshot = { ...remoteSnapshot, sources: next.sources };
     }

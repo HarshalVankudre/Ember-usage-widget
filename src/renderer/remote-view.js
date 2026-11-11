@@ -1,9 +1,11 @@
 'use strict';
 
-// The titlebar light for each server Ember pulls Claude Code usage from
-// (remote-sources.json). Green: the last sync worked recently. Amber: still
-// connecting, or the last success is old. Red: the last sync failed. Grey:
-// paused from the pill. A paused server's history stays in the totals.
+// The titlebar pill for each server Ember pulls Claude Code usage from
+// (remote-sources.json). The light is the connection: green when the last
+// sync worked recently, amber while connecting or when the last success is
+// old, red when the last sync failed, grey when syncing is paused in the
+// config. Clicking the pill switches the server's usage in or out of every
+// total; switched out, the pill is blurred. Syncing carries on either way.
 (function expose(root, factory) {
   const api = factory();
   if (typeof module === 'object' && module.exports) module.exports = api;
@@ -21,31 +23,40 @@
   }
 
   function badge(source, now, intervalMs) {
+    const b = connection(source, now, intervalMs);
+    const included = source.included !== false;
+    const action = included
+      ? 'Counted in the totals; click to leave it out.'
+      : 'Left out of the totals; click to count it again.';
+    return { ...b, included, title: `${b.title} ${action}` };
+  }
+
+  function connection(source, now, intervalMs) {
     const name = source.name;
     const host = source.host ? ` (${source.host})` : '';
     if (!source.enabled) {
       return {
         tone: 'off',
         status: 'paused',
-        title: `${name}${host}: paused. Click to resume syncing. Usage already synced stays in the totals.`,
+        title: `${name}${host}: syncing paused ("enabled": false in remote-sources.json).`,
       };
     }
     if (source.atMs == null) {
-      return { tone: 'warn', status: 'connecting', title: `${name}${host}: connecting… Click to pause.` };
+      return { tone: 'warn', status: 'connecting', title: `${name}${host}: connecting….` };
     }
     const age = now - source.atMs;
     if (!source.ok) {
       return {
         tone: 'bad',
         status: 'offline',
-        title: `${name}${host}: can't connect (${source.error || 'unknown error'}). Tried ${ago(age)}; retrying automatically. Click to pause.`,
+        title: `${name}${host}: can't connect (${source.error || 'unknown error'}). Tried ${ago(age)}; retrying automatically.`,
       };
     }
     const staleAfter = Math.max(3 * (intervalMs || 60000), MIN_STALE_MS);
     if (age > staleAfter) {
-      return { tone: 'warn', status: 'stale', title: `${name}${host}: last synced ${ago(age)}. Click to pause.` };
+      return { tone: 'warn', status: 'stale', title: `${name}${host}: last synced ${ago(age)}.` };
     }
-    return { tone: 'ok', status: 'connected', title: `${name}${host}: connected, synced ${ago(age)}. Click to pause.` };
+    return { tone: 'ok', status: 'connected', title: `${name}${host}: connected, synced ${ago(age)}.` };
   }
 
   return { badge, ago };

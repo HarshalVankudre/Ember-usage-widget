@@ -59,6 +59,10 @@ pub struct Source {
     pub ssh_path: Option<String>,
     #[serde(default = "enabled_default")]
     pub enabled: bool,
+    /// Counted in Ember's totals. Switched from the titlebar pill; syncing
+    /// carries on either way, so switching back on misses nothing.
+    #[serde(default = "enabled_default")]
+    pub included: bool,
 }
 
 fn enabled_default() -> bool {
@@ -124,6 +128,7 @@ pub fn snapshot() -> serde_json::Value {
                 "name": key,
                 "host": s.ssh.trim(),
                 "enabled": s.enabled,
+                "included": s.included,
                 "ok": rec.map(|r| r.ok),
                 "atMs": rec.map(|r| r.at_ms),
                 "error": rec.and_then(|r| r.error.clone()),
@@ -133,22 +138,19 @@ pub fn snapshot() -> serde_json::Value {
     serde_json::json!({ "sources": sources, "intervalMs": config.interval().as_millis() as f64 })
 }
 
-/// Pauses or resumes one source by rewriting its `enabled` flag. Everything
-/// else in the file, comments included, is kept as written.
-pub fn set_enabled(name: &str, enabled: bool) -> Result<(), String> {
+/// Counts one source in the totals, or leaves it out, by rewriting its
+/// `included` flag. Every other field in the file is kept as written.
+pub fn set_included(name: &str, included: bool) -> Result<(), String> {
     let dir = USER_DATA.get().ok_or("not initialised")?;
     let path = dir.join(FILE_NAME);
     let raw = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let updated = set_enabled_in(&raw, name, enabled)?;
+    let updated = set_flag_in(&raw, name, "included", included)?;
     crate::persist::write_atomic(&path, updated).map_err(|e| e.to_string())?;
-    if !enabled {
-        LAST.lock().unwrap().remove(&folder_name(name));
-    }
-    wake();
+    load_config();
     Ok(())
 }
 
-pub fn set_enabled_in(raw: &str, name: &str, enabled: bool) -> Result<String, String> {
+pub fn set_flag_in(raw: &str, name: &str, flag: &str, value: bool) -> Result<String, String> {
     let mut doc: serde_json::Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
     let sources = doc
         .get_mut("sources")
@@ -159,7 +161,7 @@ pub fn set_enabled_in(raw: &str, name: &str, enabled: bool) -> Result<String, St
     for source in sources.iter_mut() {
         let matches = source.get("name").and_then(|n| n.as_str()).map(folder_name) == Some(target.clone());
         if let (true, Some(obj)) = (matches, source.as_object_mut()) {
-            obj.insert("enabled".into(), serde_json::Value::Bool(enabled));
+            obj.insert(flag.into(), serde_json::Value::Bool(value));
             found = true;
         }
     }
@@ -180,6 +182,7 @@ pub fn init(user_data: &Path) {
         let _ = crate::persist::write_atomic(&path, TEMPLATE);
     }
     let _ = std::fs::create_dir_all(mirror_parent_in(user_data));
+    load_config();
 }
 
 fn mirror_parent_in(user_data: &Path) -> PathBuf {
@@ -207,13 +210,26 @@ pub fn mirror_roots() -> Vec<(String, PathBuf)> {
 
 pub fn load_config() -> Config {
     let Some(dir) = USER_DATA.get() else { return Config::default() };
-    match std::fs::read_to_string(dir.join(FILE_NAME)) {
+    let config = match std::fs::read_to_string(dir.join(FILE_NAME)) {
         Ok(raw) => parse_config(&raw).unwrap_or_else(|err| {
             crate::journal::note(format!("remote: {FILE_NAME} unreadable: {err}"));
             Config::default()
         }),
         Err(_) => Config::default(),
-    }
+    };
+    let excluded: Vec<String> =
+        config.sources.iter().filter(|s| !s.included).map(|s| folder_name(&s.name)).collect();
+    *EXCLUDED.lock().unwrap() = excluded;
+    config
+}
+
+/// Names of the sources switched off, as of the last config read.
+static EXCLUDED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Mirror folders whose usage is left out of the totals.
+pub fn excluded_mirror_roots() -> Vec<PathBuf> {
+    let Some(parent) = mirror_parent() else { return Vec::new() };
+    EXCLUDED.lock().unwrap().iter().map(|name| parent.join(name)).collect()
 }
 
 pub fn parse_config(raw: &str) -> Result<Config, serde_json::Error> {
@@ -582,6 +598,7 @@ mod tests {
             remote_path: None,
             ssh_path: None,
             enabled: true,
+            included: true,
         };
         let args = ssh_args(&source);
         assert!(args.windows(2).any(|w| w == ["-o", "BatchMode=yes"]));
@@ -600,16 +617,16 @@ mod tests {
     }
 
     #[test]
-    fn pausing_a_source_rewrites_only_its_flag() {
+    fn switching_a_source_rewrites_only_its_flag() {
         let raw = r#"{ "_help": "keep me", "sources": [
             { "name": "vps", "ssh": "me@a" }, { "name": "box", "ssh": "me@b", "enabled": false } ] }"#;
-        let out: serde_json::Value = serde_json::from_str(&set_enabled_in(raw, "vps", false).unwrap()).unwrap();
+        let out: serde_json::Value = serde_json::from_str(&set_flag_in(raw, "vps", "enabled", false).unwrap()).unwrap();
         assert_eq!(out["_help"], "keep me");
         assert_eq!(out["sources"][0]["enabled"], false);
         assert_eq!(out["sources"][1]["enabled"], false);
-        let back: serde_json::Value = serde_json::from_str(&set_enabled_in(raw, "box", true).unwrap()).unwrap();
+        let back: serde_json::Value = serde_json::from_str(&set_flag_in(raw, "box", "enabled", true).unwrap()).unwrap();
         assert_eq!(back["sources"][1]["enabled"], true);
-        assert!(set_enabled_in(raw, "nope", true).is_err());
+        assert!(set_flag_in(raw, "nope", "included", true).is_err());
     }
 
     #[test]
@@ -720,6 +737,7 @@ mod tests {
             remote_path: None,
             ssh_path: None,
             enabled: true,
+            included: true,
         };
         let first = sync_source(&source).expect("first sync");
         println!("first sync    : {first:?}");
@@ -735,5 +753,22 @@ mod tests {
         println!("via ssh mirror: {} calls, {:.0} tokens, ${:.2}, projects {:?}", mirrored.0, mirrored.1, mirrored.2, mirrored.3);
         assert!(mirrored.0 > 0);
         assert!(mirrored.3.iter().all(|p| p.starts_with("vps · ")));
+
+        // Switched off from the pill: out of every total, records kept.
+        std::fs::write(
+            data.join(FILE_NAME),
+            r#"{ "sources": [ { "name": "vps", "ssh": "x", "included": false } ] }"#,
+        )
+        .unwrap();
+        load_config();
+        claude_usage::invalidate();
+        let off = sum(&claude_usage::aggregate());
+        println!("switched off  : {} calls, ${:.2}", off.0, off.2);
+        assert_eq!(off.0, 0);
+        set_included("vps", true).unwrap();
+        claude_usage::invalidate();
+        let on = sum(&claude_usage::aggregate());
+        println!("switched on   : {} calls, ${:.2}", on.0, on.2);
+        assert_eq!((on.0, on.1), (mirrored.0, mirrored.1));
     }
 }
