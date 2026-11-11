@@ -1,0 +1,74 @@
+name: Release
+
+# Pushing a tag like v2.3.0 builds Ember on Windows and attaches the
+# installer and the portable exe to the GitHub release of that tag. If the
+# release does not exist yet it is created; if it is a draft, it is
+# published once the files are on it.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and release (e.g. v2.3.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Check the tag matches the app version
+        shell: pwsh
+        run: |
+          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          if ("v$version" -ne $env:TAG) { throw "Tag $env:TAG does not match app version $version" }
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - run: npm ci
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npx tauri build
+
+      - name: Collect the installer and the portable exe
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $setup = Get-ChildItem src-tauri/target/release/bundle/nsis -Filter "*_x64-setup.exe" | Select-Object -First 1
+          if (-not $setup) { throw "installer not found" }
+          Copy-Item $setup.FullName "dist/Ember_$($env:VERSION)_x64-setup.exe"
+          Copy-Item src-tauri/target/release/ember-widget.exe "dist/Ember_$($env:VERSION)_x64-portable.exe"
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - name: Attach to the release
+        shell: pwsh
+        run: |
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $env:TAG --title "Ember $($env:VERSION)" --generate-notes --verify-tag
+          }
+          gh release upload $env:TAG (Get-ChildItem dist/*.exe).FullName --clobber
+          gh release edit $env:TAG --draft=false --latest

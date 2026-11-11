@@ -1,6 +1,6 @@
 [package]
 name = "ember-widget"
-version = "2.2.0"
+version = "2.3.0"
 description = "Ember — desktop widget showing Claude Code + ChatGPT Codex token usage, API-equivalent cost, plan limits, and what a percent of your plan actually buys"
 authors = ["Harshal Vankudre"]
 license = "MIT"
