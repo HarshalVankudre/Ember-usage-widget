@@ -2,8 +2,8 @@ name: Release
 
 # Pushing a tag like v2.3.0 builds Ember on Windows and attaches the
 # installer and the portable exe to the GitHub release of that tag. If the
-# release does not exist yet it is created; if it is a draft, it is
-# published once the files are on it.
+# release does not exist yet it is created; once the files are on it, it
+# is published as the latest full release.
 on:
   push:
     tags: ["v*"]
@@ -71,4 +71,4 @@ jobs:
             gh release create $env:TAG --title "Ember $($env:VERSION)" --generate-notes --verify-tag
           }
           gh release upload $env:TAG (Get-ChildItem dist/*.exe).FullName --clobber
-          gh release edit $env:TAG --draft=false --latest
+          gh release edit $env:TAG --draft=false --prerelease=false --latest
