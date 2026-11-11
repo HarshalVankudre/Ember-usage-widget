@@ -84,6 +84,93 @@ impl Config {
 
 static USER_DATA: OnceLock<PathBuf> = OnceLock::new();
 
+/// The latest outcome per source folder name, for the titlebar indicator.
+#[derive(Clone, Debug)]
+struct LastSync {
+    ok: bool,
+    at_ms: f64,
+    error: Option<String>,
+}
+static LAST: std::sync::Mutex<BTreeMap<String, LastSync>> = std::sync::Mutex::new(BTreeMap::new());
+static WAKE: OnceLock<tokio::sync::Notify> = OnceLock::new();
+
+/// Wakes the sync loop now instead of at the end of its interval.
+pub fn wake() {
+    WAKE.get_or_init(tokio::sync::Notify::new).notify_one();
+}
+
+/// Sleeps one interval, or less if `wake` is called.
+pub async fn wait(interval: Duration) {
+    let notify = WAKE.get_or_init(tokio::sync::Notify::new);
+    let _ = tokio::time::timeout(interval, notify.notified()).await;
+}
+
+/// What the titlebar shows: one row per configured source, in config order.
+/// `atMs` is the last attempt; `ok` says whether it succeeded. A source with
+/// no attempt yet has `atMs: null`.
+pub fn snapshot() -> serde_json::Value {
+    let config = load_config();
+    let last = LAST.lock().unwrap();
+    let mut seen = std::collections::HashSet::new();
+    let sources: Vec<serde_json::Value> = config
+        .sources
+        .iter()
+        .filter(|s| !s.ssh.trim().is_empty())
+        .filter(|s| seen.insert(folder_name(&s.name)))
+        .map(|s| {
+            let key = folder_name(&s.name);
+            let rec = last.get(&key);
+            serde_json::json!({
+                "name": key,
+                "host": s.ssh.trim(),
+                "enabled": s.enabled,
+                "ok": rec.map(|r| r.ok),
+                "atMs": rec.map(|r| r.at_ms),
+                "error": rec.and_then(|r| r.error.clone()),
+            })
+        })
+        .collect();
+    serde_json::json!({ "sources": sources, "intervalMs": config.interval().as_millis() as f64 })
+}
+
+/// Pauses or resumes one source by rewriting its `enabled` flag. Everything
+/// else in the file, comments included, is kept as written.
+pub fn set_enabled(name: &str, enabled: bool) -> Result<(), String> {
+    let dir = USER_DATA.get().ok_or("not initialised")?;
+    let path = dir.join(FILE_NAME);
+    let raw = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let updated = set_enabled_in(&raw, name, enabled)?;
+    crate::persist::write_atomic(&path, updated).map_err(|e| e.to_string())?;
+    if !enabled {
+        LAST.lock().unwrap().remove(&folder_name(name));
+    }
+    wake();
+    Ok(())
+}
+
+pub fn set_enabled_in(raw: &str, name: &str, enabled: bool) -> Result<String, String> {
+    let mut doc: serde_json::Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+    let sources = doc
+        .get_mut("sources")
+        .and_then(|v| v.as_array_mut())
+        .ok_or("no sources in the config")?;
+    let target = folder_name(name);
+    let mut found = false;
+    for source in sources.iter_mut() {
+        let matches = source.get("name").and_then(|n| n.as_str()).map(folder_name) == Some(target.clone());
+        if let (true, Some(obj)) = (matches, source.as_object_mut()) {
+            obj.insert("enabled".into(), serde_json::Value::Bool(enabled));
+            found = true;
+        }
+    }
+    if !found {
+        return Err(format!("no source named {name}"));
+    }
+    let mut out = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+    out.push('\n');
+    Ok(out)
+}
+
 /// Creates the config template and the mirror folder, so the folder watcher
 /// has something to attach to from the first launch.
 pub fn init(user_data: &Path) {
@@ -424,6 +511,10 @@ pub async fn sync_all(config: &Config) -> bool {
             Err(_) => Err("timed out".into()),
         };
         let now = chrono::Local::now().to_rfc3339();
+        LAST.lock().unwrap().insert(
+            name.clone(),
+            LastSync { ok: outcome.is_ok(), at_ms: crate::now_ms(), error: outcome.as_ref().err().cloned() },
+        );
         let entry = match &outcome {
             Ok(report) => {
                 if report.files_changed > 0 {
@@ -506,6 +597,19 @@ mod tests {
         assert_eq!(project_label("vps", "-root-app"), "vps · app");
         assert_eq!(folder_name(" my vps/1 "), "my-vps-1");
         assert_eq!(folder_name(".."), "remote");
+    }
+
+    #[test]
+    fn pausing_a_source_rewrites_only_its_flag() {
+        let raw = r#"{ "_help": "keep me", "sources": [
+            { "name": "vps", "ssh": "me@a" }, { "name": "box", "ssh": "me@b", "enabled": false } ] }"#;
+        let out: serde_json::Value = serde_json::from_str(&set_enabled_in(raw, "vps", false).unwrap()).unwrap();
+        assert_eq!(out["_help"], "keep me");
+        assert_eq!(out["sources"][0]["enabled"], false);
+        assert_eq!(out["sources"][1]["enabled"], false);
+        let back: serde_json::Value = serde_json::from_str(&set_enabled_in(raw, "box", true).unwrap()).unwrap();
+        assert_eq!(back["sources"][1]["enabled"], true);
+        assert!(set_enabled_in(raw, "nope", true).is_err());
     }
 
     #[test]

@@ -188,6 +188,8 @@ Ember connects with the `ssh` client that ships with Windows 11. About once a mi
 
 3. Save the file. No restart is needed: within a minute the server's projects show up as `vps · <project>`, and the totals, charts and session windows include them.
 
+A light for each server sits in the titlebar: **green** when the last sync worked, **amber** while connecting or if the last success is more than a few minutes old, **red** when it can't connect (hover for the reason), and **grey** when paused. Click it to pause or resume that server. A paused server's usage that has already been synced stays in the totals.
+
 `ssh` can also be a host alias from your `~/.ssh/config`. Optional fields: `port`, `identityFile`, `remotePath` (default `.claude/projects` under the remote home), `sshPath` and `enabled`. The outcome of each sync is written to `remote-sources-status.json` and `ember.log` in the same folder. The copies live under `remote\<name>\`, so the server's history stays in Ember even if its logs are later deleted, the same as for local logs.
 
 ## Install

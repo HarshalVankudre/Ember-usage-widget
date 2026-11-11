@@ -1085,6 +1085,22 @@ fn get_quota(app: AppHandle) -> Value {
 }
 
 #[tauri::command]
+fn get_remote() -> Value {
+    remote_sync::snapshot()
+}
+
+#[tauri::command]
+fn remote_set_enabled(app: AppHandle, name: String, value: bool) -> Value {
+    let result = remote_sync::set_enabled(&name, value);
+    let snapshot = remote_sync::snapshot();
+    let _ = app.emit("remote:update", snapshot.clone());
+    match result {
+        Ok(()) => snapshot,
+        Err(err) => json!({ "error": err, "sources": snapshot["sources"] }),
+    }
+}
+
+#[tauri::command]
 fn get_settings(state: tauri::State<'_, EmberState>) -> Value {
     public_settings(&state)
 }
@@ -1260,6 +1276,8 @@ pub fn run() {
             get_limits,
             get_quota,
             get_settings,
+            get_remote,
+            remote_set_enabled,
             get_version,
             win_hide,
             win_close,
@@ -1437,7 +1455,8 @@ pub fn run() {
                         if remote_sync::sync_all(&config).await {
                             request_update(&app.state::<EmberState>(), false);
                         }
-                        tokio::time::sleep(config.interval()).await;
+                        let _ = app.emit("remote:update", remote_sync::snapshot());
+                        remote_sync::wait(config.interval()).await;
                     }
                 });
             }

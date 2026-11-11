@@ -473,6 +473,51 @@ input:focus-visible,
 .live-dot.stale { background: var(--gauge-warn); }
 .live-dot.beat { animation: dotBeat 640ms var(--ease); }
 
+/* One pill per server in remote-sources.json. The light is the point; the
+   name says which machine. Clicking pauses or resumes that server. */
+.remote-pills { display: flex; flex: 0 1 auto; align-items: center; gap: var(--s-1); margin-left: auto; min-width: 0; overflow: hidden; }
+.remote-pills[hidden] { display: none; }
+.remote-pills + .title-status { margin-left: var(--s-2); }
+.remote-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: .4rem;
+  height: 1.6rem;
+  padding: 0 .6rem;
+  border: 1px solid color-mix(in srgb, var(--muted) 30%, transparent);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: var(--fs-sm);
+  white-space: nowrap;
+  cursor: pointer;
+  flex: 0 1 auto;
+  min-width: 1.6rem;
+}
+.remote-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.remote-pill:hover { color: var(--text); border-color: color-mix(in srgb, var(--muted) 60%, transparent); }
+.remote-pill:focus-visible { outline: 2px solid var(--gauge-ok); outline-offset: 2px; }
+.remote-light { width: .55rem; height: .55rem; border-radius: 50%; background: var(--faint); flex: none; }
+.remote-pill[data-tone="ok"] .remote-light { background: var(--gauge-ok); box-shadow: 0 0 .45rem color-mix(in srgb, var(--gauge-ok) 70%, transparent); }
+.remote-pill[data-tone="warn"] .remote-light { background: var(--gauge-warn); }
+.remote-pill[data-tone="bad"] .remote-light { background: var(--red); box-shadow: 0 0 .45rem color-mix(in srgb, var(--red) 60%, transparent); }
+.remote-pill[data-tone="off"] { opacity: .65; }
+.remote-pill[data-tone="off"] .remote-name { text-decoration: line-through; }
+.remote-pill[disabled] { cursor: progress; }
+.titlebar:has(.remote-pills:not([hidden])) .brand { flex: none; }
+/* With servers configured, the subtitle gives its room to their names. */
+@media (max-width: 859px) {
+  .titlebar:has(.remote-pills:not([hidden])) .brand-copy small { display: none; }
+  .remote-pills:has(.remote-pill:nth-child(2)) .remote-name { display: none; }
+  .remote-pills:has(.remote-pill:nth-child(2)) .remote-pill { padding: 0 .5rem; }
+}
+/* Narrow window: the lights alone, names in the tooltip. */
+@media (max-width: 430px) {
+  .remote-name { display: none; }
+  .remote-pill { padding: 0 .5rem; }
+}
+
 .window-actions, .foot-actions { display: flex; align-items: center; gap: 2px; }
 .wbtn, .fbtn {
   display: grid;

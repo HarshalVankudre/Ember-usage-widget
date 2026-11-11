@@ -2777,6 +2777,58 @@ function renderStatus() {
   $('liveDot').classList.toggle('stale', secs > 45);
 }
 
+/* Servers Ember pulls Claude Code usage from. Buttons are kept and updated
+   in place, so the once-a-second refresh never steals hover or focus. */
+let remoteSnapshot = { sources: [], intervalMs: 60000 };
+function renderRemote() {
+  const wrap = $('remotePills');
+  if (!wrap) return;
+  const sources = remoteSnapshot.sources || [];
+  wrap.hidden = sources.length === 0;
+  const keep = new Set(sources.map((s) => s.name));
+  for (const el of [...wrap.children]) if (!keep.has(el.dataset.name)) el.remove();
+  const now = Date.now();
+  sources.forEach((src, i) => {
+    let btn = wrap.querySelector(`[data-name="${CSS.escape(src.name)}"]`);
+    if (!btn) {
+      btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'remote-pill';
+      btn.dataset.name = src.name;
+      const light = document.createElement('span');
+      light.className = 'remote-light';
+      light.setAttribute('aria-hidden', 'true');
+      const label = document.createElement('span');
+      label.className = 'remote-name';
+      label.textContent = src.name;
+      btn.append(light, label);
+      btn.addEventListener('click', () => toggleRemote(btn.dataset.name));
+    }
+    if (wrap.children[i] !== btn) wrap.insertBefore(btn, wrap.children[i] || null);
+    const b = EmberRemoteView.badge(src, now, remoteSnapshot.intervalMs);
+    btn.dataset.tone = b.tone;
+    btn.title = b.title;
+    btn.setAttribute('aria-label', `${src.name}: ${b.status}`);
+    btn.setAttribute('aria-pressed', String(!!src.enabled));
+  });
+}
+
+async function toggleRemote(name) {
+  const src = (remoteSnapshot.sources || []).find((s) => s.name === name);
+  if (!src) return;
+  const btn = $('remotePills').querySelector(`[data-name="${CSS.escape(name)}"]`);
+  if (btn) btn.disabled = true;
+  try {
+    const next = await window.api.setRemoteEnabled(name, !src.enabled);
+    if (next && Array.isArray(next.sources)) {
+      remoteSnapshot = { ...remoteSnapshot, sources: next.sources };
+    }
+  } finally {
+    if (btn) btn.disabled = false;
+    renderRemote();
+  }
+}
+
 // One quiet beat whenever genuinely new usage lands — the difference between
 // a widget that is running and one that merely looks like it is.
 function pulseLiveDot() {
@@ -2788,6 +2840,7 @@ function pulseLiveDot() {
 }
 setInterval(() => {
   renderStatus();
+  renderRemote();
   tickLimitCountdowns();
   tickQuotaClock();
 }, 1000);
@@ -3596,6 +3649,15 @@ async function init() {
   $('settingsVersion').textContent = APP_VERSION ? `v${APP_VERSION}` : '';
   updatePinButton();
   applyMiniMode();
+
+  if (window.api.getRemote) {
+    remoteSnapshot = await window.api.getRemote();
+    renderRemote();
+    window.api.onRemote((snap) => {
+      remoteSnapshot = snap;
+      renderRemote();
+    });
+  }
 
   window.api.onSettings((s) => {
     const modeChanged = s.miniMode !== state.settings.miniMode;
