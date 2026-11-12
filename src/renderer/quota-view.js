@@ -100,12 +100,17 @@
 
   function usageBetween(rows, from, to) {
     const t = newTotals();
-    // `to` is exclusive so back-to-back windows never double-count a call.
-    for (const { ts, b } of rows) {
-      if (ts < from) continue;
-      if (ts >= to) break;
-      addBucket(t, b);
+    // The timeline is sorted, so the first call inside the range is found by
+    // halving rather than by walking the whole history for every window.
+    let lo = 0;
+    let hi = rows.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (rows[mid].ts < from) lo = mid + 1;
+      else hi = mid;
     }
+    // `to` is exclusive so back-to-back windows never double-count a call.
+    for (let i = lo; i < rows.length && rows[i].ts < to; i++) addBucket(t, rows[i].b);
     return t;
   }
 
@@ -149,8 +154,12 @@
         if (current && anchor && current.endsAt > anchor.startedAt) {
           current.endsAt = Math.max(current.startedAt + 1, anchor.startedAt);
         }
+        // A watched window rarely ends on the hour, least of all after a spent
+        // reset, so the call that follows it must not open a block reaching
+        // back across that boundary.
+        const opensAt = Math.max(floorToHour(ts), current && current.endsAt <= ts ? current.endsAt : 0);
         current = {
-          startedAt: anchor ? anchor.startedAt : floorToHour(ts),
+          startedAt: anchor ? anchor.startedAt : opensAt,
           endsAt: anchor ? anchor.endsAt : floorToHour(ts) + windowMs,
           anchorKey,
           measured: !!anchor,
@@ -168,47 +177,91 @@
     return limit > 0 ? blocks.slice(-limit) : blocks;
   }
 
-  /* ---------------- anchored fixed periods (weeks) ---------------- */
+  /* ---------------- quota periods (weeks) ---------------- */
 
-  // Weekly quotas reset at a fixed hour assigned to the account, so periods
-  // are walked back from a known reset rather than inferred from activity.
+  // A weekly quota runs on the provider's clock, not on activity. Where the
+  // ledger watched a period, that period is used exactly as it was metered: a
+  // reset spent mid-week can end one early and start the next on a new
+  // cadence, and a fixed seven-day grid would cut straight through both. The
+  // stretches nobody watched are cut into rule-length periods, counted back
+  // from the watched boundary that follows them.
   function fixedPeriods(buckets, opts = {}) {
     const periodMs = opts.periodMs || WEEK_MS;
     const now = Number.isFinite(opts.now) ? opts.now : Date.now();
     const rows = opts.rows || timeline(buckets, opts.provider);
     if (!rows.length) return [];
-    const anchor = Number.isFinite(opts.anchorMs) && opts.anchorMs > 0
-      ? opts.anchorMs
-      : floorToHour(now) + periodMs;
     const earliest = rows[0].ts;
+    const anchors = (opts.anchors || [])
+      .filter((a) => Number.isFinite(a.startedAt) && a.endsAt > a.startedAt)
+      .sort((a, b) => a.startedAt - b.startedAt);
 
-    // Walk the anchor onto the period that contains "now" — a reset time can
-    // be remembered from an older window, or point at a future reset.
-    let end = anchor;
-    let guard = 0;
-    while (end <= now && guard++ < 520) end += periodMs;
-    while (end - periodMs > now && guard++ < 520) end -= periodMs;
-    const periods = [];
-    const maxPeriods = Math.max(1, opts.limit || 26);
-    while (end > earliest && periods.length < maxPeriods) {
-      const start = end - periodMs;
-      periods.push({
-        startedAt: start,
-        endsAt: end,
-        active: now < end && now >= start,
-        totals: usageBetween(rows, start, end),
-      });
-      end = start;
+    const spans = []; // newest first
+    const walkBack = (from, floor, clip) => {
+      let end = from;
+      for (let guard = 0; end > floor && guard < 520; guard++) {
+        const start = end - periodMs;
+        spans.push({ startedAt: clip ? Math.max(start, floor) : start, endsAt: end, measured: false });
+        end = start;
+      }
+    };
+
+    if (!anchors.length) {
+      // No window was ever watched: walk a remembered reset time (or, failing
+      // that, the top of this hour) onto the period that contains "now".
+      let end = Number.isFinite(opts.anchorMs) && opts.anchorMs > 0
+        ? opts.anchorMs
+        : floorToHour(now) + periodMs;
+      let guard = 0;
+      while (end <= now && guard++ < 520) end += periodMs;
+      while (end - periodMs > now && guard++ < 520) end -= periodMs;
+      walkBack(end, earliest, false);
+    } else {
+      // The newest watched period may have reset with nothing read since; the
+      // same rule then runs forward from it to the present.
+      const tail = [];
+      let start = anchors[anchors.length - 1].endsAt;
+      for (let guard = 0; start <= now && guard < 520; guard++) {
+        tail.push({ startedAt: start, endsAt: start + periodMs, measured: false });
+        start += periodMs;
+      }
+      spans.push(...tail.reverse());
+      let ceiling = Infinity;
+      for (let i = anchors.length - 1; i >= 0; i--) {
+        const a = anchors[i];
+        const endsAt = Math.min(a.endsAt, ceiling);
+        if (endsAt > a.startedAt) spans.push({ startedAt: a.startedAt, endsAt, measured: true });
+        ceiling = Math.min(ceiling, a.startedAt);
+        if (i > 0) walkBack(ceiling, anchors[i - 1].endsAt, true);
+        else walkBack(ceiling, earliest, false);
+      }
     }
-    return periods.reverse().filter((p) => p.totals.msgs > 0 || p.active);
+
+    spans.reverse();
+    const periods = spans.map((span) => ({
+      ...span,
+      active: now >= span.startedAt && now < span.endsAt,
+      totals: newTotals(),
+    }));
+    // Periods and calls are both in time order, so one pass files every call.
+    let at = 0;
+    for (const { ts, b } of rows) {
+      while (at < periods.length && ts >= periods[at].endsAt) at++;
+      if (at >= periods.length) break;
+      if (ts >= periods[at].startedAt) addBucket(periods[at].totals, b);
+    }
+    return periods
+      .filter((p) => p.totals.msgs > 0 || p.active)
+      .slice(-Math.max(1, opts.limit || 26));
   }
 
   /* ---------------- observed quota windows ---------------- */
 
+  // What a window consumed. A reset spent inside it hands quota back and the
+  // ledger counts that too, so the figure passes 100 when one was used.
   function pctConsumed(win) {
     if (!win || win.peakUtil == null) return null;
     const peak = Number(win.peakUtil);
-    return Number.isFinite(peak) ? Math.max(0, Math.min(100, peak)) : null;
+    return Number.isFinite(peak) ? Math.max(0, peak) : null;
   }
 
   // Ember only reads Claude Code and Codex logs. A plan meter also counts the
@@ -225,6 +278,66 @@
     };
   }
 
+  const larger = (a, b) => (a == null ? b : b == null ? a : Math.max(a, b));
+
+  // The ledger files a reading under the window it names, so one provider
+  // window can sit in several entries: it was read, another window was read
+  // for a while, and then it came back. They are one window, known by its
+  // reset time.
+  function mergeByReset(entries) {
+    const merged = [];
+    for (const w of entries) {
+      const twin = w.resetsAt
+        ? merged.find((m) => Math.abs(m.resetsAt - w.resetsAt) <= RESET_TOLERANCE_MS)
+        : null;
+      if (!twin) {
+        merged.push({ ...w });
+        continue;
+      }
+      twin.startedAt = Math.min(twin.startedAt, w.startedAt);
+      twin.endsAt = Math.max(twin.endsAt, w.endsAt);
+      twin.consumed = larger(twin.consumed, w.consumed);
+      // One fully measured sighting makes the whole window measured.
+      twin.measuredFrom = twin.measuredFrom == null || w.measuredFrom == null
+        ? null : Math.min(twin.measuredFrom, w.measuredFrom);
+      if (w.live) twin.reading = w.reading;
+      twin.live = twin.live || w.live;
+      twin.joinedLate = twin.joinedLate && w.joinedLate;
+      twin.refills = Math.max(twin.refills, w.refills);
+      twin.observedFor += w.observedFor;
+    }
+    return merged;
+  }
+
+  // One meter cannot be in two windows at once, so where two still overlap
+  // only one of them is right about those hours. The live window is, then
+  // whichever was watched longest: a window read for days outranks one that
+  // showed up for two minutes, which is what another quota's reading filed
+  // under this meter looks like. With nothing else to go on, the later start
+  // wins, because that is the window the provider moved to. A window that
+  // starts inside a better one is dropped; one that merely runs into it ends
+  // where the better one begins, and if that costs it more than a sliver its
+  // percentage no longer describes the hours it has left.
+  function settleOverlaps(windows) {
+    const order = [...windows].sort((a, b) =>
+      (Number(b.live) - Number(a.live))
+      || (b.observedFor - a.observedFor)
+      || (b.startedAt - a.startedAt));
+    const kept = [];
+    for (const w of order) {
+      let endsAt = w.endsAt;
+      let inside = false;
+      for (const k of kept) {
+        if (w.startedAt >= k.startedAt && w.startedAt < k.endsAt) { inside = true; break; }
+        if (k.startedAt > w.startedAt && k.startedAt < endsAt) endsAt = k.startedAt;
+      }
+      if (inside || endsAt <= w.startedAt) continue;
+      const cut = (endsAt - w.startedAt) < (w.endsAt - w.startedAt) * 0.9;
+      kept.push(endsAt === w.endsAt ? w : { ...w, endsAt, cut });
+    }
+    return kept;
+  }
+
   // Each observed window is measured over the provider's own boundaries, so a
   // window Ember joined midstream still reports the whole window's usage.
   function quotaWindows(buckets, meter, opts = {}) {
@@ -235,39 +348,73 @@
     if (meter.current) source.push({ ...meter.current, live: true });
     for (const w of meter.history || []) source.push({ ...w, live: false });
 
-    const out = [];
+    const entries = [];
     for (const w of source) {
       const startedAt = Number(w.startedAt);
       if (!Number.isFinite(startedAt)) continue;
+      const resetsAt = Number(w.resetsAt) || 0;
       // A live window runs to its reset. A finished one ends where the ledger
-      // says it ended — which is earlier than the reset when the provider
-      // replaced it midstream.
+      // says it ended, which is earlier than the reset when the provider
+      // replaced it midstream, and it cannot still be running.
       const endsAt = w.live
-        ? (Number(w.resetsAt) || now)
-        : (Number(w.endedAt) || Number(w.resetsAt) || now);
-      const totals = usageBetween(rows, startedAt, Math.min(endsAt, now));
-      const percent = pctConsumed(w);
-      out.push({
+        ? (resetsAt || now)
+        : Math.min(Number(w.endedAt) || resetsAt || now, now);
+      const peak = pctConsumed(w);
+      // An earlier build threw away the start of a window whose meter dropped
+      // and kept only what followed, counted up from the reading it fell to.
+      const tail = w.measuredFrom != null && Number.isFinite(Number(w.measuredFrom));
+      const lastUtil = w.lastUtil == null ? NaN : Number(w.lastUtil);
+      entries.push({
         startedAt,
         endsAt,
+        resetsAt,
         live: !!w.live,
         joinedLate: !!w.joinedLate,
-        restarted: !!w.restarted,
-        percent,
-        totals,
-        rate: rateFor(totals, percent),
+        measuredFrom: tail ? Number(w.measuredFrom) : null,
+        consumed: peak != null && tail ? Math.max(0, peak - (Number(w.baseline) || 0)) : peak,
+        reading: !w.live ? null : Number.isFinite(lastUtil) ? lastUtil : peak,
+        refills: Number(w.refills) || 0,
+        observedFor: Number(w.observedFor) || 0,
       });
     }
+
     // Newest first for the list; charts reverse as needed.
-    return out.sort((a, b) => b.startedAt - a.startedAt).slice(0, opts.limit || 60);
+    const windows = settleOverlaps(mergeByReset(entries))
+      .sort((a, b) => b.startedAt - a.startedAt)
+      .slice(0, opts.limit || 60);
+    return windows.map((w) => {
+      const upTo = Math.min(w.endsAt, now);
+      const totals = usageBetween(rows, w.startedAt, upTo);
+      const tail = !w.cut && w.measuredFrom != null;
+      // The tail still gives an honest rate: its own usage over the percent
+      // it consumed.
+      const rated = tail ? usageBetween(rows, w.measuredFrom, upTo) : totals;
+      return {
+        startedAt: w.startedAt,
+        endsAt: w.endsAt,
+        live: w.live,
+        joinedLate: w.joinedLate,
+        // Consumed percent of the whole window; unknown when only its tail
+        // was measured, or when it lost most of its hours to another window.
+        percent: tail || w.cut ? null : w.consumed,
+        // What the meter reads right now. It parts from `percent` once a
+        // reset has been spent.
+        reading: w.reading,
+        refills: w.refills,
+        measuredFrom: tail ? w.measuredFrom : null,
+        totals,
+        rate: w.cut ? null : rateFor(rated, w.consumed),
+      };
+    });
   }
 
-  /* An earlier parser filed model-specific Codex meters (notably Spark) under
-     the account-wide meter id. Reconcile the retained ledger non-destructively
-     against the window the current account snapshot actually publishes. This
-     hides foreign reset schedules, folds duplicate instances of the same real
-     window back together, and leaves the on-disk history available for a
-     future migration. */
+  /* The Codex ledger answers to whichever snapshot was read last, and an
+     earlier parser filed model-specific meters (notably Spark) under the
+     account-wide id. Current account telemetry therefore decides whether the
+     scope exists at all and which window is the live one. Everything else is
+     history, and quotaWindows settles whatever overlaps in it. History is not
+     held to the live window's cadence: a spent reset starts the next window
+     on the spot, and an idle account starts one at its next call. */
   function reconcileCodexMeter(meter, limitWindow, opts = {}) {
     if (!meter || !limitWindow) return null;
     const windowMinutes = Number(limitWindow.windowMinutes);
@@ -277,55 +424,15 @@
     const anchor = typeof limitWindow.resetsAt === 'number'
       ? limitWindow.resetsAt : Date.parse(limitWindow.resetsAt || '');
     if (!Number.isFinite(anchor) || anchor <= 0) return meter;
-    const periodMs = windowMinutes * 60000;
-    const fixedSchedule = windowMinutes > 720;
     const now = Number.isFinite(opts.now) ? opts.now : Date.now();
-    const instances = [];
-    if (meter.current) instances.push(meter.current);
-    instances.push(...(meter.history || []));
-
-    const aligned = new Map();
-    for (const instance of instances) {
-      const reset = Number(instance && instance.resetsAt);
-      if (!Number.isFinite(reset) || reset <= 0) continue;
-      const remainder = Math.abs(reset - anchor) % periodMs;
-      // Weekly periods share one fixed reset cadence. Session windows are
-      // rolling and can restart after idle, so only their active boundary is
-      // matched exactly; valid older sessions need not be congruent with it.
-      if (fixedSchedule && Math.min(remainder, periodMs - remainder) > RESET_TOLERANCE_MS) continue;
-      const key = Math.round(reset / 60000);
-      const previous = aligned.get(key);
-      if (!previous) {
-        aligned.set(key, {
-          ...instance,
-          resetsAt: reset,
-          // A restarted meter began counting mid-period; keep that start.
-          startedAt: instance.restarted && Number(instance.startedAt) > reset - periodMs
-            ? Number(instance.startedAt) : reset - periodMs,
-          peakUtil: Number(instance.peakUtil) || 0,
-        });
-        continue;
-      }
-      previous.peakUtil = Math.max(previous.peakUtil, Number(instance.peakUtil) || 0);
-      previous.firstUtil = Math.min(
-        Number(previous.firstUtil) || previous.peakUtil,
-        Number(instance.firstUtil) || Number(instance.peakUtil) || 0,
-      );
-      previous.joinedLate = !!previous.joinedLate && !!instance.joinedLate;
-      previous.observedFor = Math.max(
-        Number(previous.observedFor) || 0,
-        Number(instance.observedFor) || 0,
-      );
-    }
-
-    const windows = [...aligned.values()].sort((a, b) => b.resetsAt - a.resetsAt);
+    const instances = [meter.current, ...(meter.history || [])].filter(Boolean);
     const current = anchor > now
-      ? windows.find((instance) => Math.abs(instance.resetsAt - anchor) <= RESET_TOLERANCE_MS) || null
+      ? instances.find((i) => Math.abs(Number(i.resetsAt) - anchor) <= RESET_TOLERANCE_MS) || null
       : null;
     return {
       ...meter,
       current,
-      history: windows.filter((instance) => instance !== current),
+      history: instances.filter((instance) => instance !== current),
     };
   }
 
@@ -339,7 +446,7 @@
     const now = Number.isFinite(opts.now) ? opts.now : Date.now();
     const rows = opts.rows || [];
     const pool = (windows || []).filter((w) =>
-      Number.isFinite(w.startedAt) && Number.isFinite(w.percent));
+      Number.isFinite(w.startedAt) && (Number.isFinite(w.percent) || w.measuredFrom != null));
     for (const block of blocks) {
       const span = Math.max(1, block.endsAt - block.startedAt);
       let best = null;
@@ -351,20 +458,25 @@
       // Blocks are already anchored to the windows Ember watched, so a real
       // pair overlaps almost exactly. Anything less is a neighbouring window,
       // and borrowing its percentage would invent a rate that was never real.
-      // The exception is a meter the provider restarted mid-period (a plan
-      // change): it sits wholly inside its block and is the only reading of it.
-      const restartedInside = !!best && best.restarted
-        && best.startedAt >= block.startedAt && best.endsAt <= block.endsAt;
-      if (!best || (bestOverlap < span * 0.9 && !restartedInside)) {
+      if (!best || bestOverlap < span * 0.9) {
         block.percent = null;
         block.observed = false;
         block.rate = null;
         continue;
       }
       block.percent = best.percent;
+      block.reading = Number.isFinite(best.reading) ? best.reading : null;
+      block.refills = best.refills || 0;
+      block.measuredFrom = best.measuredFrom == null ? null : best.measuredFrom;
       block.observed = true;
       block.observedFrom = best.startedAt;
       block.observedTo = best.endsAt;
+      // Only the tail of this window was measured. The block keeps the whole
+      // window's usage; the rate is the tail's own.
+      if (block.measuredFrom != null) {
+        block.rate = best.rate || null;
+        continue;
+      }
       // A block built on this window already has its boundaries — possibly cut
       // short where a newer window took over — so only a rule-built block is
       // re-measured over the provider's interval.
@@ -372,8 +484,6 @@
         && (best.startedAt !== block.startedAt || best.endsAt !== block.endsAt)) {
         block.totals = usageBetween(rows, best.startedAt, Math.min(best.endsAt, now));
       }
-      // The percentage only covers usage since the restart, so the block does too.
-      if (restartedInside) block.startedAt = best.startedAt;
       block.rate = rateFor(block.totals, best.percent);
     }
     return blocks;

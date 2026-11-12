@@ -272,28 +272,130 @@ test('a neighbouring window never lends its percentage to a block it only half c
   assert.equal(block.rate, null);
 });
 
-test('a meter restarted mid-week measures the week from the restart only', () => {
-  const reset = at('2026-10-03', 6, 0);
-  const restart = at('2026-09-30', 21, 34);
+test('a reset spent mid-week leaves the week whole and counts what it handed back', () => {
+  // Seen in the field on 12 Nov 2026: the weekly meter fell to 30% when a
+  // reset was spent, and the published reset time stayed where it was.
+  const reset = at('2026-11-14', 5, 0);
+  const weekStart = reset - 7 * 24 * HOUR;
   const rows = Q.timeline([
-    bucket('2026-09-28', 10, 0, { cost: 30 }),  // before the plan change
-    bucket('2026-09-30', 22, 0, { cost: 2 }),
+    bucket('2026-11-09', 10, 0, { cost: 720 }),  // before the reset was spent
+    bucket('2026-11-12', 17, 0, { cost: 110 }),  // after it
   ], 'claude');
-  const now = at('2026-10-01', 2, 0);
+  const now = at('2026-11-12', 18, 0);
   const meter = {
     provider: 'claude',
-    current: { startedAt: restart, resetsAt: reset, peakUtil: 4, restarted: true },
+    // 72% before the reset, 41 - 30 = 11% since: 83% consumed, meter at 41%.
+    current: { startedAt: weekStart, resetsAt: reset, peakUtil: 83, lastUtil: 41, credited: 42, refills: 1 },
     history: [],
   };
   const windows = Q.quotaWindows(null, meter, { rows, now });
-  const periods = Q.fixedPeriods(null, { rows, periodMs: 7 * 24 * HOUR, anchorMs: reset, now });
+  const periods = Q.fixedPeriods(null, { rows, periodMs: 7 * 24 * HOUR, anchors: windows, now });
   Q.attachObserved(periods, windows, { rows, now });
 
-  const live = periods[periods.length - 1];
-  assert.equal(live.percent, 4);
-  assert.equal(live.startedAt, restart);
-  assert.equal(live.totals.cost, 2, 'usage before the restart is not divided by the new percent');
-  assert.equal(live.rate.costPerPct, 2 / 4);
+  assert.equal(periods.length, 1);
+  const [live] = periods;
+  assert.equal(live.active, true);
+  assert.equal(live.startedAt, weekStart, 'the week still starts where the provider started it');
+  assert.equal(live.totals.cost, 830, 'and still holds everything used in it');
+  assert.equal(live.percent, 83);
+  assert.equal(live.reading, 41, 'the bar shows what the meter reads');
+  assert.equal(live.refills, 1);
+  assert.equal(live.rate.costPerPct, 10, 'one percent buys the same before and after');
+  assert.equal(live.rate.projectedCost, 1000);
+});
+
+test('a window an earlier build restarted is shown whole and rated on what it kept', () => {
+  // The build before this one answered the same drop by discarding the week
+  // so far. The 72% is gone; the stretch after the drop is still measurable.
+  const reset = at('2026-11-14', 5, 0);
+  const weekStart = reset - 7 * 24 * HOUR;
+  const drop = at('2026-11-12', 16, 38);
+  const rows = Q.timeline([
+    bucket('2026-11-09', 10, 0, { cost: 720 }),
+    bucket('2026-11-12', 17, 0, { cost: 40 }),
+  ], 'claude');
+  const now = at('2026-11-12', 18, 0);
+  const meter = {
+    provider: 'claude',
+    current: {
+      startedAt: weekStart, resetsAt: reset, peakUtil: 34, lastUtil: 34,
+      restarted: true, measuredFrom: drop, baseline: 30,
+    },
+    history: [],
+  };
+  const windows = Q.quotaWindows(null, meter, { rows, now });
+  const periods = Q.fixedPeriods(null, { rows, periodMs: 7 * 24 * HOUR, anchors: windows, now });
+  Q.attachObserved(periods, windows, { rows, now });
+
+  const [live] = periods;
+  assert.equal(live.startedAt, weekStart);
+  assert.equal(live.totals.cost, 760, 'the whole week, not only the hours since the drop');
+  assert.equal(live.percent, null, 'what the week consumed in all is no longer known');
+  assert.equal(live.reading, 34);
+  assert.equal(live.measuredFrom, drop);
+  assert.equal(live.rate.costPerPct, 40 / 4, 'usage since the drop over the 4% consumed since');
+});
+
+test('a reset that opens a new week ends the old one there, and both keep their figures', () => {
+  // Codex answers a spent reset with a fresh window: 0% and a reset time a
+  // full week away from that moment, off the cadence of every week before it.
+  const firstStart = at('2026-10-29', 22, 35);
+  const spentAt = at('2026-11-01', 1, 40);
+  const week = 7 * 24 * HOUR;
+  const rows = Q.timeline([
+    bucket('2026-10-26', 12, 0, { provider: 'codex', cost: 5 }),   // before Ember watched
+    bucket('2026-10-30', 12, 0, { provider: 'codex', cost: 400 }),
+    bucket('2026-11-02', 12, 0, { provider: 'codex', cost: 60 }),
+  ], 'codex');
+  const now = at('2026-11-03', 12, 0);
+  const ledger = {
+    provider: 'codex',
+    kind: 'weekly',
+    windowMinutes: 10080,
+    current: { startedAt: spentAt, resetsAt: spentAt + week, peakUtil: 20, lastUtil: 20 },
+    history: [
+      { startedAt: firstStart, resetsAt: firstStart + week, endedAt: spentAt, peakUtil: 100 },
+    ],
+  };
+  const meter = Q.reconcileCodexMeter(ledger, {
+    windowMinutes: 10080,
+    resetsAt: new Date(spentAt + week).toISOString(),
+  }, { now });
+  assert.equal(meter.history.length, 1, 'the week before the reset is history, not a foreign schedule');
+
+  const windows = Q.quotaWindows(null, meter, { rows, now });
+  const periods = Q.fixedPeriods(null, { rows, periodMs: week, anchors: windows, now });
+  Q.attachObserved(periods, windows, { rows, now });
+
+  assert.equal(periods.length, 3);
+  const [unwatched, cutShort, live] = periods;
+  assert.equal(unwatched.endsAt, firstStart, 'unwatched weeks are counted back from the first watched one');
+  assert.equal(unwatched.percent, null);
+  assert.equal(cutShort.startedAt, firstStart);
+  assert.equal(cutShort.endsAt, spentAt, 'the old week ends where the reset was spent');
+  assert.equal(cutShort.percent, 100);
+  assert.equal(cutShort.rate.costPerPct, 4);
+  assert.equal(live.startedAt, spentAt);
+  assert.equal(live.endsAt, spentAt + week);
+  assert.equal(live.active, true);
+  assert.equal(live.percent, 20);
+  assert.equal(live.rate.costPerPct, 3);
+});
+
+test('a session window that ends off the hour is not overlapped by the block after it', () => {
+  // A reset spent at 22:29 puts every following window on :29.
+  const window = { startedAt: at('2026-11-08', 15, 25), endsAt: at('2026-11-08', 20, 25), percent: 12 };
+  const rows = Q.timeline([
+    bucket('2026-11-08', 16, 0),
+    bucket('2026-11-08', 20, 26),
+  ], 'claude');
+  const now = at('2026-11-08', 21, 0);
+  const blocks = Q.sessionBlocks(null, { rows, now, anchors: [window] });
+  Q.attachObserved(blocks, [window], { rows, now });
+
+  assert.equal(blocks.length, 2);
+  assert.equal(blocks[1].startedAt, at('2026-11-08', 20, 25));
+  assert.equal(blocks[1].percent, null, 'and does not borrow the finished window\'s percentage');
 });
 
 test('an exactly matching window supplies both the percentage and the rate', () => {
@@ -309,7 +411,7 @@ test('an exactly matching window supplies both the percentage and the rate', () 
   assert.equal(blocks[0].rate.projectedCost, 20);
 });
 
-test('Codex session burn follows the active account window and rejects a foreign reset schedule', () => {
+test('Codex session burn follows the active account window, not the last reading filed', () => {
   const hour = 3600 * 1000;
   const week = 7 * 24 * hour;
   const now = at('2026-07-20', 12, 0);
@@ -319,14 +421,16 @@ test('Codex session burn follows the active account window and rejects a foreign
     provider: 'codex',
     kind: 'weekly',
     windowMinutes: 10080,
+    // Another quota's reading, filed last, so the ledger calls it current.
     current: {
       startedAt: foreignReset - week,
       resetsAt: foreignReset,
+      endedAt: now,
       peakUtil: 0,
     },
     history: [
-      { startedAt: accountReset - week, resetsAt: accountReset, peakUtil: 68 },
-      { startedAt: accountReset - week, resetsAt: accountReset, peakUtil: 69 },
+      { startedAt: accountReset - week, resetsAt: accountReset, endedAt: now - hour, peakUtil: 68, observedFor: 30 * hour },
+      { startedAt: accountReset - week, resetsAt: accountReset, endedAt: now, peakUtil: 69, observedFor: 20 * hour },
     ],
   };
   const fixed = Q.reconcileCodexMeter(meter, {
@@ -334,14 +438,39 @@ test('Codex session burn follows the active account window and rejects a foreign
     resetsAt: new Date(accountReset).toISOString(),
   }, { now });
 
-  assert.equal(fixed.current.peakUtil, 69);
   assert.equal(fixed.current.resetsAt, accountReset);
-  assert.equal(fixed.history.length, 0, 'duplicate account instances are folded together');
+  const windows = Q.quotaWindows([], fixed, { now });
+  assert.equal(windows.length, 1, 'sightings of one window fold together, and the foreign one has no hours');
+  assert.equal(windows[0].live, true);
+  assert.equal(windows[0].percent, 69);
+  assert.equal(windows[0].endsAt, accountReset);
   assert.equal(
     Q.reconcileCodexMeter(meter, null, { now }),
     null,
     'a retained 5h meter cannot create a scope absent from current account telemetry',
   );
+});
+
+test('a quota read for two minutes cannot break up the week it was read in', () => {
+  const start = at('2026-08-14', 1, 0);
+  const week = 7 * 24 * HOUR;
+  const blip = at('2026-08-19', 22, 8);
+  const meter = {
+    provider: 'codex',
+    current: null,
+    history: [
+      // The real week, read before and after the stray reading.
+      { startedAt: start, resetsAt: start + week, endedAt: blip, peakUtil: 40, observedFor: 100 * HOUR },
+      { startedAt: blip, resetsAt: blip + week, endedAt: blip + week, peakUtil: 0, observedFor: 2 * 60 * 1000 },
+      { startedAt: start, resetsAt: start + week, endedAt: start + week, peakUtil: 76, observedFor: 30 * HOUR },
+    ],
+  };
+  const windows = Q.quotaWindows([], meter, { now: at('2026-09-10', 12, 0) });
+
+  assert.equal(windows.length, 1);
+  assert.equal(windows[0].startedAt, start);
+  assert.equal(windows[0].endsAt, start + week);
+  assert.equal(windows[0].percent, 76);
 });
 
 test('a verified Ultra account has no five-hour limit, and only real telemetry can say so', () => {

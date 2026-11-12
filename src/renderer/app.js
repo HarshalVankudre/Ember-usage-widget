@@ -2169,13 +2169,7 @@ function quotaRowsFor(scope) {
   const windows = scope.meter ? Q.quotaWindows(null, scope.meter, { rows, now, limit: 80 }) : [];
   const blocks = scope.mode === 'session'
     ? Q.sessionBlocks(null, { rows, windowMs: scope.windowMs, now, limit: 48, anchors: windows })
-    : Q.fixedPeriods(null, {
-      rows,
-      periodMs: scope.windowMs,
-      anchorMs: windows.length ? windows[0].endsAt : 0,
-      now,
-      limit: 26,
-    });
+    : Q.fixedPeriods(null, { rows, periodMs: scope.windowMs, anchors: windows, now, limit: 26 });
   Q.attachObserved(blocks, windows, { rows, now });
   quotaCache.key = key;
   quotaCache.rows = blocks;
@@ -2200,6 +2194,18 @@ function quotaRowLabel(row, scope) {
   return scope.mode === 'session'
     ? `${fmtShortDay(row.startedAt)} · ${fmtClock(row.startedAt)}–${fmtClock(row.endsAt)}`
     : `${fmtShortDay(row.startedAt)} – ${fmtShortDay(row.endsAt - 1)}`;
+}
+
+function fmtDayClock(ms) {
+  return `${fmtShortDay(ms)} ${fmtClock(ms)}`;
+}
+
+// What the plan meter reads for a window right now. After a spent reset that
+// is less than the window has consumed, and the bar follows the meter.
+function quotaReading(row) {
+  if (!row) return null;
+  if (Number.isFinite(row.reading)) return row.reading;
+  return Number.isFinite(row.percent) ? row.percent : null;
 }
 
 function fmtRemaining(ms) {
@@ -2285,17 +2291,32 @@ function renderQuotaLive(rows, scope, animate) {
 
   const meter = $('quotaMeter');
   const projection = $('quotaProjection');
-  if (Number.isFinite(live.percent)) {
+  const reading = quotaReading(live);
+  if (reading != null) {
     meter.hidden = false;
-    const pct = Math.max(0, Math.min(100, live.percent));
+    const pct = Math.max(0, Math.min(100, reading));
     const fill = $('quotaMeterFill');
     fill.style.setProperty('--w', `${pct.toFixed(1)}%`);
     fill.className = pct >= 95 ? 'crit' : pct >= 80 ? 'warn' : scope.provider;
     $('quotaMeterPct').textContent = `${Math.round(pct)}%`;
-    meter.title = `${Math.round(pct)}% of the plan ${scope.mode === 'session' ? 'session' : 'weekly'} quota consumed`;
-    projection.textContent = live.rate
-      ? `${fmtCost(live.rate.costPerPct)} and ${fmtTok(live.rate.tokensPerPct)} tokens per 1% · a full window at this rate is worth ${fmtCost(live.rate.projectedCost)}`
-      : 'The provider reports 0% used in this window.';
+    const kind = scope.mode === 'session' ? 'session' : 'weekly';
+    const resets = live.refills === 1 ? 'a reset' : `${live.refills} resets`;
+    // A spent reset hands quota back: the meter drops, the window does not
+    // start over, and what it has consumed keeps counting from where it was.
+    meter.title = live.refills && Number.isFinite(live.percent)
+      ? `The plan ${kind} meter reads ${Math.round(pct)}% after ${resets}; this window has consumed ${Math.round(live.percent)}% in all`
+      : `${Math.round(pct)}% of the plan ${kind} quota consumed`;
+    let text;
+    if (live.rate) {
+      text = `${fmtCost(live.rate.costPerPct)} and ${fmtTok(live.rate.tokensPerPct)} tokens per 1% · a full window at this rate is worth ${fmtCost(live.rate.projectedCost)}`;
+      if (live.measuredFrom) text += ` · measured since ${fmtDayClock(live.measuredFrom)}`;
+      else if (live.refills) text += ` · ${Math.round(live.percent)}% used counting ${resets}`;
+    } else if (live.measuredFrom) {
+      text = `Measuring since ${fmtDayClock(live.measuredFrom)} — less than 1% used since then.`;
+    } else {
+      text = 'The provider reports 0% used in this window.';
+    }
+    projection.textContent = text;
     projection.hidden = false;
   } else {
     meter.hidden = true;
@@ -2480,10 +2501,12 @@ function setupQuotaHover() {
     addRow('Tokens', fmtTok(row.totals.tokens));
     addRow('Calls', row.totals.msgs.toLocaleString());
     if (Number.isFinite(row.percent)) addRow('Quota used', `${Math.round(row.percent)}%`);
+    if (row.refills) addRow('Resets used', String(row.refills));
     if (row.rate) {
       addRow('Per 1%', fmtCost(row.rate.costPerPct));
       addRow('Full window', `≈${fmtCost(row.rate.projectedCost)}`);
     }
+    if (row.measuredFrom) addRow('Measured since', fmtDayClock(row.measuredFrom));
     const top = [...row.totals.models.values()].sort((a, b) => b.cost - a.cost).slice(0, 3);
     for (const m of top) {
       addRow(prettyModel(m.provider, m.model, m.source), metric === 'tokens' ? fmtTok(m.tokens) : fmtCost(m.cost),
@@ -3209,8 +3232,9 @@ function renderMini() {
 
   // Without a meter reading for this window, the strip falls back to the
   // hottest plan bar so it is never blank while a limit is filling up.
-  const measured = !!live && Number.isFinite(live.percent);
-  const pct = measured ? live.percent : state.worstLimit;
+  const reading = quotaReading(live);
+  const measured = reading != null;
+  const pct = measured ? reading : state.worstLimit;
   const fill = $('miniFill');
   const shown = Math.max(0, Math.min(100, pct || 0));
   fill.style.setProperty('--w', `${shown.toFixed(1)}%`);
@@ -3270,7 +3294,7 @@ function buildWindowsCsv() {
     'window_start', 'window_end', 'provider', 'window_kind', 'state', 'quota_measured',
     'tokens', 'input', 'output', 'cache_read', 'cache_write', 'calls',
     'value_usd', 'quota_percent', 'value_per_percent', 'tokens_per_percent',
-    'projected_full_window_usd', 'top_model',
+    'projected_full_window_usd', 'top_model', 'resets_used',
   ]];
   for (const row of [...rows].reverse()) {
     const t = row.totals;
@@ -3286,6 +3310,7 @@ function buildWindowsCsv() {
       row.rate ? Math.round(row.rate.tokensPerPct) : '',
       row.rate ? round(row.rate.projectedCost, 2) : '',
       topModelOf(t),
+      row.observed ? row.refills || 0 : '',
     ]);
   }
   return toCsv(out);
@@ -3384,6 +3409,7 @@ function buildViewJson() {
         live: !!row.active,
         quotaMeasured: !!row.observed,
         quotaPercent: Number.isFinite(row.percent) ? round(row.percent, 2) : null,
+        resetsUsed: row.observed ? row.refills || 0 : null,
         tokens: row.totals.tokens,
         calls: row.totals.msgs,
         valueUsd: round(row.totals.cost, 4),

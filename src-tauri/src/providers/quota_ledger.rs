@@ -24,9 +24,13 @@ const MAX_INSTANCES: usize = 260; // per meter — roughly two months of session
 const MAX_SAMPLES: usize = 90; // per instance, after thinning
 const SAMPLE_MIN_GAP_MS: f64 = 60.0 * 1000.0;
 const RESET_MATCH_TOLERANCE_MS: f64 = 90.0 * 1000.0;
-// A reading this far below the previous one is not noise: the provider
-// restarted the meter (a plan change does this) without moving the reset.
-const RESTART_DROP: f64 = 5.0;
+// A reading this far below the previous one is not noise: quota was handed
+// back inside the window (the account spent a reset) without the reset time
+// moving.
+const REFILL_DROP: f64 = 5.0;
+// A meter that leaps back to where it stood this soon after dropping was not
+// refilled: no account burns that much that fast.
+const REFILL_BOUNCE_MS: f64 = 10.0 * 60.0 * 1000.0;
 
 // Anthropic publishes these window lengths; the meters themselves do not carry
 // them. Codex reports its own window length in the rollout snapshot.
@@ -41,13 +45,25 @@ pub struct Instance {
     pub first_seen_at: f64,
     pub last_seen_at: f64,
     pub first_util: f64,
+    /// Everything the window consumed: the highest reading plus whatever was
+    /// handed back along the way, so it passes 100 when a reset was spent.
     pub peak_util: f64,
     pub last_util: f64,
     pub joined_late: bool,
     pub samples: Vec<(f64, f64)>,
     pub closed: bool,
     pub ended_at: Option<f64>,
-    /// The provider zeroed the meter mid-window; `started_at` is that moment.
+    /// Percent of quota handed back inside this window by resets.
+    pub credited: f64,
+    /// How many times that happened.
+    pub refills: u32,
+    /// The latest refill, kept only while it can still turn out to be a
+    /// stray reading: when it was seen, what the meter read before it, and
+    /// what had been credited until then. Not stored.
+    pub refill: Option<(f64, f64, f64)>,
+    /// Written by earlier builds, which answered a meter drop by discarding
+    /// the window so far: `started_at` is the drop and `first_util` the
+    /// reading it fell to. Only what came after is measurable.
     pub restarted: bool,
 }
 
@@ -118,6 +134,9 @@ fn instance_from_value(v: &Value) -> Option<Instance> {
         samples,
         closed: v.get("closed").and_then(|b| b.as_bool()).unwrap_or(false),
         ended_at: get_f64(v, "endedAt"),
+        credited: get_f64(v, "credited").unwrap_or(0.0),
+        refills: v.get("refills").and_then(|n| n.as_u64()).unwrap_or(0) as u32,
+        refill: None,
         restarted: v.get("restarted").and_then(|b| b.as_bool()).unwrap_or(false),
     })
 }
@@ -136,6 +155,8 @@ fn instance_to_value(i: &Instance) -> Value {
         "joinedLate": i.joined_late,
         "samples": samples,
         "closed": i.closed,
+        "credited": i.credited,
+        "refills": i.refills,
         "restarted": i.restarted,
     });
     if let Some(ended_at) = i.ended_at {
@@ -168,22 +189,28 @@ fn normalize_stored_meter(v: &Value) -> Option<Meter> {
     if instances.len() > MAX_INSTANCES {
         instances.drain(0..instances.len() - MAX_INSTANCES);
     }
-    // Earlier builds kept a restarted meter's pre-restart peak; the samples
-    // still show the drop, so the window is rebased where it happened.
+    // The earliest builds stored a refilled window with only its highest
+    // reading. The samples still show each drop, so what was handed back is
+    // counted from them.
     for instance in &mut instances {
-        let drop = (1..instance.samples.len())
-            .rev()
-            .find(|&j| instance.samples[j].1 + RESTART_DROP < instance.samples[j - 1].1);
-        if let Some(j) = drop {
-            let (ts, util) = instance.samples[j];
-            let tail = instance.samples.split_off(j);
-            instance.peak_util = tail.iter().map(|s| s.1).fold(util, f64::max);
-            instance.samples = tail;
-            instance.started_at = ts;
-            instance.first_seen_at = ts;
-            instance.first_util = util;
-            instance.joined_late = false;
-            instance.restarted = true;
+        if instance.refills > 0 || instance.restarted || instance.samples.is_empty() {
+            continue;
+        }
+        let mut credited = 0.0;
+        let mut refills = 0;
+        let mut consumed = instance.samples[0].1;
+        for pair in instance.samples.windows(2) {
+            let (before, after) = (pair[0].1, pair[1].1);
+            if after + REFILL_DROP < before {
+                credited = consumed - after;
+                refills += 1;
+            }
+            consumed = consumed.max(after + credited);
+        }
+        if refills > 0 {
+            instance.credited = credited;
+            instance.refills = refills;
+            instance.peak_util = instance.peak_util.max(consumed);
         }
     }
     // Earlier builds let a superseded window run on to its published reset,
@@ -478,21 +505,11 @@ fn start_instance(meter: &Meter, resets_at: f64, utilization: f64, now: f64) -> 
         samples: vec![(now, utilization)],
         closed: false,
         ended_at: None,
+        credited: 0.0,
+        refills: 0,
+        refill: None,
         restarted: false,
     }
-}
-
-/// The provider zeroed the meter but kept the reset time, so the percentage
-/// now covers only the time since this reading. Everything the window held
-/// before belongs to an allowance that no longer applies.
-fn restart_instance(instance: &mut Instance, utilization: f64, now: f64) {
-    instance.started_at = now;
-    instance.first_seen_at = now;
-    instance.first_util = utilization;
-    instance.peak_util = utilization;
-    instance.joined_late = false;
-    instance.samples = vec![(now, utilization)];
-    instance.restarted = true;
 }
 
 /// Close a window that a newer one has replaced. It ends at its published
@@ -527,16 +544,35 @@ fn observe(meter: &mut Meter, reading: &Reading, now: f64) -> bool {
     if let Some(current) = meter.instances.last_mut() {
         if !current.closed && is_same_instance(current, resets_at, utilization) {
             let changed = utilization != current.last_util;
-            if utilization + RESTART_DROP < current.last_util {
-                restart_instance(current, utilization, now);
-                current.last_seen_at = now;
-                current.last_util = utilization;
-                return true;
+            // The meter fell while the reset time held: the account spent a
+            // reset. The window is the same window and its usage still counts,
+            // so what was handed back is added to every later reading. That
+            // keeps the consumed total climbing from where it stood, and one
+            // percent means the same before and after.
+            //
+            // A reading that leaps straight back to where the meter stood is
+            // not consumption. The drop was another quota's number filed here
+            // for a moment, and the refill it was taken for is withdrawn.
+            let bounced = current.refill.is_some_and(|(at, before, _)| {
+                now - at <= REFILL_BOUNCE_MS
+                    && utilization > current.last_util + REFILL_DROP
+                    && utilization + REFILL_DROP >= before
+            });
+            if bounced {
+                if let Some((_, _, credited)) = current.refill.take() {
+                    current.credited = credited;
+                    current.refills = current.refills.saturating_sub(1);
+                }
+            } else if utilization + REFILL_DROP < current.last_util {
+                current.refill = Some((now, current.last_util, current.credited));
+                current.credited = current.peak_util - utilization;
+                current.refills += 1;
             }
             current.last_seen_at = now;
             current.last_util = utilization;
-            if utilization > current.peak_util {
-                current.peak_util = utilization;
+            let consumed = utilization + current.credited;
+            if consumed > current.peak_util {
+                current.peak_util = consumed;
             }
             push_sample(current, now, utilization);
             return changed;
@@ -655,33 +691,16 @@ impl Ledger {
             let history: Vec<Value> = history_slice
                 .iter()
                 .map(|i| {
-                    json!({
-                        "resetsAt": i.resets_at,
-                        "startedAt": i.started_at,
-                        "endedAt": i.ended_at.unwrap_or(if i.resets_at != 0.0 { i.resets_at } else { i.last_seen_at }),
-                        "windowMinutes": if i.window_minutes != 0.0 { i.window_minutes } else { meter.window_minutes },
-                        "peakUtil": i.peak_util,
-                        "firstUtil": i.first_util,
-                        "joinedLate": i.joined_late,
-                        "restarted": i.restarted,
-                        "observedFor": (i.last_seen_at - i.first_seen_at).max(0.0),
-                    })
+                    let ended_at = i.ended_at.unwrap_or(if i.resets_at != 0.0 { i.resets_at } else { i.last_seen_at });
+                    window_view(i, meter.window_minutes, ended_at)
                 })
                 .rev()
                 .collect();
             let current = if live_now {
                 let samples: Vec<Value> = last.samples.iter().map(|(ts, util)| json!([ts, util])).collect();
-                json!({
-                    "resetsAt": last.resets_at,
-                    "startedAt": last.started_at,
-                    "endedAt": now,
-                    "windowMinutes": if last.window_minutes != 0.0 { last.window_minutes } else { meter.window_minutes },
-                    "peakUtil": last.peak_util,
-                    "firstUtil": last.first_util,
-                    "joinedLate": last.joined_late,
-                    "restarted": last.restarted,
-                    "samples": samples,
-                })
+                let mut view = window_view(last, meter.window_minutes, now);
+                view["samples"] = json!(samples);
+                view
             } else {
                 Value::Null
             };
@@ -722,6 +741,39 @@ impl Ledger {
             let _ = crate::persist::write_atomic(&path, body);
         }
     }
+}
+
+/// One window as the renderer sees it. `peakUtil` is what the window consumed
+/// and `lastUtil` what the meter read last; they part ways once a reset has
+/// been spent.
+fn window_view(i: &Instance, meter_minutes: f64, ended_at: f64) -> Value {
+    let window_minutes = if i.window_minutes != 0.0 { i.window_minutes } else { meter_minutes };
+    let mut view = json!({
+        "resetsAt": i.resets_at,
+        "startedAt": i.started_at,
+        "endedAt": ended_at,
+        "windowMinutes": window_minutes,
+        "peakUtil": i.peak_util,
+        "lastUtil": i.last_util,
+        "firstUtil": i.first_util,
+        "credited": i.credited,
+        "refills": i.refills,
+        "joinedLate": i.joined_late,
+        "restarted": i.restarted,
+        "observedFor": (i.last_seen_at - i.first_seen_at).max(0.0),
+    });
+    // A window an earlier build restarted is still the provider's whole
+    // window; only the stretch after the drop was measured, from the reading
+    // the meter fell to.
+    if i.restarted {
+        let window_ms = window_minutes * 60000.0;
+        if i.resets_at != 0.0 && window_ms != 0.0 {
+            view["startedAt"] = json!(i.started_at.min(i.resets_at - window_ms));
+        }
+        view["measuredFrom"] = json!(i.started_at);
+        view["baseline"] = json!(i.first_util);
+    }
+    view
 }
 
 fn ledger_path(user_data: &Path) -> PathBuf {
@@ -942,22 +994,126 @@ mod tests {
     }
 
     #[test]
-    fn a_sharp_drop_under_the_same_reset_restarts_the_window() {
-        // Seen in the field after a plan change: 6% fell to 0% mid-week while
-        // the published reset stayed put.
+    fn a_reset_spent_inside_a_window_keeps_the_window_and_what_it_consumed() {
+        // Seen in the field on 12 Nov 2026: a reset was spent mid-week, the
+        // weekly meter fell to 30% and the published reset time stayed put.
         let mut ledger = Ledger::new();
-        ledger.record(&json!({ "claude": claude_snapshot(SnapOpts { session: 6.0, ..Default::default() }) }), T0 + HOUR);
-        ledger.record(&json!({ "claude": claude_snapshot(SnapOpts { session: 0.0, ..Default::default() }) }), T0 + 2.0 * HOUR);
-        ledger.record(&json!({ "claude": claude_snapshot(SnapOpts { session: 3.0, ..Default::default() }) }), T0 + 3.0 * HOUR);
-        let meter = session_meter(&ledger.snapshot(T0 + 3.0 * HOUR));
-        assert_eq!(meter["history"].as_array().unwrap().len(), 0);
-        assert_eq!(meter["current"]["peakUtil"], json!(3.0), "the pre-restart peak no longer applies");
-        assert_eq!(meter["current"]["startedAt"], json!(T0 + 2.0 * HOUR));
-        assert_eq!(meter["current"]["restarted"], json!(true));
+        let at = |weekly: f64| json!({ "claude": claude_snapshot(SnapOpts { weekly, ..Default::default() }) });
+        ledger.record(&at(64.0), T0 + HOUR);
+        ledger.record(&at(72.0), T0 + 2.0 * HOUR);
+        ledger.record(&at(30.0), T0 + 3.0 * HOUR);
+        ledger.record(&at(41.0), T0 + 4.0 * HOUR);
+        let snapshot = ledger.snapshot(T0 + 4.0 * HOUR);
+        let meter = snapshot["meters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == json!("claude|weekly"))
+            .unwrap();
+        assert_eq!(meter["history"].as_array().unwrap().len(), 0, "still one window");
+        let current = &meter["current"];
+        assert_eq!(current["startedAt"], json!(T0 + 5.0 * HOUR - 7.0 * 24.0 * HOUR), "its start does not move");
+        assert_eq!(current["peakUtil"], json!(83.0), "72% before the reset and 11% since");
+        assert_eq!(current["lastUtil"], json!(41.0), "the meter itself reads 41%");
+        assert_eq!(current["credited"], json!(42.0));
+        assert_eq!(current["refills"], json!(1));
+        assert_eq!(current["restarted"], json!(false));
+        assert!(current.get("measuredFrom").is_none());
+        assert_eq!(current["samples"].as_array().unwrap().len(), 4, "the burn curve keeps the drop");
     }
 
     #[test]
-    fn a_stored_window_with_a_restart_is_rebased_on_load() {
+    fn a_dip_before_the_reset_does_not_shrink_what_was_consumed() {
+        let mut ledger = Ledger::new();
+        for (hour, session) in [(1.0, 80.0), (1.5, 78.0), (2.0, 0.0), (3.0, 40.0), (3.5, 0.0), (4.0, 9.0)] {
+            ledger.record(
+                &json!({ "claude": claude_snapshot(SnapOpts { session, ..Default::default() }) }),
+                T0 + hour * HOUR,
+            );
+        }
+        let meter = session_meter(&ledger.snapshot(T0 + 4.0 * HOUR));
+        assert_eq!(meter["current"]["peakUtil"], json!(129.0), "80 + 40 + 9 across two resets");
+        assert_eq!(meter["current"]["lastUtil"], json!(9.0));
+        assert_eq!(meter["current"]["refills"], json!(2));
+        assert_eq!(meter["current"]["startedAt"], json!(T0));
+    }
+
+    #[test]
+    fn a_stray_low_reading_that_bounces_back_is_not_a_reset() {
+        // Seen in the Codex ledger: 88, then 42 for one reading, then 88
+        // again. Two quotas were being read under one meter.
+        let mut ledger = Ledger::new();
+        let minute = HOUR / 60.0;
+        for (minutes, session) in [(60.0, 88.0), (62.0, 42.0), (64.0, 88.0), (66.0, 90.0)] {
+            ledger.record(
+                &json!({ "claude": claude_snapshot(SnapOpts { session, ..Default::default() }) }),
+                T0 + minutes * minute,
+            );
+        }
+        let meter = session_meter(&ledger.snapshot(T0 + 66.0 * minute));
+        assert_eq!(meter["current"]["peakUtil"], json!(90.0), "nothing was handed back");
+        assert_eq!(meter["current"]["refills"], json!(0));
+        assert_eq!(meter["current"]["credited"], json!(0.0));
+    }
+
+    #[test]
+    fn a_reloaded_window_keeps_its_resets() {
+        let dir = std::env::temp_dir().join(format!("ember-ledger-refill-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ledger = Ledger::new();
+        for (hour, session) in [(1.0, 80.0), (2.0, 0.0), (3.0, 12.0)] {
+            ledger.record(
+                &json!({ "claude": claude_snapshot(SnapOpts { session, ..Default::default() }) }),
+                T0 + hour * HOUR,
+            );
+        }
+        ledger.persist(&dir);
+        let mut reloaded = Ledger::load(&dir);
+        reloaded.record(&json!({ "claude": claude_snapshot(SnapOpts { session: 15.0, ..Default::default() }) }), T0 + 4.0 * HOUR);
+        let meter = session_meter(&reloaded.snapshot(T0 + 4.0 * HOUR));
+        assert_eq!(meter["current"]["peakUtil"], json!(95.0));
+        assert_eq!(meter["current"]["refills"], json!(1), "loading does not count the stored drop twice");
+        assert_eq!(meter["current"]["startedAt"], json!(T0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_window_an_earlier_build_restarted_is_shown_whole() {
+        // What the build before this one stored for the 12 Nov reset: the
+        // window rebased onto the drop, and everything before it discarded.
+        let dir = std::env::temp_dir().join(format!("ember-ledger-legacy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reset = T0 + 5.0 * HOUR;
+        let drop = T0 + 3.0 * HOUR;
+        std::fs::write(
+            dir.join("quota-ledger.json"),
+            serde_json::to_string(&json!({ "v": 1, "meters": [{
+                "id": "claude|session", "provider": "claude", "kind": "session",
+                "label": "x", "windowMinutes": 300,
+                "instances": [{
+                    "startedAt": drop, "resetsAt": reset, "windowMinutes": 300,
+                    "firstSeenAt": drop, "lastSeenAt": drop + 0.5 * HOUR,
+                    "firstUtil": 30, "peakUtil": 31, "lastUtil": 31, "closed": false,
+                    "restarted": true, "samples": [[drop, 30], [drop + 0.5 * HOUR, 31]],
+                }],
+            }]}))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut ledger = Ledger::load(&dir);
+        ledger.record(&json!({ "claude": claude_snapshot(SnapOpts { session: 36.0, ..Default::default() }) }), T0 + 4.0 * HOUR);
+        let meter = session_meter(&ledger.snapshot(T0 + 4.0 * HOUR));
+        let current = &meter["current"];
+        assert_eq!(meter["history"].as_array().unwrap().len(), 0);
+        assert_eq!(current["startedAt"], json!(T0), "the provider's own boundary");
+        assert_eq!(current["measuredFrom"], json!(drop), "only the stretch after the drop was kept");
+        assert_eq!(current["baseline"], json!(30.0));
+        assert_eq!(current["peakUtil"], json!(36.0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stored_drop_from_the_earliest_builds_is_counted_on_load() {
         let dir = std::env::temp_dir().join(format!("ember-ledger-restart-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -977,9 +1133,10 @@ mod tests {
         .unwrap();
         let ledger = Ledger::load(&dir);
         let meter = session_meter(&ledger.snapshot(T0 + 3.0 * HOUR));
-        assert_eq!(meter["current"]["startedAt"], json!(T0 + 2.0 * HOUR));
-        assert_eq!(meter["current"]["peakUtil"], json!(4.0));
-        assert_eq!(meter["current"]["restarted"], json!(true));
+        assert_eq!(meter["current"]["startedAt"], json!(T0));
+        assert_eq!(meter["current"]["peakUtil"], json!(10.0), "6% before the drop and 4% after");
+        assert_eq!(meter["current"]["refills"], json!(1));
+        assert_eq!(meter["current"]["restarted"], json!(false));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
