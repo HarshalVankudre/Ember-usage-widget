@@ -36,10 +36,12 @@ const WATCH_MAX_WAIT_MS: u64 = 380;
 // An unchanged pass costs a stat sweep rather than a full rebuild, which is
 // what makes reconciling this often affordable.
 const RECONCILE_INTERVAL_MS: u64 = 8 * 1000;
-// The plan meters are polled every minute; while usage is pouring in, catch-up
-// polls can tighten that to the minimum spacing below, never past it.
-const CLAUDE_POLL_INTERVAL_MS: u64 = 60 * 1000;
-const CLAUDE_MIN_POLL_MS: f64 = 30.0 * 1000.0;
+// The usage endpoint grants about one request every two minutes: on 10 Nov
+// 2026, requests spaced 110s or more apart succeeded 59 times in 61, and the
+// old one-minute cadence was refused 44% of the time. Catch-up polls while
+// usage is pouring in can tighten the spacing to the minimum, never past it.
+const CLAUDE_POLL_INTERVAL_MS: u64 = 2 * 60 * 1000;
+const CLAUDE_MIN_POLL_MS: f64 = 90.0 * 1000.0;
 const CLAUDE_FORCE_COOLDOWN_MS: f64 = 15.0 * 1000.0;
 const CLAUDE_CATCH_UP_MS: u64 = 10 * 1000;
 // A poll that never returns must not own the slot forever. The request itself
@@ -49,9 +51,11 @@ const CLAUDE_CATCH_UP_MS: u64 = 10 * 1000;
 const CLAUDE_POLL_STALL_MS: f64 = 60.0 * 1000.0;
 // Retry-After is honored, but only within a window a person would wait through:
 // below the floor the endpoint just gets hammered again, above the ceiling the
-// meter silently sits out the rest of the day.
+// meter silently sits out the rest of the day. The ceiling sits above the
+// hour-long penalties the endpoint really sends, since returning early only
+// collects another 429.
 const CLAUDE_BACKOFF_MIN_MS: f64 = 2.0 * 60.0 * 1000.0;
-const CLAUDE_BACKOFF_MAX_MS: f64 = 30.0 * 60.0 * 1000.0;
+const CLAUDE_BACKOFF_MAX_MS: f64 = 2.0 * 60.0 * 60.0 * 1000.0;
 
 /* ---------------- small JS-parity helpers ---------------- */
 
@@ -135,10 +139,28 @@ struct ClaudeLimitsState {
     last: Option<Value>,
     last_good: Option<Value>,
     backoff_until: f64,
+    /// 429s in a row since the last answer that was not one
+    rate_limit_streak: u32,
     last_forced_at: f64,
     last_poll_at: f64,
     /// wall-clock start of the poll that currently owns the slot; 0.0 when idle
     poll_started_at: f64,
+}
+
+fn fetched_at(snapshot: Option<&Value>) -> f64 {
+    snapshot.and_then(|s| s.get("fetchedAt")).and_then(|v| v.as_f64()).unwrap_or(0.0)
+}
+
+/// Take Claude Code's copy of the meters when it is newer than ours. This runs
+/// whatever the backoff says, since it costs no request.
+fn adopt_shared(cl: &mut ClaudeLimitsState, shared: Option<Value>) -> bool {
+    let Some(shared) = shared else { return false };
+    if fetched_at(Some(&shared)) <= fetched_at(cl.last_good.as_ref()) {
+        return false;
+    }
+    cl.last_good = Some(shared.clone());
+    cl.last = Some(shared);
+    true
 }
 
 /// Frees the poll slot even if the future is dropped mid-request — a Tauri
@@ -150,13 +172,33 @@ struct ClaudePollSlot<'a> {
     started_at: f64,
 }
 
-/// How long a 429 parks the poller, given the server's Retry-After in seconds.
-/// A missing or unparseable header reads as 0 and lands on the floor.
-fn claude_backoff_ms(retry_after_secs: f64) -> f64 {
-    if !retry_after_secs.is_finite() {
-        return CLAUDE_BACKOFF_MIN_MS;
+/// How long a 429 parks the poller, given the server's Retry-After in seconds
+/// and how many 429s came in a row. The endpoint mostly sends Retry-After: 0,
+/// and knocking at a fixed two minutes went unanswered 8 times in 22 minutes on
+/// 10 Nov 2026, so each further 429 doubles the wait, up to 32 minutes.
+fn claude_backoff_ms(retry_after_secs: f64, streak: u32) -> f64 {
+    let doublings = streak.saturating_sub(1).min(4) as i32;
+    let escalated = CLAUDE_BACKOFF_MIN_MS * 2f64.powi(doublings);
+    let sent = if retry_after_secs.is_finite() { retry_after_secs * 1000.0 } else { 0.0 };
+    sent.max(escalated).clamp(CLAUDE_BACKOFF_MIN_MS, CLAUDE_BACKOFF_MAX_MS)
+}
+
+/// Settle the backoff after a failed poll. Only an answer from the endpoint
+/// says anything about its rate limit, so a failure that never reached it
+/// leaves the backoff and the streak as they were.
+fn record_failure(cl: &mut ClaudeLimitsState, res: &Value, now: f64) {
+    match res.get("reason").and_then(|r| r.as_str()) {
+        Some("http-429") => {
+            cl.rate_limit_streak += 1;
+            let retry = res.get("retryAfter").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            cl.backoff_until = now + claude_backoff_ms(retry, cl.rate_limit_streak);
+        }
+        Some(reason) if reason.starts_with("http-") => {
+            cl.rate_limit_streak = 0;
+            cl.backoff_until = 0.0;
+        }
+        _ => {}
     }
-    (retry_after_secs * 1000.0).clamp(CLAUDE_BACKOFF_MIN_MS, CLAUDE_BACKOFF_MAX_MS)
 }
 
 impl Drop for ClaudePollSlot<'_> {
@@ -414,11 +456,13 @@ fn claude_poll_gate(cl: &ClaudeLimitsState, now: f64, force: bool) -> PollGate {
             "retryAt": cl.backoff_until,
         }));
     }
-    if now - cl.last_poll_at < CLAUDE_MIN_POLL_MS {
+    // a snapshot Claude Code fetched moments ago is as good as our own
+    let last_seen = cl.last_poll_at.max(fetched_at(cl.last_good.as_ref()));
+    if now - last_seen < CLAUDE_MIN_POLL_MS {
         return PollGate::Skip(json!({
             "updated": false,
             "state": "recent",
-            "retryAt": cl.last_poll_at + CLAUDE_MIN_POLL_MS,
+            "retryAt": last_seen + CLAUDE_MIN_POLL_MS,
         }));
     }
     PollGate::Go
@@ -426,10 +470,20 @@ fn claude_poll_gate(cl: &ClaudeLimitsState, now: f64, force: bool) -> PollGate {
 
 async fn push_claude_limits(app: &AppHandle, force: bool) -> Value {
     let state = app.state::<EmberState>();
+    let shared = claude_limits::load_shared();
     let started_at;
     {
         let mut cl = state.claude.lock().unwrap();
         let now = now_ms();
+        if adopt_shared(&mut cl, shared) {
+            if let Some(snap) = &cl.last_good {
+                claude_limits::save_cached(snap);
+            }
+            journal::note("claude snapshot adopted from claude code");
+            drop(cl);
+            send_limits(app);
+            cl = state.claude.lock().unwrap();
+        }
         match claude_poll_gate(&cl, now, force) {
             PollGate::Skip(status) => {
                 // "recent" is the ordinary spacing guard and would drown the
@@ -467,18 +521,12 @@ async fn push_claude_limits(app: &AppHandle, force: bool) -> Value {
             cl.last_good = Some(res.clone());
             cl.last = Some(res.clone());
             cl.backoff_until = 0.0;
+            cl.rate_limit_streak = 0;
             claude_limits::save_cached(&res);
         } else {
             // honor Retry-After and keep serving the last good snapshot;
             // countdowns keep ticking client-side
-            if res.get("reason").and_then(|r| r.as_str()) == Some("http-429") {
-                let retry = res.get("retryAfter").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                cl.backoff_until = now_ms() + claude_backoff_ms(retry);
-            } else {
-                // the endpoint answered with something other than a rate limit,
-                // so whatever backoff was outstanding is settled
-                cl.backoff_until = 0.0;
-            }
+            record_failure(&mut cl, &res, now_ms());
             retry_at = cl.backoff_until;
             cl.last = match &cl.last_good {
                 Some(good) => {
@@ -1393,6 +1441,7 @@ pub fn run() {
                     last: last_claude,
                     last_good: last_good_claude,
                     backoff_until: 0.0,
+                    rate_limit_streak: 0,
                     last_forced_at: 0.0,
                     last_poll_at: 0.0,
                     poll_started_at: 0.0,
@@ -1561,6 +1610,7 @@ mod claude_poll_tests {
             last: None,
             last_good: None,
             backoff_until: 0.0,
+            rate_limit_streak: 0,
             last_forced_at: 0.0,
             last_poll_at: 0.0,
             poll_started_at: 0.0,
@@ -1686,14 +1736,99 @@ mod claude_poll_tests {
         assert!(matches!(claude_poll_gate(&cl, now, false), PollGate::Go));
     }
 
+    /// The usage endpoint allows about one request every two minutes. At a
+    /// one-minute cadence 62 of 140 requests came back 429.
+    #[test]
+    fn automatic_polls_stay_inside_the_endpoint_budget() {
+        let now = 1_000_000.0;
+        let mut cl = idle_state().into_inner().unwrap();
+        cl.last_poll_at = now - 60_000.0;
+        assert_eq!(
+            skip_state(claude_poll_gate(&cl, now, false)).as_deref(),
+            Some("recent"),
+            "a minute after the last request is too soon"
+        );
+        cl.last_poll_at = now - 120_000.0;
+        assert!(
+            matches!(claude_poll_gate(&cl, now, false), PollGate::Go),
+            "two minutes later is fine"
+        );
+    }
+
+    /// Only an answer from the endpoint settles a rate limit. A failure that
+    /// never reached it says nothing about whether the penalty is over.
+    #[test]
+    fn backoff_survives_failures_that_never_reached_the_endpoint() {
+        let now = 1_000_000.0;
+        let parked = now + 20.0 * 60.0 * 1000.0;
+        let mut cl = idle_state().into_inner().unwrap();
+        for reason in ["token-expired", "no-credentials", "network"] {
+            cl.backoff_until = parked;
+            cl.rate_limit_streak = 3;
+            record_failure(&mut cl, &json!({ "ok": false, "reason": reason }), now);
+            assert_eq!(cl.backoff_until, parked, "{reason} keeps the backoff");
+            assert_eq!(cl.rate_limit_streak, 3, "{reason} keeps the streak");
+        }
+        record_failure(&mut cl, &json!({ "ok": false, "reason": "http-401" }), now);
+        assert_eq!(cl.backoff_until, 0.0, "a real answer settles it");
+        assert_eq!(cl.rate_limit_streak, 0);
+        let limited = json!({ "ok": false, "reason": "http-429", "retryAfter": 600.0 });
+        record_failure(&mut cl, &limited, now);
+        assert_eq!(cl.backoff_until, now + 600_000.0);
+    }
+
+    /// Retry-After: 0 every time, so the streak is what spaces the retries out.
+    #[test]
+    fn consecutive_rate_limits_back_off_further_each_time() {
+        let now = 1_000_000.0;
+        let mut cl = idle_state().into_inner().unwrap();
+        let limited = json!({ "ok": false, "reason": "http-429", "retryAfter": 0.0 });
+        let mut waits = Vec::new();
+        for _ in 0..7 {
+            record_failure(&mut cl, &limited, now);
+            waits.push(((cl.backoff_until - now) / 60_000.0).round() as u32);
+        }
+        assert_eq!(waits, [2, 4, 8, 16, 32, 32, 32], "minutes between knocks");
+    }
+
+    /// Claude Code refreshes the same payload on its own. A newer copy is
+    /// taken even mid-backoff, an older one never replaces ours, and a fresh
+    /// one makes the next automatic request unnecessary.
+    #[test]
+    fn claude_codes_snapshot_fills_in_without_a_request() {
+        let now = 1_000_000.0;
+        let mut cl = idle_state().into_inner().unwrap();
+        cl.backoff_until = now + 20.0 * 60.0 * 1000.0;
+        cl.last_poll_at = now - 10.0 * 60.0 * 1000.0;
+        cl.last_good = Some(json!({ "ok": true, "fetchedAt": now - 3.0 * 60.0 * 60.0 * 1000.0 }));
+
+        let older = json!({ "ok": true, "fetchedAt": now - 4.0 * 60.0 * 60.0 * 1000.0 });
+        assert!(!adopt_shared(&mut cl, Some(older)), "an older copy is ignored");
+
+        let fresh = json!({ "ok": true, "fetchedAt": now - 20_000.0 });
+        assert!(adopt_shared(&mut cl, Some(fresh.clone())), "a newer copy is taken mid-backoff");
+        assert_eq!(cl.last, Some(fresh));
+
+        cl.backoff_until = 0.0;
+        assert_eq!(
+            skip_state(claude_poll_gate(&cl, now, false)).as_deref(),
+            Some("recent"),
+            "a 20-second-old snapshot needs no request"
+        );
+    }
+
     #[test]
     fn backoff_honors_retry_after_within_a_waitable_window() {
-        assert_eq!(claude_backoff_ms(0.0), CLAUDE_BACKOFF_MIN_MS, "no header -> floor");
-        assert_eq!(claude_backoff_ms(30.0), CLAUDE_BACKOFF_MIN_MS, "a short one -> floor");
-        assert_eq!(claude_backoff_ms(1_140.0), 1_140.0 * 1000.0, "19 min is honored as sent");
+        assert_eq!(claude_backoff_ms(0.0, 1), CLAUDE_BACKOFF_MIN_MS, "no header -> floor");
+        assert_eq!(claude_backoff_ms(30.0, 1), CLAUDE_BACKOFF_MIN_MS, "a short one -> floor");
+        assert_eq!(claude_backoff_ms(1_140.0, 1), 1_140.0 * 1000.0, "19 min is honored as sent");
+        // Anthropic sends a full hour after repeated misses. Coming back at 30
+        // minutes earned another 429 every time, and the card promised a retry
+        // that could not succeed.
+        assert_eq!(claude_backoff_ms(3_600.0, 1), 3_600.0 * 1000.0, "an hour is honored as sent");
         // Left uncapped this is what sits the meter out for the rest of the day.
-        assert_eq!(claude_backoff_ms(86_400.0), CLAUDE_BACKOFF_MAX_MS, "a day -> ceiling");
-        assert_eq!(claude_backoff_ms(f64::NAN), CLAUDE_BACKOFF_MIN_MS, "garbage -> floor");
+        assert_eq!(claude_backoff_ms(86_400.0, 1), CLAUDE_BACKOFF_MAX_MS, "a day -> ceiling");
+        assert_eq!(claude_backoff_ms(f64::NAN, 1), CLAUDE_BACKOFF_MIN_MS, "garbage -> floor");
     }
 }
 

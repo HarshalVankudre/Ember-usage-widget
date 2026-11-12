@@ -2643,7 +2643,7 @@ function codexRows(l) {
 
 function claudeErrorMsg(l) {
   return l.reason === 'no-credentials' ? 'Sign in to Claude Code to show plan limits.'
-    : l.reason === 'http-401' || l.reason === 'http-403' ? 'Sign-in expired — open Claude Code once to refresh it.'
+    : ['http-401', 'http-403', 'token-expired'].includes(l.reason) ? 'Sign-in expired — open Claude Code once to refresh it.'
     : l.reason === 'http-429' ? 'Rate-limited by the account API — retrying in a few minutes.'
     : 'Plan limits unavailable — retrying.';
 }
@@ -2722,7 +2722,7 @@ function renderLimits() {
           ? ` Retry available in ${fmtRemaining(retry).replace(/ left$/, '')}.` : '';
         return `Snapshot from ${age} ago — Anthropic rate-limited the refresh.${retryText}`;
       }
-      if (l.lastError === 'http-401' || l.lastError === 'http-403') {
+      if (['http-401', 'http-403', 'token-expired'].includes(l.lastError)) {
         return `Snapshot from ${age} ago — Claude Code sign-in has expired.`;
       }
       if (l.lastError) return `Snapshot from ${age} ago — refresh failed (${l.lastError}).`;
